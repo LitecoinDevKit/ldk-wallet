@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LTC Wallet",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "identifier": "com.indigonakamoto.ltc-wallet",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,7 +32,7 @@
     "targets": ["app", "dmg", "deb", "appimage"],
     "category": "Finance",
     "shortDescription": "Native Litecoin wallet for macOS and Linux",
-    "longDescription": "BIP84 transparent Litecoin wallet with Electrum sync, optional MWEB privacy, and a LitVM LiteForge testnet sidecar.",
+    "longDescription": "BIP84 transparent Litecoin wallet with Electrum sync, optional MWEB privacy, spend-to-self, and a LitVM LiteForge testnet sidecar.",
     "copyright": "Copyright © Indigo Nakamoto",
     "icon": [
       "icons/32x32.png",

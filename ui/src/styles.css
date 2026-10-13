@@ -481,6 +481,15 @@ code {
   text-overflow: ellipsis;
 }
 
+.nav-dot {
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--warning);
+  flex: 0 0 auto;
+}
+
 .content {
   display: flex;
   flex-direction: column;
@@ -1376,6 +1385,28 @@ textarea {
   background: color-mix(in srgb, var(--accent) 10%, var(--surface));
 }
 
+.banner-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.35rem;
+}
+
+.churn-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.churn-more summary {
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 0.82rem;
+}
+
+.churn-more .field {
+  margin-top: 0.55rem;
+}
+
 .litvm-banner {
   margin: 0 0 0.85rem;
 }
@@ -2031,7 +2062,8 @@ textarea {
 }
 
 .coins-utxo-list {
-  max-height: 22rem;
+  max-height: none;
+  overflow: visible;
 }
 
 .utxo-row {
@@ -2054,11 +2086,102 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 0.1rem;
+  overflow: hidden;
+}
+
+.utxo-amt {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.churn-status {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.churn-status[data-tone="paused"] {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+}
+
+.churn-status[data-tone="error"] {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+}
+
+.churn-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.churn-status-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.churn-kicker {
+  color: var(--text-3);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.churn-status-main,
+.churn-status-sub,
+.churn-status-error {
+  margin: 0;
+}
+
+.churn-status-main {
+  color: var(--text-1);
+  font-size: 0.92rem;
+}
+
+.churn-status-sub {
+  color: var(--text-3);
+  font-size: 0.78rem;
+}
+
+.churn-status-error {
+  color: var(--danger);
+  font-size: 0.82rem;
+}
+
+.churn-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.churn-pill-accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.churn-pill-error {
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+  color: var(--danger);
 }
 
 .utxo-meta {
   color: var(--text-2);
   font-size: 0.72rem;
+}
+
+.utxo-depth {
+  color: var(--text-3);
+  font-size: 0.68rem;
 }
 
 .utxo-id {
@@ -2448,6 +2571,10 @@ textarea {
     height: 1px;
     overflow: hidden;
     clip-path: inset(50%);
+  }
+
+  .nav-dot {
+    margin-left: 0;
   }
 
   .views {

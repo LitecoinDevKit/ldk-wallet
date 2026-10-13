@@ -13,7 +13,7 @@ use wallet_core::{
     SetTxLabelRequest, SetUtxoLabelRequest, SetMwebUtxoLockedRequest, SetUtxoLockedRequest,
     SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment, TxRecord, UnlockRequest,
     UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletApp, WalletSettings,
-    WalletSummary,
+    WalletSummary, ChurnPreview, ChurnRequest, ChurnStatus,
 };
 
 mod litvm;
@@ -362,6 +362,54 @@ async fn split_coin(
 ) -> Result<SplitResult, String> {
     let wallet = Arc::clone(&state);
     tauri::async_runtime::spawn_blocking(move || wallet.split_coin(req).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn preview_churn(
+    state: State<'_, Arc<WalletApp>>,
+    req: ChurnRequest,
+) -> Result<ChurnPreview, String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.preview_churn(req).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn start_churn(
+    state: State<'_, Arc<WalletApp>>,
+    req: ChurnRequest,
+) -> Result<ChurnStatus, String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.start_churn(req).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn churn_status(
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<Option<ChurnStatus>, String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.churn_status().map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn retry_churn(state: State<'_, Arc<WalletApp>>) -> Result<ChurnStatus, String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.retry_churn().map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn cancel_churn(state: State<'_, Arc<WalletApp>>) -> Result<ChurnStatus, String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.cancel_churn().map_err(map_err))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -783,6 +831,11 @@ pub fn run() {
             list_mweb_unspent,
             preview_split,
             split_coin,
+            preview_churn,
+            start_churn,
+            churn_status,
+            retry_churn,
+            cancel_churn,
             set_utxo_locked,
             set_mweb_utxo_locked,
             set_utxo_label,

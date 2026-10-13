@@ -642,7 +642,7 @@ const UNCONFIRMED_MWEB_REVERT_SECS: u64 = 48 * 60 * 60;
 fn is_outgoing_mweb(kind: TxKind) -> bool {
     matches!(
         kind,
-        TxKind::Pegout | TxKind::MwebSend | TxKind::MwebSplit
+        TxKind::Pegout | TxKind::MwebSend | TxKind::MwebSplit | TxKind::MwebChurn
     )
 }
 
@@ -859,6 +859,18 @@ fn decode_output_id(id_hex: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use bdk_mweb::MwebCoin;
+
+    #[test]
+    fn header_peers_keep_the_configured_node_ahead_of_public_ones() {
+        let local: std::net::SocketAddr = "127.0.0.1:9333".parse().unwrap();
+        let public: std::net::SocketAddr = "64.23.156.63:9333".parse().unwrap();
+        assert_eq!(
+            merge_header_peers(&[local], &[public]),
+            vec![local, public]
+        );
+        assert_eq!(merge_header_peers(&[], &[public]), vec![public]);
+        assert_eq!(merge_header_peers(&[local], &[local]), vec![local]);
+    }
 
     const TIP: u32 = 200;
 
@@ -2134,6 +2146,9 @@ pub fn list_mweb_unspent(
     let labels = utxo_labels::read_labels(data_dir)
         .map(|f| f.labels)
         .unwrap_or_default();
+    let (depth, job) = crate::churn::annotations(data_dir).unwrap_or_else(|_| {
+        (std::collections::BTreeMap::new(), None)
+    });
     let mut rows: Vec<MwebUtxoRecord> = runtime
         .store
         .db()
@@ -2161,6 +2176,7 @@ pub fn list_mweb_unspent(
             let output_id = hex::encode(c.output_id);
             let locked = frozen.contains(&output_id);
             let label = labels.get(&output_id).cloned().unwrap_or_default();
+            let fields = churn_fields(&output_id, c.is_pegin, &depth, job.as_ref());
             MwebUtxoRecord {
                 output_id,
                 amount_sats: c.amount,
@@ -2169,6 +2185,14 @@ pub fn list_mweb_unspent(
                 maturity_blocks_left,
                 locked,
                 label,
+                from_pegin: fields.from_pegin,
+                non_solo_blocks: fields.non_solo_blocks,
+                last_other_kernels: fields.last_other_kernels,
+                last_other_outputs: fields.last_other_outputs,
+                churn_phase: fields.churn_phase,
+                churn_error: fields.churn_error,
+                churn_target: fields.churn_target,
+                churn_counted: fields.churn_counted,
             }
         })
         .collect();
@@ -2179,6 +2203,134 @@ pub fn list_mweb_unspent(
             .then_with(|| a.output_id.cmp(&b.output_id))
     });
     rows
+}
+
+struct ChurnFields {
+    from_pegin: bool,
+    non_solo_blocks: Option<u32>,
+    last_other_kernels: Option<u64>,
+    last_other_outputs: Option<u64>,
+    churn_phase: Option<crate::dto::ChurnPhase>,
+    churn_error: Option<String>,
+    churn_target: Option<u32>,
+    churn_counted: Option<u32>,
+}
+
+fn churn_fields(
+    output_id: &str,
+    is_pegin: bool,
+    depth: &std::collections::BTreeMap<String, crate::dto::ChurnDepthRecord>,
+    job: Option<&crate::churn::ChurnJob>,
+) -> ChurnFields {
+    let record = depth.get(output_id);
+    let from_pegin = is_pegin || record.is_some_and(|r| r.from_pegin);
+    let non_solo_blocks = if let Some(record) = record {
+        Some(record.non_solo_blocks)
+    } else if is_pegin {
+        Some(0)
+    } else {
+        None
+    };
+    let (churn_phase, churn_error, churn_target, churn_counted) = match job {
+        Some(job) if job.current_output_id == output_id && job.phase.is_active() => (
+            Some(job.phase),
+            job.last_error.clone(),
+            Some(job.target_depth),
+            Some(job.effective_depth),
+        ),
+        _ => (None, None, None, None),
+    };
+    ChurnFields {
+        from_pegin,
+        non_solo_blocks,
+        last_other_kernels: record.and_then(|r| r.last_other_kernels),
+        last_other_outputs: record.and_then(|r| r.last_other_outputs),
+        churn_phase,
+        churn_error,
+        churn_target,
+        churn_counted,
+    }
+}
+
+/// Block height of an unspent output, once sync has dated it.
+pub fn coin_block_height(runtime: &MwebRuntime, output_id_hex: &str) -> Option<u32> {
+    let id = decode_output_id(output_id_hex)?;
+    runtime.store.db().get(&id).and_then(|c| c.block_height)
+}
+
+/// Amount and maturity for a self-spend preview. Does not apply the freeze list.
+pub struct ChurnCoinInfo {
+    pub amount: u64,
+    pub mature: bool,
+    pub is_pegin: bool,
+}
+
+pub fn churn_coin_info(
+    runtime: &MwebRuntime,
+    tip_height: u32,
+    output_id_hex: &str,
+) -> Result<ChurnCoinInfo, WalletError> {
+    let id = decode_output_id(output_id_hex.trim()).ok_or_else(|| {
+        WalletError::BuildTx(format!(
+            "invalid MWEB output id '{output_id_hex}' (expected 32-byte hex)"
+        ))
+    })?;
+    let coin = runtime.store.db().get(&id).cloned().ok_or_else(|| {
+        WalletError::BuildTx(format!(
+            "selected MWEB coin {output_id_hex} is not an unspent output in this wallet"
+        ))
+    })?;
+    Ok(ChurnCoinInfo {
+        amount: coin.amount,
+        mature: coin.is_spendable(tip_height, MWEB_PEGIN_MATURITY),
+        is_pegin: coin.is_pegin,
+    })
+}
+
+/// Configured peers first, then any public peers not already in that list.
+///
+/// A configured node that is down must not be the only place scoring can look.
+/// Sync and broadcast already fall through to DNS seeds in that case.
+pub(crate) fn merge_header_peers(
+    configured: &[std::net::SocketAddr],
+    discovered: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    let mut addrs = configured.to_vec();
+    for addr in discovered {
+        if !addrs.contains(addr) {
+            addrs.push(*addr);
+        }
+    }
+    addrs
+}
+
+/// Peers to ask for an MWEB header: the user's node, then public seeds.
+pub fn peers_for_headers(peers: &[String], network: WalletNetwork) -> Vec<std::net::SocketAddr> {
+    let configured = resolve_peers(peers).unwrap_or_default();
+    let discovered = crate::discovery::discover_mweb_peers(network);
+    merge_header_peers(&configured, &discovered)
+}
+
+/// Kernel and output MMR sizes at `block_hash`, from the first peer that answers.
+pub fn fetch_mmr_sizes(
+    addrs: &[std::net::SocketAddr],
+    network: WalletNetwork,
+    block_hash: bdk_wallet::bitcoin::BlockHash,
+) -> Option<crate::churn::MmrSizes> {
+    let bdk_net = network.to_bitcoin_network();
+    for addr in addrs {
+        let Ok(mut peer) = TcpMwebPeer::connect(*addr, bdk_net) else {
+            continue;
+        };
+        let Ok(hdr) = MwebUtxoSource::get_header(&mut peer, block_hash) else {
+            continue;
+        };
+        return Some(crate::churn::MmrSizes {
+            kernel_mmr_size: hdr.mweb_header.kernel_mmr_size,
+            output_mmr_size: hdr.mweb_header.output_mmr_size,
+        });
+    }
+    None
 }
 
 /// Resolve one mature, unfrozen MWEB coin by output id.
@@ -2354,6 +2506,92 @@ pub fn mweb_split(
         txid: wtxid,
         fee_sats,
         output_count: recipient_amounts.len() as u32,
+    })
+}
+
+/// 1-in-1 self-spend of one coin, including when the churn job has frozen it.
+pub struct SelfSpendResult {
+    pub wtxid: String,
+    pub output_id: String,
+}
+
+pub fn mweb_self_spend(
+    wallet: &PersistedWallet<Connection>,
+    runtime: &mut MwebRuntime,
+    data_dir: &Path,
+    rpc_url: Option<&str>,
+    peers: &[String],
+    output_id_hex: &str,
+    fee_sats: u64,
+    network: WalletNetwork,
+) -> Result<SelfSpendResult, WalletError> {
+    let tip = wallet.latest_checkpoint().height();
+    let mut frozen = mweb_frozen::read_ids(data_dir)?.ids;
+    if let Ok(id) = mweb_frozen::normalize_output_id(output_id_hex) {
+        frozen.remove(&id);
+    }
+    let coin = select_mweb_coin(runtime.store.db(), output_id_hex, tip, &frozen, "spending to self")?;
+    if coin.amount <= fee_sats {
+        return Err(WalletError::BuildTx(
+            "This coin is too small to pay the fee.".into(),
+        ));
+    }
+    let amount = coin.amount - fee_sats;
+    let kind = match network {
+        WalletNetwork::Mainnet => NetworkKind::Main,
+        WalletNetwork::Testnet => NetworkKind::Test,
+    };
+    let index = runtime.receive_index;
+    let addr = runtime
+        .keys
+        .address(index, kind, &runtime.secp)
+        .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    runtime.receive_index = index.saturating_add(1);
+    runtime.persist(data_dir)?;
+
+    let mut funded = bdk_mweb::fund_mweb_spend(
+        vec![coin],
+        vec![(addr, amount)],
+        vec![],
+        fee_sats,
+        &runtime.keys,
+        CHANGE_ADDRESS_INDEX,
+        kind,
+        &runtime.secp,
+    )
+    .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    if funded.spent_coins.len() != 1 || funded.staged_outputs.len() != 1 {
+        return Err(WalletError::BuildTx(
+            "A self-spend must spend one coin and create one output.".into(),
+        ));
+    }
+    let spent_ids: Vec<_> = funded.spent_coins.iter().map(|c| c.output_id).collect();
+    let (tx, _change) = wallet
+        .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
+        .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
+    let wtxid = tx.compute_wtxid().to_string();
+    for id in &spent_ids {
+        let _ = runtime.store.db_mut().mark_spent(id);
+    }
+    let staged = &funded.staged_outputs[0];
+    let mut owned = owned_coin_from_staged(staged, index, &runtime.keys, &runtime.secp)?;
+    owned.block_height = None;
+    let output_id = hex::encode(owned.output_id);
+    runtime.store.db_mut().insert(owned);
+    runtime.history.record(MwebHistoryEntry {
+        id: wtxid.clone(),
+        kind: TxKind::MwebChurn,
+        net_sats: -(fee_sats as i64),
+        fee_sats: Some(fee_sats),
+        timestamp: now_ts(),
+        output_ids: vec![output_id.clone()],
+        input_ids: spent_ids.iter().map(hex::encode).collect(),
+        confirmed_height: None,
+    });
+    Ok(SelfSpendResult {
+        wtxid,
+        output_id,
     })
 }
 
@@ -2542,5 +2780,42 @@ mod pegin_balance_tests {
             "transparent should drop after peg-in apply"
         );
         assert!(mweb_total > 0, "mweb should hold peg-in output");
+    }
+}
+
+#[cfg(test)]
+mod churn_field_tests {
+    use super::churn_fields;
+    use crate::churn;
+    use crate::dto::ChurnPhase;
+    use std::collections::BTreeMap;
+
+    fn output_id() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn active_job_stamps_target_and_counted() {
+        let id = output_id();
+        let mut job = churn::new_job(&id, true, 4, 50_000).unwrap();
+        job.effective_depth = 2;
+        job.phase = ChurnPhase::PausedSolo;
+        let fields = churn_fields(&id, true, &BTreeMap::new(), Some(&job));
+        assert_eq!(fields.churn_phase, Some(ChurnPhase::PausedSolo));
+        assert_eq!(fields.churn_target, Some(4));
+        assert_eq!(fields.churn_counted, Some(2));
+        assert!(fields.churn_error.is_none());
+    }
+
+    #[test]
+    fn finished_job_does_not_stamp_progress() {
+        let id = output_id();
+        let mut job = churn::new_job(&id, false, 1, 50_000).unwrap();
+        job.phase = ChurnPhase::Done;
+        job.effective_depth = 1;
+        let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
+        assert!(fields.churn_phase.is_none());
+        assert!(fields.churn_target.is_none());
+        assert!(fields.churn_counted.is_none());
     }
 }

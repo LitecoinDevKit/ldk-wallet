@@ -27,6 +27,7 @@ pub use crate::contacts::CONTACTS_FILE;
 pub use crate::labels::TX_LABELS_FILE;
 pub use crate::mweb_frozen::MWEB_FROZEN_FILE;
 pub use crate::split_ids::SPLIT_IDS_FILE;
+pub use crate::churn::{CHURN_DEPTH_FILE, CHURN_JOB_FILE};
 pub use crate::utxo_labels::UTXO_LABELS_FILE;
 
 fn default_true() -> bool {
@@ -220,6 +221,8 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
         data_dir.join(UTXO_LABELS_FILE),
         data_dir.join(SPLIT_IDS_FILE),
         data_dir.join(MWEB_FROZEN_FILE),
+        data_dir.join(CHURN_JOB_FILE),
+        data_dir.join(CHURN_DEPTH_FILE),
         data_dir.join(CONTACTS_FILE),
         // Legacy Insights LLM key file (feature removed; delete on wipe if present).
         data_dir.join("insights_llm_key.enc"),

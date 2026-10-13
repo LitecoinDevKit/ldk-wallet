@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::contacts::{self, ContactsFile};
 use crate::dto::ContactRecord;
+use crate::dto::ChurnDepthRecord;
 use crate::error::WalletError;
 use crate::labels::{self, TxLabelsFile};
 use crate::mweb_frozen::{self, MwebFrozenFile};
 use crate::split_ids::{self, SplitIdsFile};
+use crate::churn;
 use crate::utxo_labels::{self, UtxoLabelsFile};
 
 pub const METADATA_BUNDLE_VERSION: u32 = 1;
@@ -35,6 +37,9 @@ pub struct MetadataBundle {
     /// Frozen MWEB output ids (hex).
     #[serde(default)]
     pub mweb_frozen: Vec<String>,
+    /// Per-coin self-spend depth. Without this, a restore shows the count as unknown.
+    #[serde(default)]
+    pub churn_depth: Vec<ChurnDepthRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +50,8 @@ pub struct MetadataImportResult {
     pub split_txids_upserted: usize,
     #[serde(default)]
     pub mweb_frozen_upserted: usize,
+    #[serde(default)]
+    pub churn_depth_upserted: usize,
 }
 
 fn now_ts() -> u64 {
@@ -66,6 +73,7 @@ pub fn export_bundle(data_dir: &Path) -> Result<MetadataBundle, WalletError> {
         .ids
         .into_iter()
         .collect();
+    let churn_depth = churn::list_depth(data_dir)?;
     Ok(MetadataBundle {
         version: METADATA_BUNDLE_VERSION,
         exported_at: Some(now_ts()),
@@ -74,6 +82,7 @@ pub fn export_bundle(data_dir: &Path) -> Result<MetadataBundle, WalletError> {
         utxo_labels,
         split_txids,
         mweb_frozen,
+        churn_depth,
     })
 }
 
@@ -208,12 +217,15 @@ pub fn import_json(data_dir: &Path, json: &str) -> Result<MetadataImportResult, 
         )?;
     }
 
+    let churn_depth_upserted = churn::upsert_depth(data_dir, &bundle.churn_depth)?;
+
     Ok(MetadataImportResult {
         contacts_upserted,
         tx_labels_upserted,
         utxo_labels_upserted,
         split_txids_upserted,
         mweb_frozen_upserted,
+        churn_depth_upserted,
     })
 }
 
@@ -242,5 +254,31 @@ mod tests {
         assert_eq!(labels.get("aaa").map(String::as_str), Some("note-a"));
         assert_eq!(labels.get("keep").map(String::as_str), Some("local"));
         assert!(mweb_frozen::contains(dir.path(), &id));
+    }
+
+    #[test]
+    fn churn_depth_round_trip() {
+        let dir = tempdir().unwrap();
+        let output_id = "cd".repeat(32);
+        churn::upsert_depth(
+            dir.path(),
+            &[ChurnDepthRecord {
+                output_id: output_id.clone(),
+                non_solo_blocks: 2,
+                last_other_kernels: Some(3),
+                last_other_outputs: Some(4),
+                from_pegin: true,
+            }],
+        )
+        .unwrap();
+        let json = export_json(dir.path()).unwrap();
+        let _ = std::fs::remove_file(churn::depth_path(dir.path()));
+        let result = import_json(dir.path(), &json).unwrap();
+        assert_eq!(result.churn_depth_upserted, 1);
+        let restored = churn::depth_of(dir.path(), &output_id).unwrap().unwrap();
+        assert_eq!(restored.non_solo_blocks, 2);
+        assert_eq!(restored.last_other_kernels, Some(3));
+        assert_eq!(restored.last_other_outputs, Some(4));
+        assert!(restored.from_pegin);
     }
 }

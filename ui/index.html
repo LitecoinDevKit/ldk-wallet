@@ -337,6 +337,7 @@
               <circle cx="15.5" cy="12" r="5.5" />
             </svg>
             <span class="nav-label">Coins</span>
+            <span class="nav-dot" id="nav-coins-dot" hidden></span>
           </button>
           <button
             type="button"
@@ -421,6 +422,25 @@
             </div>
             <div class="banner banner-info" id="maturity-banner" hidden>
               <p id="maturity-banner-text"></p>
+            </div>
+            <div class="banner banner-info" id="churn-banner" hidden>
+              <p id="churn-banner-text"></p>
+              <div class="banner-actions">
+                <button type="button" id="btn-churn-banner" class="btn btn-ghost btn-sm">
+                  View coins
+                </button>
+                <button type="button" id="btn-churn-banner-dismiss" class="btn btn-ghost btn-sm">
+                  Dismiss
+                </button>
+              </div>
+            </div>
+            <div class="banner banner-info" id="churn-job-banner" hidden>
+              <p id="churn-job-banner-text"></p>
+              <div class="banner-actions">
+                <button type="button" id="btn-churn-job-banner" class="btn btn-ghost btn-sm">
+                  View coins
+                </button>
+              </div>
             </div>
             <div class="hero">
               <div class="hero-inner">
@@ -1041,6 +1061,7 @@
                 <p class="hint" id="coins-utxo-empty">No public coins yet.</p>
               </div>
               <div id="coins-private" class="seg-panel" role="tabpanel" aria-labelledby="coins-seg-private" hidden>
+                <div id="churn-status" class="churn-status" hidden></div>
                 <p class="hint mono" id="coins-mweb-sum" hidden></p>
                 <ul class="utxo-list coins-utxo-list" id="coins-mweb-list"></ul>
                 <p class="hint" id="coins-mweb-empty">No private coins yet.</p>

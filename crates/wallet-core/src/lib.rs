@@ -11,6 +11,7 @@ mod electrum;
 mod error;
 pub mod explorer;
 mod contacts;
+mod churn;
 mod history_export;
 mod insights;
 mod labels;
@@ -39,7 +40,8 @@ pub use dto::{
     SetUtxoLabelRequest, SetMwebUtxoLockedRequest, SetUtxoLockedRequest, SplitChain, SplitOutput,
     SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment, TxIo, TxKind, TxRecord,
     TxStatus, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
-    WalletSettings, WalletSummary, DEFAULT_MWEB_FEE_SATS,
+    WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_MAX_TARGET, CHURN_QUIET_NOTE,
+    ChurnDepthRecord, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, DEFAULT_MWEB_FEE_SATS,
 };
 pub use explorer::{DEFAULT_EXPLORER_BASE_URL, is_chain_txid};
 pub use error::{BroadcastFailureKind, WalletError};

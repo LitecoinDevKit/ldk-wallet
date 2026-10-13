@@ -192,6 +192,8 @@ pub enum TxKind {
     Split,
     /// MWEB 1-in-N-out self-split.
     MwebSplit,
+    /// MWEB 1-in-1 self-spend (churn hop). The history amount is the fee.
+    MwebChurn,
 }
 
 /// A wallet-relevant transaction for history UI.
@@ -650,6 +652,30 @@ pub struct MwebUtxoRecord {
     /// Optional local note (non-secret sidecar).
     #[serde(default)]
     pub label: String,
+    /// This coin is the peg-in output, or a descendant tracked from one.
+    #[serde(default)]
+    pub from_pegin: bool,
+    /// Non-solo blocks recorded for this coin. `None` means this device does not know.
+    #[serde(default)]
+    pub non_solo_blocks: Option<u32>,
+    /// Other kernels in the last counted block.
+    #[serde(default)]
+    pub last_other_kernels: Option<u64>,
+    /// Other outputs in the last counted block.
+    #[serde(default)]
+    pub last_other_outputs: Option<u64>,
+    /// Live self-spend phase when this coin is the job's current output.
+    #[serde(default)]
+    pub churn_phase: Option<ChurnPhase>,
+    /// Broadcast or score error for the live job, if any.
+    #[serde(default)]
+    pub churn_error: Option<String>,
+    /// Non-solo blocks this job is waiting for. Set only while the job holds this coin.
+    #[serde(default)]
+    pub churn_target: Option<u32>,
+    /// Non-solo blocks this job has already counted.
+    #[serde(default)]
+    pub churn_counted: Option<u32>,
 }
 
 /// One output in a split plan (change is flagged).
@@ -699,4 +725,91 @@ pub struct SplitResult {
     pub txid: String,
     pub fee_sats: u64,
     pub output_count: u32,
+}
+
+/// How many non-solo blocks a self-spend will wait for. The sheet defaults to one.
+pub const CHURN_MAX_TARGET: u32 = 10;
+
+/// Confirm-sheet sentence: depth does not hide the implied amount.
+pub const CHURN_AMOUNT_NOTE: &str = "This subtracts the public fee. The resulting amount is still determined by where this coin started.";
+
+/// Confirm-sheet sentence: a quiet block pauses and does not retry.
+pub const CHURN_QUIET_NOTE: &str = "A block that only contains this spend does not count, and this wallet will not try again by itself.";
+
+/// Live self-spend job phase.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChurnPhase {
+    WaitingToBroadcast,
+    WaitingConfirm,
+    PausedSolo,
+    PausedUnscored,
+    Done,
+    Cancelled,
+}
+
+impl ChurnPhase {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::WaitingToBroadcast
+                | Self::WaitingConfirm
+                | Self::PausedSolo
+                | Self::PausedUnscored
+        )
+    }
+}
+
+/// Start or preview a self-spend. `target_depth` of 0 means one hop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChurnRequest {
+    pub output_id: String,
+    /// Non-solo blocks to count before the job stops. `0` or omitted means 1.
+    #[serde(default)]
+    pub target_depth: u32,
+}
+
+/// Dry-run of one self-spend hop, plus the fee if the target is more than one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChurnPreview {
+    pub input_sats: u64,
+    /// Fee for a single hop.
+    pub hop_fee_sats: u64,
+    /// Coin amount after one hop.
+    pub resulting_sats: u64,
+    pub target_depth: u32,
+    /// `target_depth * hop_fee_sats`. A quiet block can stop the run before this is spent.
+    pub total_fee_sats: u64,
+    pub amount_note: String,
+    pub quiet_block_note: String,
+}
+
+/// What the Coins screen needs while a job exists, including after it finishes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChurnStatus {
+    pub phase: ChurnPhase,
+    pub output_id: String,
+    pub target_depth: u32,
+    pub effective_depth: u32,
+    pub fee_sats: u64,
+    pub from_pegin: bool,
+    #[serde(default)]
+    pub last_other_kernels: Option<u64>,
+    #[serde(default)]
+    pub last_other_outputs: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Local record that a coin has shared some number of blocks. Exported with metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChurnDepthRecord {
+    pub output_id: String,
+    pub non_solo_blocks: u32,
+    #[serde(default)]
+    pub last_other_kernels: Option<u64>,
+    #[serde(default)]
+    pub last_other_outputs: Option<u64>,
+    #[serde(default)]
+    pub from_pegin: bool,
 }

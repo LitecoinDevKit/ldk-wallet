@@ -141,6 +141,7 @@ type MetadataImportResult = {
   utxo_labels_upserted: number;
   split_txids_upserted?: number;
   mweb_frozen_upserted?: number;
+  churn_depth_upserted?: number;
 };
 
 type MwebSendPreview = {
@@ -166,7 +167,8 @@ type TxKind =
   | "mweb-send"
   | "mweb-receive"
   | "split"
-  | "mweb-split";
+  | "mweb-split"
+  | "mweb-churn";
 
 type ContactKind = "public" | "private";
 
@@ -196,6 +198,32 @@ type MwebUtxoRecord = {
   maturity_blocks_left?: number;
   locked?: boolean;
   label?: string;
+  from_pegin?: boolean;
+  non_solo_blocks?: number | null;
+  last_other_kernels?: number | null;
+  last_other_outputs?: number | null;
+  churn_phase?: ChurnPhase | null;
+  churn_error?: string | null;
+  churn_target?: number | null;
+  churn_counted?: number | null;
+};
+
+type ChurnPhase =
+  | "waiting-to-broadcast"
+  | "waiting-confirm"
+  | "paused-solo"
+  | "paused-unscored"
+  | "done"
+  | "cancelled";
+
+type ChurnPreview = {
+  input_sats: number;
+  hop_fee_sats: number;
+  resulting_sats: number;
+  target_depth: number;
+  total_fee_sats: number;
+  amount_note: string;
+  quiet_block_note: string;
 };
 
 type SplitOutput = {
@@ -240,6 +268,7 @@ const TX_KIND_LABELS: Record<TxKind, string> = {
   "mweb-receive": "mweb receive",
   split: "split",
   "mweb-split": "split",
+  "mweb-churn": "self-spend",
 };
 
 type MwebScheme = "litecoin-core" | "lip0004" | "mwebd";
@@ -442,6 +471,15 @@ const el = {
   btnBackupBannerDismiss: document.querySelector<HTMLButtonElement>("#btn-backup-banner-dismiss")!,
   maturityBanner: document.querySelector<HTMLElement>("#maturity-banner")!,
   maturityBannerText: document.querySelector<HTMLElement>("#maturity-banner-text")!,
+  churnBanner: document.querySelector<HTMLElement>("#churn-banner")!,
+  churnBannerText: document.querySelector<HTMLElement>("#churn-banner-text")!,
+  btnChurnBanner: document.querySelector<HTMLButtonElement>("#btn-churn-banner")!,
+  btnChurnBannerDismiss: document.querySelector<HTMLButtonElement>("#btn-churn-banner-dismiss")!,
+  churnJobBanner: document.querySelector<HTMLElement>("#churn-job-banner")!,
+  churnJobBannerText: document.querySelector<HTMLElement>("#churn-job-banner-text")!,
+  btnChurnJobBanner: document.querySelector<HTMLButtonElement>("#btn-churn-job-banner")!,
+  churnStatus: document.querySelector<HTMLElement>("#churn-status")!,
+  navCoinsDot: document.querySelector<HTMLElement>("#nav-coins-dot")!,
   viewTitle: document.querySelector<HTMLElement>("#view-title")!,
   networkBadge: document.querySelector<HTMLElement>("#network-badge")!,
   syncDot: document.querySelector<HTMLElement>("#sync-dot")!,
@@ -1559,6 +1597,7 @@ function setPhase(next: Phase) {
   if (next !== "mnemonic") showMnemonicStep("show");
   updateBackupBanner();
   updateMaturityBanner(0);
+  updateChurnBanner();
   updateEmptyFundingState();
   updateSecurityChecklist();
 }
@@ -3312,6 +3351,7 @@ function renderCombined(c: CombinedSummary) {
   });
   updateEmptyFundingState();
   updateSecurityChecklist();
+  void refreshUtxos();
 }
 
 function renderLastTxid() {
@@ -3358,7 +3398,8 @@ function isPrivateTxKind(kind: TxKind): boolean {
     kind === "pegout" ||
     kind === "mweb-send" ||
     kind === "mweb-receive" ||
-    kind === "mweb-split"
+    kind === "mweb-split" ||
+    kind === "mweb-churn"
   );
 }
 
@@ -4566,6 +4607,20 @@ el.btnBackupBannerDismiss.addEventListener("click", () => {
   updateBackupBanner();
 });
 
+el.btnChurnBanner.addEventListener("click", () => {
+  setView("coins");
+  el.coinsSegPrivate.click();
+});
+
+el.btnChurnJobBanner.addEventListener("click", () => {
+  setView("coins");
+  el.coinsSegPrivate.click();
+});
+
+el.btnChurnBannerDismiss.addEventListener("click", () => {
+  dismissChurnBanner();
+});
+
 el.btnFundReceive.addEventListener("click", () => openPublicReceive());
 el.btnFundReceiveHistory.addEventListener("click", () => openPublicReceive());
 
@@ -4996,20 +5051,291 @@ function renderCoinsList() {
   }
 }
 
+const CHURN_BANNER_DISMISSED_KEY = "ltc-churn-banner-dismissed";
+
+let churnPending: "retry" | "cancel" | null = null;
+let churnActionError: string | null = null;
+let churnSawActive = false;
+let churnSuppressFinish = false;
+
+function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
+  return (
+    phase === "waiting-to-broadcast" ||
+    phase === "waiting-confirm" ||
+    phase === "paused-solo" ||
+    phase === "paused-unscored"
+  );
+}
+
+function activeChurnCoin(): MwebUtxoRecord | undefined {
+  return mwebUtxoCache.find((coin) => churnPhaseActive(coin.churn_phase));
+}
+
+function churnCompanySentence(coin: MwebUtxoRecord): string | null {
+  const phase = coin.churn_phase;
+  if (phase === "waiting-to-broadcast" || phase === "waiting-confirm") {
+    return "Waiting for the next block.";
+  }
+  if (phase === "paused-solo") return "This block only contained your spend.";
+  if (phase === "paused-unscored") return "Couldn't read that block yet.";
+  if (coin.from_pegin && coin.non_solo_blocks === 0) {
+    return "Tied to its peg-in until it is spent in a block with other private activity.";
+  }
+  if (coin.last_other_kernels != null && coin.last_other_outputs != null) {
+    const kernels = coin.last_other_kernels;
+    const outputs = coin.last_other_outputs;
+    return `This block also had ${kernels.toLocaleString("en-US")} other kernel${
+      kernels === 1 ? "" : "s"
+    } and ${outputs.toLocaleString("en-US")} other output${
+      outputs === 1 ? "" : "s"
+    }. Peg-ins and peg-outs in that count publish their amounts.`;
+  }
+  return null;
+}
+
+function churnRowMain(coin: MwebUtxoRecord): string | null {
+  if (churnPhaseActive(coin.churn_phase)) {
+    if (churnPending === "retry") return "Trying again…";
+    if (churnPending === "cancel") return "Cancelling…";
+  }
+  return churnCompanySentence(coin);
+}
+
+function churnVisibleError(coin: MwebUtxoRecord): string | null {
+  if (!churnPhaseActive(coin.churn_phase) || churnPending) return null;
+  return churnActionError || coin.churn_error || null;
+}
+
+type ChurnPillKind = "accent" | "pending" | "error";
+
+function churnPillClass(kind: ChurnPillKind): string {
+  if (kind === "pending") return "pill pending";
+  return `pill churn-pill-${kind}`;
+}
+
+function churnPill(coin: MwebUtxoRecord): { label: string; kind: ChurnPillKind } | null {
+  if (!churnPhaseActive(coin.churn_phase)) return null;
+  if (churnPending === "cancel") return { label: "Cancelling", kind: "pending" };
+  if (churnPending === "retry") return { label: "Trying again", kind: "pending" };
+  if (coin.churn_phase === "waiting-to-broadcast" && (coin.churn_error || churnActionError)) {
+    return { label: "Couldn't send", kind: "error" };
+  }
+  if (coin.churn_phase === "waiting-to-broadcast") return { label: "Sending", kind: "accent" };
+  if (coin.churn_phase === "waiting-confirm") return { label: "Waiting", kind: "accent" };
+  if (coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored") {
+    return { label: "Paused", kind: "pending" };
+  }
+  return null;
+}
+
+function churnSmallerLine(coin: MwebUtxoRecord): string | null {
+  if (
+    churnPhaseActive(coin.churn_phase) &&
+    coin.churn_target != null &&
+    coin.churn_target > 1
+  ) {
+    const counted = coin.churn_counted ?? 0;
+    return `${counted.toLocaleString("en-US")} of ${coin.churn_target.toLocaleString("en-US")} non-solo blocks`;
+  }
+  return churnDepthSentence(coin);
+}
+
+function churnNeedsAttention(coin: MwebUtxoRecord): boolean {
+  return (
+    coin.churn_phase === "paused-solo" ||
+    coin.churn_phase === "paused-unscored" ||
+    (coin.churn_phase === "waiting-to-broadcast" && !!coin.churn_error)
+  );
+}
+
+function churnJobNotice(coin: MwebUtxoRecord): string {
+  if (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error) {
+    return "A self-spend could not be sent.";
+  }
+  if (coin.churn_phase === "paused-solo") return "This block only contained your spend.";
+  if (coin.churn_phase === "paused-unscored") return "Couldn't read that block yet.";
+  return "A self-spend is waiting for the next block.";
+}
+
+function churnSummaryToken(coin: MwebUtxoRecord): string {
+  if (coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored") {
+    return "self-spend paused";
+  }
+  if (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error) return "couldn't send";
+  return "self-spend waiting";
+}
+
+function churnDepthSentence(coin: MwebUtxoRecord): string | null {
+  if (coin.non_solo_blocks == null) {
+    if (!coin.mature || churnPhaseActive(coin.churn_phase)) return null;
+    return "non-solo blocks unknown";
+  }
+  if (coin.non_solo_blocks > 0) {
+    const count = coin.non_solo_blocks;
+    return `${count.toLocaleString("en-US")} non-solo block${count === 1 ? "" : "s"} so far`;
+  }
+  return null;
+}
+
+function pegInStillTied(coin: MwebUtxoRecord): boolean {
+  return (
+    !!coin.mature &&
+    !!coin.from_pegin &&
+    coin.non_solo_blocks === 0 &&
+    !churnPhaseActive(coin.churn_phase)
+  );
+}
+
+function dismissedChurnIds(): Set<string> {
+  try {
+    return new Set((localStorage.getItem(CHURN_BANNER_DISMISSED_KEY) ?? "").split(",").filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function dismissChurnBanner() {
+  const next = dismissedChurnIds();
+  for (const coin of mwebUtxoCache) {
+    if (pegInStillTied(coin)) next.add(coin.output_id);
+  }
+  try {
+    localStorage.setItem(CHURN_BANNER_DISMISSED_KEY, Array.from(next).join(","));
+  } catch {
+    /* storage unavailable */
+  }
+  updateChurnBanner();
+}
+
+function updateChurnBanner() {
+  const pending = mwebUtxoCache.filter(
+    (coin) => pegInStillTied(coin) && !dismissedChurnIds().has(coin.output_id),
+  );
+  const show = currentPhase === "ready" && pending.length > 0;
+  el.churnBanner.hidden = !show;
+  if (show) {
+    el.churnBannerText.textContent =
+      pending.length === 1
+        ? "A private coin is still tied to the peg-in that created it."
+        : "Some private coins are still tied to the peg-in that created them.";
+  }
+  const job = activeChurnCoin();
+  const showJob = currentPhase === "ready" && !!job;
+  el.churnJobBanner.hidden = !showJob;
+  if (showJob && job) el.churnJobBannerText.textContent = churnJobNotice(job);
+  el.navCoinsDot.hidden = !(showJob && !!job && churnNeedsAttention(job));
+}
+
+function renderChurnStatus() {
+  const card = el.churnStatus;
+  const coin = activeChurnCoin();
+  if (!coin) {
+    card.hidden = true;
+    card.textContent = "";
+    delete card.dataset.tone;
+    return;
+  }
+  card.hidden = false;
+  const tone =
+    churnVisibleError(coin) || (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error)
+      ? "error"
+      : coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored"
+        ? "paused"
+        : "waiting";
+  card.dataset.tone = tone;
+  card.setAttribute("aria-busy", churnPending ? "true" : "false");
+  card.textContent = "";
+
+  const head = document.createElement("div");
+  head.className = "churn-status-head";
+  const title = document.createElement("div");
+  title.className = "churn-status-title";
+  const kicker = document.createElement("span");
+  kicker.className = "churn-kicker";
+  kicker.textContent = "Self-spend";
+  title.append(kicker);
+  const pillInfo = churnPill(coin);
+  if (pillInfo) {
+    const pill = document.createElement("span");
+    pill.className = churnPillClass(pillInfo.kind);
+    pill.textContent = pillInfo.label;
+    title.append(pill);
+  }
+  const amt = document.createElement("span");
+  amt.textContent = formatAmountPlain(coin.amount_sats);
+  head.append(title, amt);
+
+  const main = document.createElement("p");
+  main.className = "churn-status-main";
+  main.textContent = churnRowMain(coin) ?? "Waiting for the next block.";
+  card.append(head, main);
+
+  const smaller = churnSmallerLine(coin);
+  if (smaller) {
+    const sub = document.createElement("p");
+    sub.className = "churn-status-sub";
+    sub.textContent = smaller;
+    card.append(sub);
+  }
+  const error = churnVisibleError(coin);
+  if (error) {
+    const err = document.createElement("p");
+    err.className = "churn-status-error";
+    err.textContent = error;
+    card.append(err);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "churn-status-actions";
+  const phase = coin.churn_phase;
+  const canRetry =
+    phase === "paused-solo" ||
+    phase === "paused-unscored" ||
+    (phase === "waiting-to-broadcast" && !!(coin.churn_error || churnActionError));
+  if (canRetry) {
+    const again = document.createElement("button");
+    again.type = "button";
+    again.className = "btn btn-primary btn-sm";
+    again.textContent = "Try again";
+    again.disabled = churnPending != null;
+    again.addEventListener("click", () => void retryChurn());
+    actions.append(again);
+  }
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn btn-ghost btn-sm";
+  cancel.textContent = "Cancel";
+  cancel.disabled = churnPending != null;
+  cancel.addEventListener("click", () => void cancelChurn());
+  actions.append(cancel);
+  card.append(actions);
+}
+
 function renderMwebCoinsList() {
+  renderChurnStatus();
   el.coinsMwebList.textContent = "";
   el.coinsMwebEmpty.hidden = mwebUtxoCache.length > 0;
   let immature = 0;
-  let frozen = 0;
   for (const coin of mwebUtxoCache) {
     if (!coin.mature) immature += 1;
-    if (coin.locked) frozen += 1;
+    const jobHolds = churnPhaseActive(coin.churn_phase);
     const li = document.createElement("li");
-    li.className = coin.locked || !coin.mature ? "utxo-row is-locked" : "utxo-row";
+    li.className =
+      !coin.mature || (coin.locked && !jobHolds) ? "utxo-row is-locked" : "utxo-row";
     const main = document.createElement("div");
     main.className = "utxo-main";
+    const amtRow = document.createElement("div");
+    amtRow.className = "utxo-amt";
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(coin.amount_sats);
+    amtRow.append(amt);
+    const pillInfo = churnPill(coin);
+    if (pillInfo) {
+      const pill = document.createElement("span");
+      pill.className = churnPillClass(pillInfo.kind);
+      pill.textContent = pillInfo.label;
+      amtRow.append(pill);
+    }
     const meta = document.createElement("span");
     meta.className = "utxo-meta";
     const left = coin.maturity_blocks_left ?? 0;
@@ -5019,10 +5345,25 @@ function renderMwebCoinsList() {
         : `${coin.confirmations.toLocaleString("en-US")} conf`;
     const labelBit = coin.label ? ` · ${coin.label}` : "";
     meta.textContent = coin.mature
-      ? `${conf}${coin.locked ? " · frozen" : ""}${labelBit}`
+      ? `${conf}${coin.locked && !jobHolds ? " · frozen" : ""}${labelBit}`
       : coin.confirmations === 0
         ? "pending · not yet spendable"
         : `maturing · ${left} block${left === 1 ? "" : "s"} left`;
+    const company = churnRowMain(coin);
+    const companyLine = document.createElement("span");
+    companyLine.className = "utxo-meta";
+    companyLine.hidden = !company;
+    companyLine.textContent = company ?? "";
+    const errorText = churnVisibleError(coin);
+    const errorLine = document.createElement("span");
+    errorLine.className = "churn-status-error";
+    errorLine.hidden = !errorText;
+    errorLine.textContent = errorText ?? "";
+    const depth = churnSmallerLine(coin);
+    const depthLine = document.createElement("span");
+    depthLine.className = "utxo-depth";
+    depthLine.hidden = !depth;
+    depthLine.textContent = depth ?? "";
     const id = document.createElement("span");
     id.className = "utxo-id";
     id.textContent = coin.output_id;
@@ -5035,37 +5376,55 @@ function renderMwebCoinsList() {
     labelInput.addEventListener("change", () => {
       void persistUtxoLabel(coin.output_id, labelInput.value);
     });
-    main.append(amt, meta, id, labelInput);
-    const actions = document.createElement("div");
-    actions.className = "split-actions";
-    const freeze = document.createElement("button");
-    freeze.type = "button";
-    freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-    freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
-    freeze.disabled = !coin.mature && !coin.locked;
-    freeze.addEventListener("click", () => void toggleMwebLocked(coin));
-    const split = document.createElement("button");
-    split.type = "button";
-    split.className = "btn btn-ghost btn-sm";
-    split.textContent = "Split";
-    const splitBlocked = !!coin.locked || !coin.mature;
-    split.disabled = splitBlocked;
-    split.title = coin.locked
-      ? "Unfreeze to split."
-      : coin.mature
-        ? "Split this private coin into multiple outputs"
-        : left > 0
-          ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
-          : "Cannot spend privately until confirmed.";
-    split.addEventListener("click", () => {
-      void openSplitModal({
-        chain: "private",
-        id: coin.output_id,
-        amount_sats: coin.amount_sats,
+    main.append(amtRow, meta, companyLine, errorLine, depthLine, id, labelInput);
+    li.append(main);
+    if (!jobHolds) {
+      const actions = document.createElement("div");
+      actions.className = "split-actions";
+      const spend = document.createElement("button");
+      spend.type = "button";
+      const tied =
+        !!coin.from_pegin && coin.non_solo_blocks === 0 && coin.mature && !coin.locked;
+      spend.className = tied ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm";
+      spend.textContent = "Spend to self";
+      spend.disabled = !coin.mature || !!coin.locked;
+      spend.title = coin.locked
+        ? "Unfreeze to spend to self."
+        : coin.mature
+          ? "Spend this coin to an address of this wallet"
+          : left > 0
+            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
+            : "Cannot spend privately until confirmed.";
+      spend.addEventListener("click", () => void openChurnModal(coin));
+      const freeze = document.createElement("button");
+      freeze.type = "button";
+      freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+      freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
+      freeze.disabled = !coin.mature && !coin.locked;
+      freeze.addEventListener("click", () => void toggleMwebLocked(coin));
+      const split = document.createElement("button");
+      split.type = "button";
+      split.className = "btn btn-ghost btn-sm";
+      split.textContent = "Split";
+      const splitBlocked = !!coin.locked || !coin.mature;
+      split.disabled = splitBlocked;
+      split.title = coin.locked
+        ? "Unfreeze to split."
+        : coin.mature
+          ? "Split this private coin into multiple outputs"
+          : left > 0
+            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
+            : "Cannot spend privately until confirmed.";
+      split.addEventListener("click", () => {
+        void openSplitModal({
+          chain: "private",
+          id: coin.output_id,
+          amount_sats: coin.amount_sats,
+        });
       });
-    });
-    actions.append(freeze, split);
-    li.append(main, actions);
+      actions.append(spend, freeze, split);
+      li.append(actions);
+    }
     el.coinsMwebList.appendChild(li);
   }
   if (mwebUtxoCache.length === 0) {
@@ -5075,8 +5434,153 @@ function renderMwebCoinsList() {
     el.coinsMwebSum.hidden = false;
     const bits = [`${mwebUtxoCache.length} coin${mwebUtxoCache.length === 1 ? "" : "s"}`];
     if (immature) bits.push(`${immature} maturing`);
-    if (frozen) bits.push(`${frozen} frozen`);
+    const userFrozen = mwebUtxoCache.filter(
+      (coin) => !!coin.locked && !churnPhaseActive(coin.churn_phase),
+    ).length;
+    if (userFrozen) bits.push(`${userFrozen} frozen`);
+    const active = activeChurnCoin();
+    if (active) bits.push(churnSummaryToken(active));
     el.coinsMwebSum.textContent = bits.join(" · ");
+  }
+  updateChurnBanner();
+}
+
+async function retryChurn() {
+  if (churnPending) return;
+  churnPending = "retry";
+  churnActionError = null;
+  renderMwebCoinsList();
+  try {
+    await invoke("retry_churn");
+  } catch (err) {
+    churnActionError = String(err);
+    setStatus(churnActionError, "error");
+  } finally {
+    churnPending = null;
+    await refreshUtxos();
+  }
+}
+
+async function cancelChurn() {
+  if (churnPending) return;
+  churnPending = "cancel";
+  churnSuppressFinish = true;
+  churnActionError = null;
+  renderMwebCoinsList();
+  try {
+    await invoke("cancel_churn");
+  } catch (err) {
+    churnActionError = String(err);
+    setStatus(churnActionError, "error");
+  } finally {
+    churnPending = null;
+    await refreshUtxos();
+    churnSuppressFinish = false;
+  }
+}
+
+async function openChurnModal(coin: MwebUtxoRecord) {
+  let targetDepth = 1;
+  let previewOk = false;
+  const choice = await openModal({
+    title: "Spend to self",
+    build(body) {
+      const sheet = document.createElement("div");
+      sheet.className = "churn-sheet";
+      appendParagraph(
+        sheet,
+        "Spend this coin to an address of this wallet. It mixes only if that block also has other private activity.",
+        "hint",
+      );
+      const feeBox = document.createElement("div");
+      const amount = document.createElement("p");
+      amount.className = "hint";
+      const quiet = document.createElement("p");
+      quiet.className = "hint";
+      const err = document.createElement("p");
+      err.className = "error";
+      err.hidden = true;
+      const details = document.createElement("details");
+      details.className = "churn-more";
+      const summary = document.createElement("summary");
+      summary.textContent = "Keep going for more non-solo blocks";
+      const field = document.createElement("label");
+      field.className = "field";
+      const caption = document.createElement("span");
+      caption.className = "field-label";
+      caption.textContent = "Non-solo blocks";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "2";
+      input.max = "10";
+      input.step = "1";
+      input.value = "2";
+      field.append(caption, input);
+      details.append(summary, field);
+      sheet.append(feeBox, amount, quiet, err, details);
+      body.append(sheet);
+
+      let seq = 0;
+      const paint = (preview: ChurnPreview | null, message: string | null) => {
+        previewOk = preview != null;
+        feeBox.replaceChildren();
+        if (preview) {
+          const rows: DetailRow[] = [["Fee for this hop", formatAmount(preview.hop_fee_sats)]];
+          if (preview.target_depth > 1) {
+            rows.push(["Fees if every block counts", formatAmount(preview.total_fee_sats)]);
+          }
+          feeBox.append(buildDetailList(rows));
+          amount.textContent = preview.amount_note;
+          quiet.textContent = preview.quiet_block_note;
+        }
+        err.hidden = !message;
+        err.textContent = message ?? "";
+        const go = el.modalActions.querySelector<HTMLButtonElement>('[data-action="start"]');
+        if (go) {
+          go.disabled = !previewOk;
+          go.textContent = targetDepth === 1 ? "Spend once" : "Start";
+        }
+      };
+
+      const refresh = async () => {
+        targetDepth = details.open
+          ? Math.min(10, Math.max(2, Math.floor(Number(input.value) || 2)))
+          : 1;
+        const ticket = ++seq;
+        try {
+          const preview = await invoke<ChurnPreview>("preview_churn", {
+            req: { output_id: coin.output_id, target_depth: targetDepth },
+          });
+          if (ticket !== seq) return;
+          paint(preview, null);
+        } catch (error) {
+          if (ticket !== seq) return;
+          paint(null, String(error));
+        }
+      };
+
+      queueMicrotask(() => {
+        const go = el.modalActions.querySelector<HTMLButtonElement>('[data-action="start"]');
+        if (go && !previewOk) go.disabled = true;
+      });
+      details.addEventListener("toggle", () => void refresh());
+      input.addEventListener("input", () => void refresh());
+      void refresh();
+    },
+    actions: [
+      { id: "start", label: "Spend once", kind: "primary" },
+      { id: "cancel", label: "Cancel", kind: "ghost" },
+    ],
+  });
+  if (choice !== "start" || !previewOk) return;
+  try {
+    await invoke("start_churn", {
+      req: { output_id: coin.output_id, target_depth: targetDepth },
+    });
+    await refreshUtxos();
+  } catch (err) {
+    await refreshUtxos();
+    if (!activeChurnCoin()) setStatus(String(err), "error");
   }
 }
 
@@ -5151,6 +5655,7 @@ function renderMwebControlList(panel: CoinControlPanel) {
   panel.empty.hidden = mwebUtxoCache.length > 0;
   for (const coin of mwebUtxoCache) {
     const li = document.createElement("li");
+    const jobHolds = churnPhaseActive(coin.churn_phase);
     const blocked = !!coin.locked || !coin.mature;
     li.className = blocked ? "utxo-row is-locked" : "utxo-row";
 
@@ -5159,7 +5664,9 @@ function renderMwebControlList(panel: CoinControlPanel) {
     check.disabled = blocked;
     check.checked = panel.selected.has(coin.output_id);
     const left = coin.maturity_blocks_left ?? 0;
-    check.title = coin.locked
+    check.title = jobHolds
+      ? "A self-spend has this coin."
+      : coin.locked
       ? "Unfreeze to spend."
       : !coin.mature
         ? coin.confirmations === 0
@@ -5201,6 +5708,8 @@ function renderMwebControlList(panel: CoinControlPanel) {
     freeze.type = "button";
     freeze.className = "btn btn-ghost btn-sm utxo-freeze";
     freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
+    freeze.disabled = jobHolds;
+    freeze.title = jobHolds ? "A self-spend has this coin." : "";
     freeze.addEventListener("click", () => void toggleMwebLocked(coin));
 
     li.append(check, main, freeze);
@@ -5209,14 +5718,25 @@ function renderMwebControlList(panel: CoinControlPanel) {
   updateMwebControlSum(panel);
 }
 
+function noteChurnFinished() {
+  const active = !!activeChurnCoin();
+  if (churnSawActive && !active && !churnSuppressFinish) {
+    setStatus("Self-spend finished.", "info");
+  }
+  if (!active) churnActionError = null;
+  churnSawActive = active;
+}
+
 async function refreshUtxos() {
   try {
     utxoCache = (await invoke<UtxoRecord[]>("list_unspent")) ?? [];
   } catch {
     utxoCache = [];
   }
+  let mwebListOk = false;
   try {
     mwebUtxoCache = (await invoke<MwebUtxoRecord[]>("list_mweb_unspent")) ?? [];
+    mwebListOk = true;
   } catch {
     mwebUtxoCache = [];
   }
@@ -5230,6 +5750,7 @@ async function refreshUtxos() {
   renderMwebControlList(pegoutCoinPanel);
   renderCoinsList();
   renderMwebCoinsList();
+  if (mwebListOk) noteChurnFinished();
   reapplyPressedAmountPresets();
 }
 

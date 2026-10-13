@@ -21,9 +21,11 @@ use crate::dto::{
     RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetTxLabelRequest,
     SetUtxoLabelRequest, SetMwebUtxoLockedRequest, SetUtxoLockedRequest, SplitChain, SplitPreview,
     SplitRequest, SplitResult, SyncResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest,
-    UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary, DEFAULT_MWEB_FEE_SATS,
+    UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE,
+    CHURN_QUIET_NOTE, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, DEFAULT_MWEB_FEE_SATS,
 };
 use crate::contacts;
+use crate::churn::{self, HopScore};
 use crate::labels;
 use crate::metadata::{self, MetadataImportResult};
 use crate::split::{self, PlanParams};
@@ -604,6 +606,7 @@ impl WalletApp {
         let _ = state.mweb.as_ref().ok_or_else(|| {
             WalletError::Mweb("MWEB runtime not initialized".into())
         })?;
+        refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
         mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
     }
 
@@ -889,6 +892,12 @@ impl WalletApp {
             }
             let _ = mweb.persist(&state.data_dir);
             mweb_ms = mweb_started.elapsed().as_millis() as u64;
+        }
+
+        self.abort_if_locked(&mut guard)?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        if state.mweb.is_some() {
+            let _ = drive_churn(state);
         }
 
         self.abort_if_locked(&mut guard)?;
@@ -1312,6 +1321,87 @@ impl WalletApp {
         }
     }
 
+    pub fn preview_churn(&self, req: ChurnRequest) -> Result<ChurnPreview, WalletError> {
+        self.ensure_unlocked()?;
+        let guard = self.lock_state()?;
+        let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+        let (info, frozen, job_active, from_pegin) = churn_start_facts(state, &req.output_id)?;
+        let target = churn::check_start(&churn::StartCheck {
+            mature: info.mature,
+            frozen,
+            amount_sats: info.amount,
+            fee_sats: DEFAULT_MWEB_FEE_SATS,
+            job_active,
+            target_depth: req.target_depth,
+        })?;
+        let _ = from_pegin;
+        Ok(ChurnPreview {
+            input_sats: info.amount,
+            hop_fee_sats: DEFAULT_MWEB_FEE_SATS,
+            resulting_sats: info.amount - DEFAULT_MWEB_FEE_SATS,
+            target_depth: target,
+            total_fee_sats: DEFAULT_MWEB_FEE_SATS.saturating_mul(target as u64),
+            amount_note: CHURN_AMOUNT_NOTE.to_string(),
+            quiet_block_note: CHURN_QUIET_NOTE.to_string(),
+        })
+    }
+
+    pub fn start_churn(&self, req: ChurnRequest) -> Result<ChurnStatus, WalletError> {
+        self.ensure_unlocked()?;
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let (info, frozen, job_active, from_pegin) = churn_start_facts(state, &req.output_id)?;
+        let target = churn::check_start(&churn::StartCheck {
+            mature: info.mature,
+            frozen,
+            amount_sats: info.amount,
+            fee_sats: DEFAULT_MWEB_FEE_SATS,
+            job_active,
+            target_depth: req.target_depth,
+        })?;
+        let mut job = churn::new_job(&req.output_id, from_pegin || info.is_pegin, target, DEFAULT_MWEB_FEE_SATS)?;
+        churn::write_job(&state.data_dir, &job)?;
+        mweb_frozen::set_locked(&state.data_dir, &job.current_output_id, true)?;
+        broadcast_churn(state, &mut job)?;
+        Ok(churn::status_view(&job))
+    }
+
+    pub fn churn_status(&self) -> Result<Option<ChurnStatus>, WalletError> {
+        self.ensure_unlocked()?;
+        let guard = self.lock_state()?;
+        let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+        Ok(churn::read_job(&state.data_dir)?.map(|job| churn::status_view(&job)))
+    }
+
+    pub fn retry_churn(&self) -> Result<ChurnStatus, WalletError> {
+        self.ensure_unlocked()?;
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let mut job = churn::read_job(&state.data_dir)?
+            .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
+        churn::request_retry(&mut job)?;
+        churn::write_job(&state.data_dir, &job)?;
+        let _ = drive_churn(state);
+        let job = churn::read_job(&state.data_dir)?
+            .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
+        // A saved broadcast error stays on the job for the Coins card. It is not a failed command.
+        Ok(churn::status_view(&job))
+    }
+
+    pub fn cancel_churn(&self) -> Result<ChurnStatus, WalletError> {
+        self.ensure_unlocked()?;
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let mut job = churn::read_job(&state.data_dir)?
+            .ok_or_else(|| WalletError::BuildTx("There is no self-spend to cancel.".into()))?;
+        let output_id = job.current_output_id.clone();
+        churn::request_cancel(&mut job)?;
+        // Persist the cancellation before unlocking. A failed unlock must not leave the job active.
+        churn::write_job(&state.data_dir, &job)?;
+        mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
+        Ok(churn::status_view(&job))
+    }
+
     fn create_or_restore(
         &self,
         data_dir: &Path,
@@ -1668,6 +1758,7 @@ impl MemoryBackedApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+        refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
         mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
     }
 
@@ -2647,6 +2738,126 @@ fn fetch_tx_hex_litecoinspace(txid_hex: &str) -> Result<Vec<u8>, String> {
         return Err("response was not hex".into());
     }
     hex::decode(hex).map_err(|e| e.to_string())
+}
+
+fn refuse_churn_unfreeze(data_dir: &Path, output_id: &str, locked: bool) -> Result<(), WalletError> {
+    if locked {
+        return Ok(());
+    }
+    if churn::held_by_active_job(data_dir, output_id)? {
+        return Err(WalletError::Mweb("A self-spend has this coin.".into()));
+    }
+    Ok(())
+}
+
+fn hash_at(wallet: &PersistedWallet<Connection>, height: u32) -> Option<bdk_wallet::bitcoin::BlockHash> {
+    if wallet.latest_checkpoint().height() == height {
+        return Some(wallet.latest_checkpoint().hash());
+    }
+    wallet.local_chain().get(height).map(|cp| cp.hash())
+}
+
+fn score_inclusion(state: &WalletState, height: u32) -> HopScore {
+    if height == 0 {
+        return HopScore::Unscored;
+    }
+    let Some(inclusion_hash) = hash_at(&state.wallet, height) else {
+        return HopScore::Unscored;
+    };
+    let Some(parent_hash) = hash_at(&state.wallet, height - 1) else {
+        return HopScore::Unscored;
+    };
+    let addrs = mweb::peers_for_headers(&state.mweb_peers, state.network);
+    let inclusion = mweb::fetch_mmr_sizes(&addrs, state.network, inclusion_hash);
+    let parent = mweb::fetch_mmr_sizes(&addrs, state.network, parent_hash);
+    churn::score_1in1_hop(parent, inclusion)
+}
+
+fn churn_start_facts(
+    state: &WalletState,
+    output_id: &str,
+) -> Result<(mweb::ChurnCoinInfo, bool, bool, bool), WalletError> {
+    let mweb = state.mweb.as_ref().ok_or_else(|| {
+        WalletError::Mweb("MWEB runtime not initialized".into())
+    })?;
+    let tip = state.wallet.latest_checkpoint().height();
+    let info = mweb::churn_coin_info(mweb, tip, output_id)?;
+    let id = mweb_frozen::normalize_output_id(output_id)?;
+    let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids.contains(&id);
+    let job_active = churn::read_job(&state.data_dir)?
+        .is_some_and(|job| job.phase.is_active());
+    let recorded = churn::depth_of(&state.data_dir, &id)?.is_some_and(|record| record.from_pegin);
+    Ok((info, frozen, job_active, recorded))
+}
+
+fn broadcast_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(), WalletError> {
+    let spent_id = job.current_output_id.clone();
+    let rpc_url = state.litecoin_rpc_url.clone();
+    let peers = state.mweb_peers.clone();
+    let network = state.network;
+    let data_dir = state.data_dir.clone();
+    let fee = job.fee_sats;
+    let from_pegin = job.from_pegin;
+    let mweb = state.mweb.as_mut().ok_or_else(|| {
+        WalletError::Mweb("MWEB runtime not initialized".into())
+    })?;
+    match mweb::mweb_self_spend(
+        &state.wallet,
+        mweb,
+        &data_dir,
+        rpc_url.as_deref(),
+        &peers,
+        &spent_id,
+        fee,
+        network,
+    ) {
+        Ok(spent) => {
+            mweb.persist(&data_dir)?;
+            mweb_frozen::set_locked(&data_dir, &spent_id, false)?;
+            mweb_frozen::set_locked(&data_dir, &spent.output_id, true)?;
+            churn::inherit_depth(&data_dir, &spent_id, &spent.output_id, from_pegin)?;
+            churn::note_broadcast(job, &spent.wtxid, &spent.output_id)?;
+            churn::write_job(&data_dir, job)?;
+            Ok(())
+        }
+        Err(e) => {
+            churn::note_broadcast_error(job, e.to_string());
+            churn::write_job(&data_dir, job)?;
+            Err(e)
+        }
+    }
+}
+
+/// Score a confirmed hop, then broadcast the next one when the job asks for it.
+/// Broadcast failures stay on the job so sync itself still succeeds.
+fn drive_churn(state: &mut WalletState) -> Result<(), WalletError> {
+    let Some(mut job) = churn::read_job(&state.data_dir)? else {
+        return Ok(());
+    };
+    if matches!(
+        job.phase,
+        ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
+    ) {
+        let height = state
+            .mweb
+            .as_ref()
+            .and_then(|mweb| mweb::coin_block_height(mweb, &job.current_output_id));
+        if let Some(height) = height {
+            let score = score_inclusion(state, height);
+            let output_id = job.current_output_id.clone();
+            let from_pegin = job.from_pegin;
+            churn::apply_score(&mut job, score)?;
+            churn::commit_score(&state.data_dir, &output_id, from_pegin, score)?;
+            if job.phase == ChurnPhase::Done {
+                mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
+            }
+            churn::write_job(&state.data_dir, &job)?;
+        }
+    }
+    if churn::ready_to_broadcast(&job) {
+        let _ = broadcast_churn(state, &mut job);
+    }
+    Ok(())
 }
 
 fn parse_txid(hex: &str) -> Option<Txid> {

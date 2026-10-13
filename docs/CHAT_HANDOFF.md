@@ -71,6 +71,7 @@ Boot → Unlock | Migrate | Onboarding → Mnemonic backup → verify quiz → H
 - **Done (post-competitive M2–M4):** Broadcast failure recovery modal; persistent Electrum/MWEB status strip; UTXO labels + change warning; Coins nav; metadata export/import; Electrum presets + test connection. Live E2E checklist [`MWEB_E2E.md`](MWEB_E2E.md); notarization runbook [`NOTARIZATION.md`](NOTARIZATION.md).
 - **Done (feat/denomination-split):** Coins Public/Private lists; Split modal (equal + preset denominations) as 1-in-N-out self-transfer. Simple Send stays single-recipient.
 - **Done (feat/n-to-n-pegout):** Swap → Public Max / Choose coins emit one HogEx output per private coin (one kernel, fee from largest). Typed amount with no coins picked stays 1-out.
+- **Done (feat/mweb-churn):** Coins → Spend to self. One private coin, one confirmed block per hop, counted only when the inclusion headers show the block was not ours alone. See [`docs/CHURN.md`](CHURN.md).
 - **Next (P4 deferred):** Multi-wallet, hardware wallets, Tor/proxy — future architecture.
 
 ## Implementation status

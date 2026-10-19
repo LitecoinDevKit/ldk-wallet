@@ -668,6 +668,9 @@ pub struct MwebUtxoRecord {
     /// Other outputs in the last counted block.
     #[serde(default)]
     pub last_other_outputs: Option<u64>,
+    /// Counted blocks, oldest first. Empty on records saved before this list existed.
+    #[serde(default)]
+    pub hops: Vec<ChurnHop>,
     /// Live self-spend phase when this coin is the job's current output.
     #[serde(default)]
     pub churn_phase: Option<ChurnPhase>,
@@ -805,6 +808,13 @@ pub struct ChurnStatus {
     pub last_error: Option<String>,
 }
 
+/// Other kernels and outputs in one counted block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChurnHop {
+    pub other_kernels: u64,
+    pub other_outputs: u64,
+}
+
 /// Local record that a coin has shared some number of blocks. Exported with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChurnDepthRecord {
@@ -814,6 +824,9 @@ pub struct ChurnDepthRecord {
     pub last_other_kernels: Option<u64>,
     #[serde(default)]
     pub last_other_outputs: Option<u64>,
+    /// Counted blocks, oldest first. Missing on older files and bundles.
+    #[serde(default)]
+    pub hops: Vec<ChurnHop>,
     #[serde(default)]
     pub from_pegin: bool,
 }

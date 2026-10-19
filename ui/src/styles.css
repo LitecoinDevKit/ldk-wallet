@@ -2228,6 +2228,12 @@ textarea {
   font-size: 0.68rem;
 }
 
+.utxo-hops {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+}
+
 .utxo-id {
   font-family: var(--font-mono);
   font-size: 0.68rem;

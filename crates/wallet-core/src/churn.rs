@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{ChurnDepthRecord, ChurnPhase, ChurnStatus, CHURN_MAX_TARGET};
+use crate::dto::{ChurnDepthRecord, ChurnHop, ChurnPhase, ChurnStatus, CHURN_MAX_TARGET};
 use crate::error::WalletError;
 use crate::mweb_frozen;
 
@@ -124,6 +124,9 @@ struct StoredDepth {
     last_other_kernels: Option<u64>,
     #[serde(default)]
     last_other_outputs: Option<u64>,
+    /// Counted blocks, oldest first.
+    #[serde(default)]
+    hops: Vec<ChurnHop>,
     #[serde(default)]
     from_pegin: bool,
 }
@@ -135,6 +138,7 @@ impl StoredDepth {
             non_solo_blocks: self.non_solo_blocks,
             last_other_kernels: self.last_other_kernels,
             last_other_outputs: self.last_other_outputs,
+            hops: self.hops.clone(),
             from_pegin: self.from_pegin,
         }
     }
@@ -146,6 +150,7 @@ impl From<&ChurnDepthRecord> for StoredDepth {
             non_solo_blocks: record.non_solo_blocks,
             last_other_kernels: record.last_other_kernels,
             last_other_outputs: record.last_other_outputs,
+            hops: record.hops.clone(),
             from_pegin: record.from_pegin,
         }
     }
@@ -638,6 +643,7 @@ pub fn inherit_depth(
             non_solo_blocks: prev.non_solo_blocks,
             last_other_kernels: None,
             last_other_outputs: None,
+            hops: prev.hops,
             from_pegin: from_pegin || prev.from_pegin,
         },
     );
@@ -698,16 +704,16 @@ pub fn commit_score(
     });
     entry.from_pegin = entry.from_pegin || from_pegin;
     match score {
-        HopScore::Unscored => {}
-        HopScore::Solo => {
-            entry.last_other_kernels = None;
-            entry.last_other_outputs = None;
-        }
+        HopScore::Unscored | HopScore::Solo => {}
         HopScore::Mixed {
             other_kernels,
             other_outputs,
         } => {
             entry.non_solo_blocks = entry.non_solo_blocks.saturating_add(1);
+            entry.hops.push(ChurnHop {
+                other_kernels,
+                other_outputs,
+            });
             entry.last_other_kernels = Some(other_kernels);
             entry.last_other_outputs = Some(other_outputs);
         }
@@ -994,7 +1000,50 @@ mod tests {
         assert_eq!(mixed.non_solo_blocks, 1);
         assert_eq!(mixed.last_other_kernels, Some(2));
         assert_eq!(mixed.last_other_outputs, Some(3));
+        assert_eq!(
+            mixed.hops,
+            vec![ChurnHop {
+                other_kernels: 2,
+                other_outputs: 3,
+            }]
+        );
         assert!(depth_of(dir.path(), &from).unwrap().is_none());
+
+        let next = "ef".repeat(32);
+        inherit_depth(dir.path(), &to, &next, true).unwrap();
+        let moved = depth_of(dir.path(), &next).unwrap().unwrap();
+        assert_eq!(moved.non_solo_blocks, 1);
+        assert!(moved.last_other_kernels.is_none());
+        assert_eq!(moved.hops, mixed.hops);
+        commit_score(
+            dir.path(),
+            &next,
+            true,
+            HopScore::Mixed {
+                other_kernels: 5,
+                other_outputs: 6,
+            },
+        )
+        .unwrap();
+        commit_score(dir.path(), &next, true, HopScore::Solo).unwrap();
+        let both = depth_of(dir.path(), &next).unwrap().unwrap();
+        assert_eq!(both.non_solo_blocks, 2);
+        assert_eq!(both.last_other_kernels, Some(5));
+        assert_eq!(both.last_other_outputs, Some(6));
+        assert_eq!(
+            both.hops,
+            vec![
+                ChurnHop {
+                    other_kernels: 2,
+                    other_outputs: 3,
+                },
+                ChurnHop {
+                    other_kernels: 5,
+                    other_outputs: 6,
+                },
+            ]
+        );
+        assert!(depth_of(dir.path(), &to).unwrap().is_none());
     }
 
     #[test]

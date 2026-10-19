@@ -264,6 +264,10 @@ mod tests {
                 non_solo_blocks: 2,
                 last_other_kernels: Some(3),
                 last_other_outputs: Some(4),
+                hops: vec![crate::dto::ChurnHop {
+                    other_kernels: 1,
+                    other_outputs: 2,
+                }],
                 from_pegin: true,
             }],
         )
@@ -276,6 +280,8 @@ mod tests {
         assert_eq!(restored.non_solo_blocks, 2);
         assert_eq!(restored.last_other_kernels, Some(3));
         assert_eq!(restored.last_other_outputs, Some(4));
+        assert_eq!(restored.hops.len(), 1);
+        assert_eq!(restored.hops[0].other_kernels, 1);
         assert!(restored.from_pegin);
     }
 }

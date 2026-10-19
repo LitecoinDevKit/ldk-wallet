@@ -192,6 +192,11 @@ type UtxoRecord = {
   label?: string;
 };
 
+type ChurnHop = {
+  other_kernels: number;
+  other_outputs: number;
+};
+
 type MwebUtxoRecord = {
   output_id: string;
   amount_sats: number;
@@ -204,6 +209,7 @@ type MwebUtxoRecord = {
   non_solo_blocks?: number | null;
   last_other_kernels?: number | null;
   last_other_outputs?: number | null;
+  hops?: ChurnHop[];
   churn_phase?: ChurnPhase | null;
   churn_error?: string | null;
   churn_target?: number | null;
@@ -5306,6 +5312,21 @@ function churnDepthSentence(coin: MwebUtxoRecord): string | null {
   return null;
 }
 
+function churnHopLine(kernels: number, outputs: number): string {
+  return `${kernels.toLocaleString("en-US")} other kernel${kernels === 1 ? "" : "s"} and ${outputs.toLocaleString("en-US")} other output${outputs === 1 ? "" : "s"}.`;
+}
+
+/** Saved hops under the count. A higher count than the list means older blocks were not kept. */
+function churnHopLines(coin: MwebUtxoRecord): string[] {
+  const hops = coin.hops ?? [];
+  const count = coin.non_solo_blocks ?? 0;
+  const knownLatest = coin.last_other_kernels != null && coin.last_other_outputs != null;
+  const accounted = hops.length > 0 ? hops.length : knownLatest ? 1 : 0;
+  const lines = hops.map((hop) => churnHopLine(hop.other_kernels, hop.other_outputs));
+  if (count > accounted) lines.push("Earlier blocks were not saved.");
+  return lines;
+}
+
 function pegInStillTied(coin: MwebUtxoRecord): boolean {
   return (
     !!coin.mature &&
@@ -5576,6 +5597,15 @@ function renderMwebCoinsList() {
     depthLine.className = "utxo-depth";
     depthLine.hidden = !depth;
     depthLine.textContent = depth ?? "";
+    const hopLines = document.createElement("div");
+    hopLines.className = "utxo-hops";
+    for (const line of churnHopLines(coin)) {
+      const hop = document.createElement("span");
+      hop.className = "utxo-depth";
+      hop.textContent = line;
+      hopLines.append(hop);
+    }
+    hopLines.hidden = hopLines.childElementCount === 0;
     const id = document.createElement("span");
     id.className = "utxo-id";
     id.textContent = coin.output_id;
@@ -5588,7 +5618,7 @@ function renderMwebCoinsList() {
     labelInput.addEventListener("change", () => {
       void persistUtxoLabel(coin.output_id, labelInput.value);
     });
-    main.append(amtRow, meta, companyLine, errorLine, depthLine, id, labelInput);
+    main.append(amtRow, meta, companyLine, errorLine, depthLine, hopLines, id, labelInput);
     li.append(main);
     if (!jobHolds) {
       const actions = document.createElement("div");

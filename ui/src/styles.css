@@ -55,11 +55,7 @@
   color-scheme: dark;
 
   --bg: #07080c;
-  --backdrop-gradient: radial-gradient(
-    120% 80% at 50% -10%,
-    #171b24 0%,
-    #07080c 55%
-  );
+  --backdrop-gradient: #07080c;
 
   --surface-1: #10131a;
   --surface-2: #171b24;
@@ -81,12 +77,25 @@
   --danger-soft: rgba(242, 82, 70, 0.14);
   --warning: #e0a545;
 
-  --panel-bg: rgba(16, 19, 26, 0.86);
-  --chrome-bg: rgba(16, 19, 26, 0.72);
+  --panel-bg: #10131a;
+  --chrome-bg: #07080c;
 
   --shadow-1: 0 2px 4px rgba(0, 0, 0, 0.35);
   --shadow-2: 0 14px 34px -12px rgba(0, 0, 0, 0.7);
   --skeleton: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2));
+}
+
+/* Dark chrome matches the site: flat field, solid surfaces, line borders. */
+:root[data-theme="dark"] {
+  --glass-blur: none;
+  --glass-fill: #10131a;
+  --glass-fill-hover: #171b24;
+  --glass-hairline: #2a3140;
+  --glass-ring: linear-gradient(#2a3140, #2a3140);
+  --glass-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+  --text-glass-1: #e8eaf0;
+  --text-glass-2: #b4bccb;
+  --text-glass-3: #7d8798;
 }
 
 :root[data-theme="light"] {
@@ -474,7 +483,7 @@ code {
 }
 
 .nav-item:hover {
-  background: var(--glass-fill);
+  background: var(--glass-fill-hover);
   color: var(--text-glass-1);
 }
 
@@ -484,6 +493,19 @@ code {
   color: var(--text-glass-1);
   box-shadow: inset 0 0.5px 0 rgba(238, 235, 235, 0.67), inset 0 0 0 0.5px rgba(216, 210, 210, 0.3),
     0 2px 4px rgba(0, 0, 0, 0.07);
+}
+
+:root[data-theme="dark"] .nav-item[aria-selected="true"],
+:root[data-theme="dark"] .topbar .btn-secondary,
+:root[data-theme="dark"] .topbar .btn-ghost,
+:root[data-theme="dark"] .topbar .badge,
+:root[data-theme="dark"] .hero-stat {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+:root[data-theme="dark"] ::selection {
+  background: #2a3d72;
+  color: #f4f7ff;
 }
 
 .nav-item:focus-visible {

@@ -109,10 +109,10 @@
   --text-2: #3a4458;
   --text-3: #5c6778;
 
-  --accent: #3d5fd4;
-  --accent-hover: #3453bc;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(61, 95, 212, 0.12);
+  --accent: #8eb0ff;
+  --accent-hover: #6d96f0;
+  --accent-ink: #07080c;
+  --accent-soft: rgba(142, 176, 255, 0.28);
 
   --success: #20bb74;
   --danger: #f25246;
@@ -330,18 +330,16 @@ code {
 }
 
 .brand-mark {
-  display: grid;
-  place-items: center;
+  display: block;
   flex: 0 0 auto;
   width: 2rem;
   height: 2rem;
-  border-radius: 10px;
-  background: #10131a;
-  box-shadow: inset 0 0 0 1px #2a3140;
-  color: #8eb0ff;
-  font-size: 1.05rem;
-  font-weight: 700;
-  line-height: 1;
+}
+
+.brand-mark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .brand > .brand-text {
@@ -351,11 +349,31 @@ code {
   text-overflow: ellipsis;
 }
 
+.brand-prototype {
+  margin-left: 0.4rem;
+  color: var(--text-glass-3);
+  font-size: 0.68rem;
+  font-weight: 560;
+  letter-spacing: 0.02em;
+  vertical-align: 0.15em;
+}
+
+.nav .brand-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.15;
+  white-space: normal;
+}
+
+.nav .brand-prototype {
+  margin-left: 0;
+  margin-top: 0.1rem;
+}
+
 .brand-lg .brand-mark {
   width: 2.6rem;
   height: 2.6rem;
-  border-radius: 13px;
-  font-size: 1.4rem;
 }
 
 .phase {

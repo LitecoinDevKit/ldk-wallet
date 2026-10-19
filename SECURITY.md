@@ -1,6 +1,6 @@
 # Security
 
-This document describes what LTC Wallet protects, what it does not, and how to
+This document describes what LDK Wallet protects, what it does not, and how to
 report vulnerabilities. For verifying that a downloaded release matches the
 source code, see [`docs/VERIFYING.md`](docs/VERIFYING.md).
 

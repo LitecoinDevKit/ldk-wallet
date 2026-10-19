@@ -1,4 +1,4 @@
-# LTC Wallet — live MWEB end-to-end checklist
+# LDK Wallet — live MWEB end-to-end checklist
 
 Operator checklist for proving v0.2 MWEB against a live archive peer + litecoind RPC.
 Library-level loops live in the sibling BDK repo ([`LITECOIN_E2E.md`](../../bdk/docs/LITECOIN_E2E.md),

@@ -12,15 +12,15 @@ that built the artifacts. After downloading, compare:
 
 ```bash
 # macOS
-shasum -a 256 "LTC Wallet_0.4.4_aarch64.dmg"
+shasum -a 256 "LDK Wallet_0.4.4_aarch64.dmg"
 # Linux
-sha256sum "LTC Wallet_0.4.4_amd64.AppImage"
+sha256sum "LDK Wallet_0.4.4_amd64.AppImage"
 ```
 
 against the matching line in the sums file, or use the helper:
 
 ```bash
-scripts/verify-release.sh checksums "LTC Wallet_0.4.4_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
+scripts/verify-release.sh checksums "LDK Wallet_0.4.4_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
 ```
 
 This proves your download was not corrupted or swapped after CI built it. It
@@ -33,7 +33,7 @@ build time, cryptographically linking it to the exact commit and workflow run
 that produced it. With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify "LTC Wallet_0.4.4_aarch64.dmg" --repo LitecoinDevKit/ltc-wallet-mac
+gh attestation verify "LDK Wallet_0.4.4_aarch64.dmg" --repo LitecoinDevKit/ltc-wallet-mac
 ```
 
 A successful verification shows the source commit and the workflow file that
@@ -63,8 +63,8 @@ notes state whether that run was signed or unsigned.
 **Signed / notarized** builds:
 
 ```bash
-codesign -dv --verbose=4 "/Applications/LTC Wallet.app"   # identity + team ID
-spctl -a -vv "/Applications/LTC Wallet.app"               # Gatekeeper / notarization
+codesign -dv --verbose=4 "/Applications/LDK Wallet.app"   # identity + team ID
+spctl -a -vv "/Applications/LDK Wallet.app"               # Gatekeeper / notarization
 ```
 
 Expect `Developer ID Application` and `accepted` from `spctl`.
@@ -74,7 +74,7 @@ are absent. Clear quarantine once, then prefer building from source or waiting
 for a signed release:
 
 ```bash
-xattr -cr "/Applications/LTC Wallet.app"
+xattr -cr "/Applications/LDK Wallet.app"
 ```
 
 ## 4. Cross-check the dependency pins

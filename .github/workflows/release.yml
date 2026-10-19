@@ -103,7 +103,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: v__VERSION__
-          releaseName: "LTC Wallet v__VERSION__"
+          releaseName: "LDK Wallet v__VERSION__"
           releaseBody: |
             Draft release built by GitHub Actions.
 
@@ -131,14 +131,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: "LTC Wallet v__VERSION__"
+          releaseName: "LDK Wallet v__VERSION__"
           releaseBody: |
             Draft release built by GitHub Actions.
 
             **Install**
             - macOS: open the `.dmg` and drag the app to Applications. These builds are unsigned, so
               macOS claims the app "is damaged" — it isn't. Clear the quarantine flag once with
-              `xattr -cr "/Applications/LTC Wallet.app"`, then launch normally.
+              `xattr -cr "/Applications/LDK Wallet.app"`, then launch normally.
             - Linux: prefer the `.AppImage` (`chmod +x` then run), or install the `.deb`.
 
             **Verify your download** — see [`docs/VERIFYING.md`](https://github.com/${{ github.repository }}/blob/main/docs/VERIFYING.md).

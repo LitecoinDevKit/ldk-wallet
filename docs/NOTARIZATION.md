@@ -37,8 +37,8 @@ npm run tauri build
 ## Verify a signed build
 
 ```bash
-codesign -dv --verbose=4 "/Applications/LTC Wallet.app"
-spctl -a -vv "/Applications/LTC Wallet.app"
+codesign -dv --verbose=4 "/Applications/LDK Wallet.app"
+spctl -a -vv "/Applications/LDK Wallet.app"
 ```
 
 Expect `Developer ID Application` and Gatekeeper acceptance (`accepted`).

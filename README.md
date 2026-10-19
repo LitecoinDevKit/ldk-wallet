@@ -1,4 +1,4 @@
-# ltc-wallet-mac
+# LDK Wallet
 
 Native Litecoin wallet for macOS (Apple Silicon) and Linux (x86_64), built on the Litecoin BDK fork ([`LitecoinDevKit/bdk`](https://github.com/LitecoinDevKit/bdk) + [`bdk_wallet`](https://github.com/LitecoinDevKit/bdk_wallet)), with a Tauri 2 shell.
 
@@ -10,7 +10,7 @@ Canonical MWEB shape in `wallet-core`: Electrum/RPC tip → `MwebStore` + LIP sy
 
 **v0.4.4** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. Spend a private coin to itself so it can share a later block. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
 
-Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LTC Wallet.app"`) and **Linux x86_64** (`.deb` / `.AppImage`). No Intel Mac, ARM Linux, or Windows build.
+Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LDK Wallet.app"`) and **Linux x86_64** (`.deb` / `.AppImage`). No Intel Mac, ARM Linux, or Windows build.
 
 Read [`docs/CHAT_HANDOFF.md`](docs/CHAT_HANDOFF.md). Blueprint: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -91,7 +91,7 @@ Artifacts under `src-tauri/target/release/bundle/` (or the workspace `target/` e
 Unsigned builds trip Gatekeeper. macOS may claim the app is damaged — it isn’t. After dragging it to Applications:
 
 ```bash
-xattr -cr "/Applications/LTC Wallet.app"
+xattr -cr "/Applications/LDK Wallet.app"
 ```
 
 Then launch normally. Fallback: Right-click → Open, or Privacy & Security → Open Anyway.

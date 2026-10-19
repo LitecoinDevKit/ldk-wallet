@@ -12,15 +12,15 @@ that built the artifacts. After downloading, compare:
 
 ```bash
 # macOS
-shasum -a 256 "LTC Wallet_0.4.1_aarch64.dmg"
+shasum -a 256 "LTC Wallet_0.4.2_aarch64.dmg"
 # Linux
-sha256sum "LTC Wallet_0.4.1_amd64.AppImage"
+sha256sum "LTC Wallet_0.4.2_amd64.AppImage"
 ```
 
 against the matching line in the sums file, or use the helper:
 
 ```bash
-scripts/verify-release.sh checksums "LTC Wallet_0.4.1_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
+scripts/verify-release.sh checksums "LTC Wallet_0.4.2_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
 ```
 
 This proves your download was not corrupted or swapped after CI built it. It
@@ -33,7 +33,7 @@ build time, cryptographically linking it to the exact commit and workflow run
 that produced it. With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify "LTC Wallet_0.4.1_aarch64.dmg" --repo LitecoinDevKit/ltc-wallet-mac
+gh attestation verify "LTC Wallet_0.4.2_aarch64.dmg" --repo LitecoinDevKit/ltc-wallet-mac
 ```
 
 A successful verification shows the source commit and the workflow file that

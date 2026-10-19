@@ -8,7 +8,7 @@ Canonical MWEB shape in `wallet-core`: Electrum/RPC tip → `MwebStore` + LIP sy
 
 ## Status
 
-**v0.4.3** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. Spend a private coin to itself so it can share a later block. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
+**v0.4.4** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. Spend a private coin to itself so it can share a later block. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
 
 Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LTC Wallet.app"`) and **Linux x86_64** (`.deb` / `.AppImage`). No Intel Mac, ARM Linux, or Windows build.
 

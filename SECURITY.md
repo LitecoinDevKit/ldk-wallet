@@ -7,7 +7,7 @@ source code, see [`docs/VERIFYING.md`](docs/VERIFYING.md).
 ## Reporting a vulnerability
 
 Report security issues privately via
-[GitHub Security Advisories](https://github.com/LitecoinDevKit/ltc-wallet-mac/security/advisories/new)
+[GitHub Security Advisories](https://github.com/LitecoinDevKit/ldk-wallet/security/advisories/new)
 ("Report a vulnerability"). Please do not open public issues for bugs that
 could put user funds at risk. You should receive an initial response within
 7 days.
@@ -106,7 +106,7 @@ the revs pinned in the manifests and `Cargo.lock`. Additionally:
 - **Build provenance attestations**: every artifact digest is attested by
   GitHub's build provenance service, linking it to the exact commit and
   workflow run. Verify with `gh attestation verify <file> --repo
-  LitecoinDevKit/ltc-wallet-mac`.
+  LitecoinDevKit/ldk-wallet`.
 - **Minisign signatures** (once the signing key is published): each
   `SHA256SUMS` file is signed with an offline-verifiable minisign key, so
   verification does not depend on GitHub's infrastructure.

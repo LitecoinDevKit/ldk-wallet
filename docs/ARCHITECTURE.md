@@ -14,7 +14,7 @@ Rejected for the library backend (see BDK `MWEB_ARCHITECTURE.md`): embedding Nex
 ## Repository layout
 
 ```text
-ltc-wallet-mac/
+ldk-wallet/
   docs/
     CHAT_HANDOFF.md       # short decisions for new Cursor chats
     ARCHITECTURE.md       # this file
@@ -30,7 +30,7 @@ Sibling checkouts (expected on a dev machine):
 ```text
 /Users/indigo/Dev/bdk
 /Users/indigo/Dev/bdk_wallet
-/Users/indigo/Dev/ltc-wallet-mac   ← this repo
+/Users/indigo/Dev/ldk-wallet   ← this repo
 /Users/indigo/Dev/grail-sdk-rust   unofficial Grail client (LiteForge only)
 ```
 

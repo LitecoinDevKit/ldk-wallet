@@ -9,7 +9,7 @@ Clone the forks as siblings of this repo:
 
 ```text
 Dev/
-├── ltc-wallet-mac/   this repo
+├── ldk-wallet/       this repo
 ├── bdk/              LitecoinDevKit/bdk        (litecoin)
 ├── bdk_wallet/       LitecoinDevKit/bdk_wallet (litecoin)
 ├── rust-litecoin/    LitecoinDevKit/rust-litecoin

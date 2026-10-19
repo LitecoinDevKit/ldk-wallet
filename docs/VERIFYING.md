@@ -33,7 +33,7 @@ build time, cryptographically linking it to the exact commit and workflow run
 that produced it. With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify "LDK Wallet_0.4.5_aarch64.dmg" --repo LitecoinDevKit/ltc-wallet-mac
+gh attestation verify "LDK Wallet_0.4.5_aarch64.dmg" --repo LitecoinDevKit/ldk-wallet
 ```
 
 A successful verification shows the source commit and the workflow file that

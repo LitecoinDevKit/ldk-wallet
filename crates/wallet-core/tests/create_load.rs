@@ -254,11 +254,17 @@ fn address_reuse_hint_unused_used_and_mweb() {
             .reused,
         "MWEB stealth must never warn"
     );
-    assert!(!app.address_reuse_hint("tltc1qnotours").expect("foreign").reused);
+    assert!(
+        !app.address_reuse_hint("tltc1qnotours")
+            .expect("foreign")
+            .reused
+    );
 
     app.mark_external_used(0).expect("mark used");
     assert!(
-        app.address_reuse_hint(&addr).expect("hint after use").reused,
+        app.address_reuse_hint(&addr)
+            .expect("hint after use")
+            .reused,
         "marked-used receive address should warn"
     );
 }
@@ -542,7 +548,10 @@ fn coin_control_list_lock_and_manual_select() {
             selected_outpoints: Some(vec![outpoint.clone()]),
         })
         .expect_err("frozen selected");
-    assert!(frozen_err.to_string().contains("frozen"), "got {frozen_err}");
+    assert!(
+        frozen_err.to_string().contains("frozen"),
+        "got {frozen_err}"
+    );
 
     app.set_utxo_locked(SetUtxoLockedRequest {
         outpoint: outpoint.clone(),

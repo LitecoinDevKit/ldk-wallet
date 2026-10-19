@@ -168,16 +168,14 @@ impl EncryptedFileSecretStore {
         let mut key = Self::derive_key_v2(passphrase, &salt)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let mut plain =
-            Zeroizing::new(Vec::with_capacity(KEY_LEN + mnemonic.trim().len()));
+        let mut plain = Zeroizing::new(Vec::with_capacity(KEY_LEN + mnemonic.trim().len()));
         plain.extend_from_slice(sealing_key);
         plain.extend_from_slice(mnemonic.trim().as_bytes());
         let ciphertext = cipher
             .encrypt(nonce, plain.as_slice())
             .map_err(|_| WalletError::SecretStore("encrypt failed".into()))?;
         key.zeroize();
-        let mut out =
-            Vec::with_capacity(MAGIC_V2.len() + SALT_LEN + NONCE_LEN + ciphertext.len());
+        let mut out = Vec::with_capacity(MAGIC_V2.len() + SALT_LEN + NONCE_LEN + ciphertext.len());
         out.extend_from_slice(MAGIC_V2);
         out.extend_from_slice(&salt);
         out.extend_from_slice(&nonce_bytes);
@@ -249,10 +247,7 @@ impl EncryptedFileSecretStore {
 impl SecretStore for EncryptedFileSecretStore {
     fn set_mnemonic(&self, mnemonic: &str) -> Result<(), WalletError> {
         let mut inner = self.lock_inner()?;
-        let key = inner
-            .sealing_key
-            .as_ref()
-            .ok_or(WalletError::Locked)?;
+        let key = inner.sealing_key.as_ref().ok_or(WalletError::Locked)?;
         // Re-seal with a fresh salt using the current passphrase-derived key is not possible
         // without the passphrase; instead keep unlocked mnemonic and require passphrase on migrate.
         // For create/restore after unlock/with passphrase path, caller uses migrate_encrypt or
@@ -307,7 +302,9 @@ impl EncryptedFileSecretStore {
     /// Create or overwrite encrypted mnemonic with passphrase (create/restore path).
     pub fn set_with_passphrase(&self, passphrase: &str, mnemonic: &str) -> Result<(), WalletError> {
         if passphrase.is_empty() {
-            return Err(WalletError::SecretStore("passphrase must not be empty".into()));
+            return Err(WalletError::SecretStore(
+                "passphrase must not be empty".into(),
+            ));
         }
         let mut sealing_key = [0u8; KEY_LEN];
         rand::thread_rng().fill_bytes(&mut sealing_key);
@@ -358,14 +355,13 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             // failure keep the legacy key so the on-disk v1 file stays usable.
             let mut new_key = [0u8; KEY_LEN];
             rand::thread_rng().fill_bytes(&mut new_key);
-            let upgraded = Self::seal(passphrase, &opened.mnemonic, &new_key)
-                .and_then(|blob2| {
-                    let check = Self::open(passphrase, &blob2)?;
-                    if check.mnemonic.trim() != opened.mnemonic.trim() {
-                        return Err(WalletError::SecretStore("upgrade verify failed".into()));
-                    }
-                    write_bytes(&self.path, &blob2)
-                });
+            let upgraded = Self::seal(passphrase, &opened.mnemonic, &new_key).and_then(|blob2| {
+                let check = Self::open(passphrase, &blob2)?;
+                if check.mnemonic.trim() != opened.mnemonic.trim() {
+                    return Err(WalletError::SecretStore("upgrade verify failed".into()));
+                }
+                write_bytes(&self.path, &blob2)
+            });
             match upgraded {
                 Ok(()) => {
                     opened.sealing_key = Zeroizing::new(new_key);
@@ -553,8 +549,7 @@ mod tests {
         let enc = dir.path().join("wallet.mnemonic.enc");
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         fs::write(&enc, seal_v1("pass", mnemonic)).unwrap();
-        let store =
-            EncryptedFileSecretStore::new(&enc, dir.path().join("wallet.mnemonic"));
+        let store = EncryptedFileSecretStore::new(&enc, dir.path().join("wallet.mnemonic"));
         store.unlock("pass").unwrap();
         assert_eq!(store.get_mnemonic().unwrap().unwrap(), mnemonic);
         let key_after_upgrade = store.sealing_key().unwrap();
@@ -578,7 +573,9 @@ mod tests {
             dir.path().join("wallet.mnemonic.enc"),
             dir.path().join("wallet.mnemonic"),
         );
-        store.set_with_passphrase("pw", "abandon ability able").unwrap();
+        store
+            .set_with_passphrase("pw", "abandon ability able")
+            .unwrap();
         let key = store.sealing_key().unwrap();
         store.lock();
         store.unlock("pw").unwrap();

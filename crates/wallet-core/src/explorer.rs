@@ -89,7 +89,10 @@ fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, WalletError> {
         .timeout_read(HTTP_TIMEOUT)
         .build();
     let resp = agent.get(url).call().map_err(|e| {
-        WalletError::Explorer(format!("request failed: {}", crate::rpc::redact_userinfo(&e.to_string())))
+        WalletError::Explorer(format!(
+            "request failed: {}",
+            crate::rpc::redact_userinfo(&e.to_string())
+        ))
     })?;
     resp.into_json::<T>()
         .map_err(|e| WalletError::Explorer(format!("invalid JSON: {e}")))
@@ -101,7 +104,10 @@ fn get_text(url: &str) -> Result<String, WalletError> {
         .timeout_read(HTTP_TIMEOUT)
         .build();
     let resp = agent.get(url).call().map_err(|e| {
-        WalletError::Explorer(format!("request failed: {}", crate::rpc::redact_userinfo(&e.to_string())))
+        WalletError::Explorer(format!(
+            "request failed: {}",
+            crate::rpc::redact_userinfo(&e.to_string())
+        ))
     })?;
     resp.into_string()
         .map_err(|e| WalletError::Explorer(format!("read failed: {e}")))
@@ -270,10 +276,7 @@ mod tests {
 
     #[test]
     fn normalizes_default_and_trailing_slash() {
-        assert_eq!(
-            normalize_base_url("").unwrap(),
-            DEFAULT_EXPLORER_BASE_URL
-        );
+        assert_eq!(normalize_base_url("").unwrap(), DEFAULT_EXPLORER_BASE_URL);
         assert_eq!(
             normalize_base_url("https://litview.space/").unwrap(),
             "https://litview.space"

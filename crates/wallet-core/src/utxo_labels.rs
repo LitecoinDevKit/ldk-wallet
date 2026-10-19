@@ -111,7 +111,10 @@ mod tests {
         let id = "cd".repeat(32);
         set_label(dir.path(), &id, " peg-out prep ").unwrap();
         let file = read_labels(dir.path()).unwrap();
-        assert_eq!(file.labels.get(&id).map(String::as_str), Some("peg-out prep"));
+        assert_eq!(
+            file.labels.get(&id).map(String::as_str),
+            Some("peg-out prep")
+        );
         set_label(dir.path(), &id, "").unwrap();
         assert!(!labels_path(dir.path()).is_file());
     }

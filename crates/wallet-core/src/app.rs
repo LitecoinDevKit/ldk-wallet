@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
+use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_mweb::mweb_sync::SyncProgress;
 
 use bdk_wallet::bitcoin::consensus::encode::deserialize;
@@ -12,33 +13,34 @@ use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions};
 
+use crate::churn;
+use crate::contacts;
 use crate::descriptors::{self, create_params, load_params};
 use crate::dto::{
-    AddressReuseHint, CombinedSummary, ContactRecord, CreateWalletRequest, CreateWalletResponse,
-    DeleteContactRequest, ElectrumProbe, FeeEstimate, MigrateEncryptRequest, MwebBroadcastResult,
-    MwebScheme, MwebSendPreview, MwebSendRequest, MwebUtxoRecord, PeginPreview, PeginRequest,
-    PeginResult, PegoutPreview, PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest,
-    RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetTxLabelRequest,
-    SetUtxoLabelRequest, SetMwebUtxoLockedRequest, SetUtxoLockedRequest, SplitChain, SplitPreview,
-    SplitRequest, SplitResult, SyncResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest,
-    UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE,
-    CHURN_QUIET_NOTE, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, DEFAULT_MWEB_FEE_SATS,
+    AddressReuseHint, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary,
+    ContactRecord, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest, ElectrumProbe,
+    FeeEstimate, MigrateEncryptRequest, MwebBroadcastResult, MwebScheme, MwebSendPreview,
+    MwebSendRequest, MwebUtxoRecord, PeginPreview, PeginRequest, PeginResult, PegoutPreview,
+    PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse,
+    SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest, SetTxLabelRequest,
+    SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitPreview, SplitRequest, SplitResult,
+    SyncResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest,
+    UtxoRecord, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_QUIET_NOTE,
+    DEFAULT_MWEB_FEE_SATS,
 };
-use crate::contacts;
-use crate::churn::{self, HopScore};
-use crate::labels;
-use crate::metadata::{self, MetadataImportResult};
-use crate::split::{self, PlanParams};
-use crate::split_ids;
-use crate::utxo_labels;
 use crate::electrum::{self, BATCH_SIZE, MIN_FEE_RATE_SAT_VB, STOP_GAP};
 use crate::error::WalletError;
+use crate::labels;
 use crate::meta::{self, WalletMeta};
+use crate::metadata::{self, MetadataImportResult};
 use crate::mweb::{self, MwebRuntime};
 use crate::mweb_frozen;
 use crate::network::WalletNetwork;
 use crate::secrets::{EncryptedFileSecretStore, SecretStore, UnlockableSecretStore};
 use crate::seed::MasterSecret;
+use crate::split::{self, PlanParams};
+use crate::split_ids;
+use crate::utxo_labels;
 use crate::{MNEMONIC_ENC_FILE, MNEMONIC_FILE};
 
 struct WalletState {
@@ -112,7 +114,9 @@ fn electrum_candidates(state: &WalletState) -> Vec<String> {
 }
 
 /// Connect with fallback across [`electrum_candidates`], remembering what worked.
-fn connect_electrum(state: &mut WalletState) -> Result<crate::electrum::ElectrumClient, WalletError> {
+fn connect_electrum(
+    state: &mut WalletState,
+) -> Result<crate::electrum::ElectrumClient, WalletError> {
     let candidates = electrum_candidates(state);
     let (client, used) = electrum::connect_first(&candidates, state.electrum_validate_domain)?;
     if used != state.electrum_url {
@@ -483,9 +487,10 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let mweb = state.mweb.as_mut().ok_or_else(|| {
-            WalletError::Mweb("MWEB runtime not initialized".into())
-        })?;
+        let mweb = state
+            .mweb
+            .as_mut()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let addr = mweb.receive_address(state.network)?;
         mweb.persist(&state.data_dir)?;
         Ok(addr)
@@ -603,9 +608,10 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let guard = self.lock_state()?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
-        let _ = state.mweb.as_ref().ok_or_else(|| {
-            WalletError::Mweb("MWEB runtime not initialized".into())
-        })?;
+        let _ = state
+            .mweb
+            .as_ref()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
         mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
     }
@@ -644,8 +650,7 @@ impl WalletApp {
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| state.electrum_url.clone());
         meta::validate_electrum_url(&url)?;
-        let (tip_height, latency_ms) =
-            electrum::probe_tip(&url, state.electrum_validate_domain)?;
+        let (tip_height, latency_ms) = electrum::probe_tip(&url, state.electrum_validate_domain)?;
         Ok(ElectrumProbe {
             url,
             tip_height,
@@ -897,7 +902,7 @@ impl WalletApp {
         self.abort_if_locked(&mut guard)?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         if state.mweb.is_some() {
-            let _ = drive_churn(state);
+            let _ = drive_churn(state, Some(&client));
         }
 
         self.abort_if_locked(&mut guard)?;
@@ -973,7 +978,8 @@ impl WalletApp {
             let network = state.network;
             // Fresh runtime after wipe: no previous sync state, so no extension hint.
             self.with_mweb_progress(|progress| {
-                let _ = mweb.sync_at_tip(tip_height, tip_hash, None, &peers, network, Some(progress));
+                let _ =
+                    mweb.sync_at_tip(tip_height, tip_hash, None, &peers, network, Some(progress));
             });
             mweb.persist(&state.data_dir)?;
         }
@@ -1054,11 +1060,9 @@ impl WalletApp {
             .map_err(|e| WalletError::BuildTx(e.to_string()))?;
 
         let client = connect_electrum(state)?;
-        client
-            .transaction_broadcast(&tx)
-            .map_err(|e| {
-                WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
-            })?;
+        client.transaction_broadcast(&tx).map_err(|e| {
+            WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
+        })?;
 
         // Keep local balance honest until the next sync sees the broadcast.
         state
@@ -1084,12 +1088,11 @@ impl WalletApp {
         let total_from_transparent_sats = resolved
             .amount_sats
             .saturating_add(resolved.transparent_fee_sats);
-        let creates_change = pegin_selection_creates_change(state, &resolved, total_from_transparent_sats);
+        let creates_change =
+            pegin_selection_creates_change(state, &resolved, total_from_transparent_sats);
         Ok(PeginPreview {
             amount_sats: resolved.amount_sats,
-            private_credit_sats: resolved
-                .amount_sats
-                .saturating_sub(resolved.mweb_fee_sats),
+            private_credit_sats: resolved.amount_sats.saturating_sub(resolved.mweb_fee_sats),
             mweb_fee_sats: resolved.mweb_fee_sats,
             transparent_fee_sats: resolved.transparent_fee_sats,
             total_from_transparent_sats,
@@ -1109,7 +1112,14 @@ impl WalletApp {
             .mweb
             .as_mut()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-        let result = mweb::pegin(&mut state.wallet, mweb, rpc_url.as_deref(), &peers, req, network)?;
+        let result = mweb::pegin(
+            &mut state.wallet,
+            mweb,
+            rpc_url.as_deref(),
+            &peers,
+            req,
+            network,
+        )?;
         state
             .wallet
             .persist(&mut state.db)
@@ -1220,9 +1230,10 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let guard = self.lock_state()?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
-        let mweb = state.mweb.as_ref().ok_or_else(|| {
-            WalletError::Mweb("MWEB runtime not initialized".into())
-        })?;
+        let mweb = state
+            .mweb
+            .as_ref()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let tip = state.wallet.latest_checkpoint().height();
         Ok(mweb::list_mweb_unspent(mweb, tip, &state.data_dir))
     }
@@ -1233,9 +1244,10 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let mweb = state.mweb.as_mut().ok_or_else(|| {
-            WalletError::Mweb("MWEB runtime not initialized".into())
-        })?;
+        let mweb = state
+            .mweb
+            .as_mut()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let scan = hex::encode(mweb.keys.scan.secret_bytes());
         let spend = hex::encode(mweb.keys.spend.secret_bytes());
         let dest = mweb.receive_address(state.network)?;
@@ -1270,11 +1282,9 @@ impl WalletApp {
                     .extract_tx()
                     .map_err(|e| WalletError::Sign(e.to_string()))?;
                 let client = connect_electrum(state)?;
-                client
-                    .transaction_broadcast(&tx)
-                    .map_err(|e| {
-                        WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
-                    })?;
+                client.transaction_broadcast(&tx).map_err(|e| {
+                    WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
+                })?;
                 state
                     .wallet
                     .apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
@@ -1301,9 +1311,10 @@ impl WalletApp {
                 let peers = state.mweb_peers.clone();
                 let network = state.network;
                 let data_dir = state.data_dir.clone();
-                let mweb = state.mweb.as_mut().ok_or_else(|| {
-                    WalletError::Mweb("MWEB runtime not initialized".into())
-                })?;
+                let mweb = state
+                    .mweb
+                    .as_mut()
+                    .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
                 let result = mweb::mweb_split(
                     &state.wallet,
                     mweb,
@@ -1359,7 +1370,12 @@ impl WalletApp {
             job_active,
             target_depth: req.target_depth,
         })?;
-        let mut job = churn::new_job(&req.output_id, from_pegin || info.is_pegin, target, DEFAULT_MWEB_FEE_SATS)?;
+        let mut job = churn::new_job(
+            &req.output_id,
+            from_pegin || info.is_pegin,
+            target,
+            DEFAULT_MWEB_FEE_SATS,
+        )?;
         churn::write_job(&state.data_dir, &job)?;
         mweb_frozen::set_locked(&state.data_dir, &job.current_output_id, true)?;
         broadcast_churn(state, &mut job)?;
@@ -1381,7 +1397,8 @@ impl WalletApp {
             .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
         churn::request_retry(&mut job)?;
         churn::write_job(&state.data_dir, &job)?;
-        let _ = drive_churn(state);
+        let electrum = connect_electrum(state).ok();
+        let _ = drive_churn(state, electrum.as_ref());
         let job = churn::read_job(&state.data_dir)?
             .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
         // A saved broadcast error stays on the job for the Coins card. It is not a failed command.
@@ -1412,7 +1429,9 @@ impl WalletApp {
         mweb_scheme: MwebScheme,
     ) -> Result<WalletSummary, WalletError> {
         if passphrase.trim().is_empty() {
-            return Err(WalletError::SecretStore("passphrase must not be empty".into()));
+            return Err(WalletError::SecretStore(
+                "passphrase must not be empty".into(),
+            ));
         }
         if self.exists(data_dir) {
             if self.secrets.get_mnemonic()?.is_none() && !self.secrets.is_locked() {
@@ -1429,24 +1448,25 @@ impl WalletApp {
 
         std::fs::create_dir_all(data_dir)?;
 
-        let create_db = || -> Result<(PersistedWallet<Connection>, Connection, WalletMeta), WalletError> {
-            let db_path = meta::db_path(data_dir);
-            let mut db =
-                Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
-            let params = create_params(secret, network)?;
-            let mut wallet = PersistedWallet::create(&mut db, params)
-                .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let create_db =
+            || -> Result<(PersistedWallet<Connection>, Connection, WalletMeta), WalletError> {
+                let db_path = meta::db_path(data_dir);
+                let mut db =
+                    Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
+                let params = create_params(secret, network)?;
+                let mut wallet = PersistedWallet::create(&mut db, params)
+                    .map_err(|e| WalletError::Persist(e.to_string()))?;
 
-            let _ = wallet.next_unused_address(KeychainKind::External);
-            wallet
-                .persist(&mut db)
-                .map_err(|e| WalletError::Persist(e.to_string()))?;
+                let _ = wallet.next_unused_address(KeychainKind::External);
+                wallet
+                    .persist(&mut db)
+                    .map_err(|e| WalletError::Persist(e.to_string()))?;
 
-            let mut meta = WalletMeta::new(network, electrum_url.clone());
-            meta.mweb_scheme = mweb_scheme;
-            meta::write_meta(data_dir, &meta)?;
-            Ok((wallet, db, meta))
-        };
+                let mut meta = WalletMeta::new(network, electrum_url.clone());
+                meta.mweb_scheme = mweb_scheme;
+                meta::write_meta(data_dir, &meta)?;
+                Ok((wallet, db, meta))
+            };
 
         let (wallet, db, meta) = match create_db() {
             Ok(v) => v,
@@ -1501,9 +1521,7 @@ impl WalletApp {
         }
     }
 
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<WalletState>>, WalletError> {
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, Option<WalletState>>, WalletError> {
         self.state
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))
@@ -1777,9 +1795,10 @@ impl MemoryBackedApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
-        let mweb = state.mweb.as_ref().ok_or_else(|| {
-            WalletError::Mweb("MWEB runtime not initialized".into())
-        })?;
+        let mweb = state
+            .mweb
+            .as_ref()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let tip = state.wallet.latest_checkpoint().height();
         Ok(mweb::list_mweb_unspent(mweb, tip, &state.data_dir))
     }
@@ -1870,12 +1889,11 @@ impl MemoryBackedApp {
         let total_from_transparent_sats = resolved
             .amount_sats
             .saturating_add(resolved.transparent_fee_sats);
-        let creates_change = pegin_selection_creates_change(state, &resolved, total_from_transparent_sats);
+        let creates_change =
+            pegin_selection_creates_change(state, &resolved, total_from_transparent_sats);
         Ok(PeginPreview {
             amount_sats: resolved.amount_sats,
-            private_credit_sats: resolved
-                .amount_sats
-                .saturating_sub(resolved.mweb_fee_sats),
+            private_credit_sats: resolved.amount_sats.saturating_sub(resolved.mweb_fee_sats),
             mweb_fee_sats: resolved.mweb_fee_sats,
             transparent_fee_sats: resolved.transparent_fee_sats,
             total_from_transparent_sats,
@@ -1909,8 +1927,7 @@ impl MemoryBackedApp {
         }
         std::fs::create_dir_all(data_dir)?;
         let db_path = meta::db_path(data_dir);
-        let mut db =
-            Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
+        let mut db = Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
         let params = create_params(secret, network)?;
         let mut wallet = PersistedWallet::create(&mut db, params)
             .map_err(|e| WalletError::Persist(e.to_string()))?;
@@ -1963,10 +1980,7 @@ fn auto_mweb_fee(explicit: u64) -> u64 {
     }
 }
 
-fn auto_pegin_transparent_fee(
-    state: &mut WalletState,
-    explicit: u64,
-) -> Result<u64, WalletError> {
+fn auto_pegin_transparent_fee(state: &mut WalletState, explicit: u64) -> Result<u64, WalletError> {
     if explicit > 0 {
         return Ok(explicit);
     }
@@ -2330,7 +2344,11 @@ fn build_send_psbt(
             WalletError::BuildTx(msg)
         }
     })?;
-    Ok((fee_rate_sat_vb.max(MIN_FEE_RATE_SAT_VB), psbt, recipient_script))
+    Ok((
+        fee_rate_sat_vb.max(MIN_FEE_RATE_SAT_VB),
+        psbt,
+        recipient_script,
+    ))
 }
 
 fn parse_outpoint(raw: &str) -> Result<OutPoint, WalletError> {
@@ -2341,10 +2359,7 @@ fn parse_outpoint(raw: &str) -> Result<OutPoint, WalletError> {
     })
 }
 
-fn public_split_utxo(
-    state: &WalletState,
-    raw: &str,
-) -> Result<(OutPoint, u64), WalletError> {
+fn public_split_utxo(state: &WalletState, raw: &str) -> Result<(OutPoint, u64), WalletError> {
     let op = parse_outpoint(raw)?;
     let utxo = state.wallet.get_utxo(op).ok_or_else(|| {
         WalletError::BuildTx(format!(
@@ -2371,7 +2386,10 @@ fn public_split_utxo(
     Ok((op, utxo.txout.value.to_sat()))
 }
 
-fn plan_split_request(state: &mut WalletState, req: &SplitRequest) -> Result<SplitPreview, WalletError> {
+fn plan_split_request(
+    state: &mut WalletState,
+    req: &SplitRequest,
+) -> Result<SplitPreview, WalletError> {
     match req.chain {
         SplitChain::Public => {
             let (_op, input_sats) = public_split_utxo(state, &req.input)?;
@@ -2393,9 +2411,10 @@ fn plan_split_request(state: &mut WalletState, req: &SplitRequest) -> Result<Spl
             })
         }
         SplitChain::Private => {
-            let mweb = state.mweb.as_ref().ok_or_else(|| {
-                WalletError::Mweb("MWEB runtime not initialized".into())
-            })?;
+            let mweb = state
+                .mweb
+                .as_ref()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let tip = state.wallet.latest_checkpoint().height();
             let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
             let coin = mweb::select_split_coin(mweb.store.db(), &req.input, tip, &frozen)?;
@@ -2456,11 +2475,11 @@ fn build_public_split_psbt(
         tx_builder.add_recipient(script, amount);
     }
     tx_builder.fee_absolute(Amount::from_sat(preview.fee_sats));
-    let psbt = tx_builder.finish().map_err(|e| WalletError::BuildTx(e.to_string()))?;
+    let psbt = tx_builder
+        .finish()
+        .map_err(|e| WalletError::BuildTx(e.to_string()))?;
     if psbt.unsigned_tx.input.len() != 1 {
-        return Err(WalletError::BuildTx(
-            "Split uses exactly one coin".into(),
-        ));
+        return Err(WalletError::BuildTx("Split uses exactly one coin".into()));
     }
     let fee_sats = psbt
         .fee_amount()
@@ -2500,14 +2519,26 @@ fn mweb_selection_creates_change(
     state: &WalletState,
     req: &MwebSendRequest,
 ) -> Result<bool, WalletError> {
-    mweb_inputs_exceed_needed(state, req.selected_output_ids.as_deref(), req.amount_sats, req.fee_sats, "spending")
+    mweb_inputs_exceed_needed(
+        state,
+        req.selected_output_ids.as_deref(),
+        req.amount_sats,
+        req.fee_sats,
+        "spending",
+    )
 }
 
 fn pegout_selection_creates_change(
     state: &WalletState,
     req: &PegoutRequest,
 ) -> Result<bool, WalletError> {
-    mweb_inputs_exceed_needed(state, req.selected_output_ids.as_deref(), req.amount_sats, req.fee_sats, "swapping")
+    mweb_inputs_exceed_needed(
+        state,
+        req.selected_output_ids.as_deref(),
+        req.amount_sats,
+        req.fee_sats,
+        "swapping",
+    )
 }
 
 fn mweb_inputs_exceed_needed(
@@ -2524,14 +2555,7 @@ fn mweb_inputs_exceed_needed(
     let tip = state.wallet.latest_checkpoint().height();
     let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
     let needed = amount_sats.saturating_add(fee_sats);
-    let coins = mweb::resolve_spend_coins(
-        mweb.store.db(),
-        tip,
-        &frozen,
-        selected,
-        needed,
-        action,
-    )?;
+    let coins = mweb::resolve_spend_coins(mweb.store.db(), tip, &frozen, selected, needed, action)?;
     let sum: u64 = coins.iter().map(|c| c.amount).sum();
     Ok(sum > needed)
 }
@@ -2740,7 +2764,11 @@ fn fetch_tx_hex_litecoinspace(txid_hex: &str) -> Result<Vec<u8>, String> {
     hex::decode(hex).map_err(|e| e.to_string())
 }
 
-fn refuse_churn_unfreeze(data_dir: &Path, output_id: &str, locked: bool) -> Result<(), WalletError> {
+fn refuse_churn_unfreeze(
+    data_dir: &Path,
+    output_id: &str,
+    locked: bool,
+) -> Result<(), WalletError> {
     if locked {
         return Ok(());
     }
@@ -2750,42 +2778,382 @@ fn refuse_churn_unfreeze(data_dir: &Path, output_id: &str, locked: bool) -> Resu
     Ok(())
 }
 
-fn hash_at(wallet: &PersistedWallet<Connection>, height: u32) -> Option<bdk_wallet::bitcoin::BlockHash> {
+fn hash_at(
+    wallet: &PersistedWallet<Connection>,
+    height: u32,
+) -> Option<bdk_wallet::bitcoin::BlockHash> {
     if wallet.latest_checkpoint().height() == height {
         return Some(wallet.latest_checkpoint().hash());
     }
     wallet.local_chain().get(height).map(|cp| cp.hash())
 }
 
-fn score_inclusion(state: &WalletState, height: u32) -> HopScore {
-    if height == 0 {
-        return HopScore::Unscored;
+fn block_hash_at(
+    wallet: &PersistedWallet<Connection>,
+    electrum: Option<&electrum::ElectrumClient>,
+    height: u32,
+) -> Option<bdk_wallet::bitcoin::BlockHash> {
+    if let Some(hash) = hash_at(wallet, height) {
+        return Some(hash);
     }
-    let Some(inclusion_hash) = hash_at(&state.wallet, height) else {
-        return HopScore::Unscored;
+    let header = electrum?.inner.block_header(height as usize).ok()?;
+    Some(header.block_hash())
+}
+
+enum ResolvedHop {
+    Scored { height: u32, score: churn::HopScore },
+    NotYet,
+    NotIncluded,
+}
+
+/// What one scoring pass saw. Formatted onto `ChurnJob::last_check`.
+#[derive(Default)]
+struct HopCheck {
+    tip: u32,
+    anchor: Option<mweb::CoinAnchor>,
+    parent_mmr: Option<u64>,
+    tip_mmr: Option<u64>,
+    inputs_unspent: Option<bool>,
+    hunt: Option<churn::LeafHunt>,
+    leaf: Option<u64>,
+    located: Option<churn::LeafBlock>,
+    first_unread: Option<u32>,
+    peers: usize,
+    exit: &'static str,
+}
+
+fn fmt_opt<T: std::fmt::Debug>(v: Option<T>) -> String {
+    match v {
+        Some(v) => format!("{v:?}"),
+        None => "-".to_string(),
+    }
+}
+
+impl HopCheck {
+    fn line(&self) -> String {
+        format!(
+            "tip={} anchor_height={} anchor_leaf={} mmr_at_broadcast={} mmr_at_tip={} \
+             inputs_unspent={} hunt={} leaf={} located={} first_unread={} peers={} exit={}",
+            self.tip,
+            fmt_opt(self.anchor.and_then(|a| a.height)),
+            fmt_opt(self.anchor.and_then(|a| a.leaf_index)),
+            fmt_opt(self.parent_mmr),
+            fmt_opt(self.tip_mmr),
+            fmt_opt(self.inputs_unspent),
+            fmt_opt(self.hunt),
+            fmt_opt(self.leaf),
+            fmt_opt(self.located),
+            fmt_opt(self.first_unread),
+            self.peers,
+            self.exit,
+        )
+    }
+}
+
+/// Header reads for one hop. Seeded from the job's height-keyed cache and the
+/// sync height map, so a pass that lost its peer halfway does not start over.
+struct HopReader<'a> {
+    wallet: &'a PersistedWallet<Connection>,
+    electrum: Option<&'a electrum::ElectrumClient>,
+    lookup: mweb::MmrLookup,
+    height_map: &'a std::collections::BTreeMap<u32, u64>,
+    cache: &'a mut std::collections::BTreeMap<u32, churn::MmrSizes>,
+    first_unread: Option<u32>,
+}
+
+impl HopReader<'_> {
+    fn sizes_at(&mut self, height: u32) -> Option<churn::MmrSizes> {
+        if let Some(hit) = self.cache.get(&height) {
+            return Some(*hit);
+        }
+        let fetched = block_hash_at(self.wallet, self.electrum, height)
+            .and_then(|hash| self.lookup.get(hash));
+        match fetched {
+            Some(sizes) => {
+                self.cache.insert(height, sizes);
+                Some(sizes)
+            }
+            None => {
+                self.first_unread = Some(self.first_unread.map_or(height, |h| h.min(height)));
+                None
+            }
+        }
+    }
+
+    fn output_mmr_at(&mut self, height: u32) -> Option<u64> {
+        if let Some(hit) = self.cache.get(&height) {
+            return Some(hit.output_mmr_size);
+        }
+        if let Some(size) = self.height_map.get(&height) {
+            return Some(*size);
+        }
+        self.sizes_at(height).map(|sizes| sizes.output_mmr_size)
+    }
+}
+
+/// Score the one block whose output MMR crosses `leaf`.
+fn score_known_leaf(
+    reader: &mut HopReader<'_>,
+    check: &mut HopCheck,
+    broadcast: u32,
+    tip: u32,
+    leaf: u64,
+) -> churn::InclusionFind {
+    let located =
+        churn::locate_leaf_block(broadcast, tip, leaf, |height| reader.output_mmr_at(height));
+    check.located = Some(located);
+    let churn::LeafBlock::Found(height) = located else {
+        check.exit = "leaf-not-located";
+        return churn::InclusionFind::NotYet;
     };
-    let Some(parent_hash) = hash_at(&state.wallet, height - 1) else {
-        return HopScore::Unscored;
+    let Some(parent_height) = height.checked_sub(1) else {
+        check.exit = "no-parent";
+        return churn::InclusionFind::NotYet;
     };
-    let addrs = mweb::peers_for_headers(&state.mweb_peers, state.network);
-    let inclusion = mweb::fetch_mmr_sizes(&addrs, state.network, inclusion_hash);
-    let parent = mweb::fetch_mmr_sizes(&addrs, state.network, parent_hash);
-    churn::score_1in1_hop(parent, inclusion)
+    let score = churn::score_1in1_hop(reader.sizes_at(parent_height), reader.sizes_at(height));
+    match score {
+        churn::HopScore::Unscored => {
+            check.exit = "inclusion-pair-unscored";
+            churn::InclusionFind::NotYet
+        }
+        score => {
+            check.exit = "scored";
+            churn::InclusionFind::Found { height, score }
+        }
+    }
+}
+
+fn score_saved_window(
+    state: &WalletState,
+    electrum: Option<&electrum::ElectrumClient>,
+    job: &churn::ChurnJob,
+) -> ResolvedHop {
+    let output_id = job.current_output_id.as_str();
+    let Some(anchor) = state
+        .mweb
+        .as_ref()
+        .and_then(|mweb| mweb::coin_anchor(mweb, output_id))
+    else {
+        return ResolvedHop::NotYet;
+    };
+    let tip = state.wallet.latest_checkpoint().height();
+    let dated = anchor.height.unwrap_or(tip);
+    match score_hop_window(
+        state,
+        electrum,
+        job.broadcast_height,
+        dated,
+        anchor.leaf_index,
+    ) {
+        churn::InclusionFind::Found { height, score } => ResolvedHop::Scored { height, score },
+        churn::InclusionFind::NotYet => ResolvedHop::NotYet,
+    }
+}
+
+/// Find the hop in `(broadcast, tip]`. A leaf index picks the block. Without one,
+/// the stored leafset says whether the spend landed, then the new output is
+/// looked up among leaves created since broadcast.
+///
+/// Writes what it saw onto `job.last_check` and keeps header reads in
+/// `job.header_cache`; the caller persists the job.
+fn resolve_waiting_hop(
+    state: &mut WalletState,
+    electrum: Option<&electrum::ElectrumClient>,
+    job: &mut churn::ChurnJob,
+) -> ResolvedHop {
+    let Some(broadcast) = job.broadcast_height else {
+        job.last_check = Some("no broadcast height; scored the saved window".into());
+        return score_saved_window(state, electrum, job);
+    };
+    let mut check = HopCheck {
+        tip: state.wallet.latest_checkpoint().height(),
+        ..HopCheck::default()
+    };
+    let resolved = resolve_after_broadcast(state, electrum, job, broadcast, &mut check);
+    let line = check.line();
+    eprintln!("churn check: {line}");
+    job.last_check = Some(line);
+    resolved
+}
+
+fn resolve_after_broadcast(
+    state: &mut WalletState,
+    electrum: Option<&electrum::ElectrumClient>,
+    job: &mut churn::ChurnJob,
+    broadcast: u32,
+    check: &mut HopCheck,
+) -> ResolvedHop {
+    let tip = check.tip;
+    if tip <= broadcast {
+        check.exit = "tip-at-broadcast";
+        return ResolvedHop::NotYet;
+    }
+    let output_id = job.current_output_id.clone();
+    let Some(mweb) = state.mweb.as_ref() else {
+        check.exit = "no-mweb";
+        return ResolvedHop::NotYet;
+    };
+    let Some(anchor) = mweb::coin_anchor(mweb, &output_id) else {
+        check.exit = "coin-not-unspent";
+        return ResolvedHop::NotYet;
+    };
+    check.anchor = Some(anchor);
+    check.inputs_unspent = job
+        .pending_wtxid
+        .as_deref()
+        .and_then(|wtxid| mweb::churn_inputs_still_unspent(mweb, wtxid));
+    let height_map = mweb.sync_state.height_map.clone();
+    let addrs = mweb::peers_for_headers(&state.mweb_peers, state.network, mweb.last_good_peer);
+    check.peers = addrs.len();
+    let tip_hash = state.wallet.latest_checkpoint().hash();
+
+    let mut reader = HopReader {
+        wallet: &state.wallet,
+        electrum,
+        lookup: mweb::MmrLookup::new(addrs, state.network),
+        height_map: &height_map,
+        cache: &mut job.header_cache,
+        first_unread: None,
+    };
+    let mut new_leaf = None;
+    let outcome = 'resolve: {
+        let leaf = if let Some(leaf) = anchor.leaf_index {
+            leaf
+        } else {
+            if let Some(verdict) = churn::leafset_verdict(broadcast, tip, check.inputs_unspent) {
+                check.exit = match verdict {
+                    churn::UndatedHop::NotIncluded => "leafset-not-included",
+                    _ => "leafset-still-waiting",
+                };
+                break 'resolve match verdict {
+                    churn::UndatedHop::NotIncluded => ResolvedHop::NotIncluded,
+                    _ => ResolvedHop::NotYet,
+                };
+            }
+            let Some(parent) = reader.output_mmr_at(broadcast) else {
+                check.exit = "broadcast-header-unread";
+                break 'resolve ResolvedHop::NotYet;
+            };
+            check.parent_mmr = Some(parent);
+            let Some(tip_size) = reader.output_mmr_at(tip) else {
+                check.exit = "tip-header-unread";
+                break 'resolve ResolvedHop::NotYet;
+            };
+            check.tip_mmr = Some(tip_size);
+            let hunt = if tip_size <= parent {
+                churn::LeafHunt::Absent
+            } else {
+                match mweb::find_output_leaf(
+                    reader.lookup.peers(),
+                    state.network,
+                    tip_hash,
+                    parent,
+                    tip_size,
+                    &output_id,
+                ) {
+                    mweb::ChainLeaf::Found(leaf) => churn::LeafHunt::Found(leaf),
+                    mweb::ChainLeaf::Absent => churn::LeafHunt::Absent,
+                    mweb::ChainLeaf::Unread => churn::LeafHunt::Unread,
+                }
+            };
+            check.hunt = Some(hunt);
+            match churn::undated_hop(broadcast, tip, parent, tip_size, hunt, check.inputs_unspent) {
+                churn::UndatedHop::UseLeaf(leaf) => {
+                    new_leaf = Some(leaf);
+                    leaf
+                }
+                churn::UndatedHop::NotIncluded => {
+                    check.exit = "hunt-not-included";
+                    break 'resolve ResolvedHop::NotIncluded;
+                }
+                churn::UndatedHop::NotYet => {
+                    check.exit = "hunt-undecided";
+                    break 'resolve ResolvedHop::NotYet;
+                }
+            }
+        };
+        check.leaf = Some(leaf);
+        match score_known_leaf(&mut reader, check, broadcast, tip, leaf) {
+            churn::InclusionFind::Found { height, score } => ResolvedHop::Scored { height, score },
+            churn::InclusionFind::NotYet => ResolvedHop::NotYet,
+        }
+    };
+    check.first_unread = reader.first_unread;
+    drop(reader);
+
+    // Sizes read for scoring also date leaves in later syncs.
+    if let Some(mweb) = state.mweb.as_mut() {
+        let mut changed = false;
+        for (height, sizes) in job.header_cache.iter() {
+            if mweb
+                .sync_state
+                .height_map
+                .insert(*height, sizes.output_mmr_size)
+                .is_none()
+            {
+                changed = true;
+            }
+        }
+        if let Some(leaf) = new_leaf {
+            changed |= mweb::set_coin_leaf_index(mweb, &output_id, leaf);
+        }
+        if changed {
+            let _ = mweb.persist(&state.data_dir);
+        }
+    }
+    outcome
+}
+
+/// Score the block in `(broadcast_height, dated_height]` that contains the hop.
+/// A miss stays [`churn::InclusionFind::NotYet`] instead of pausing the job.
+fn score_hop_window(
+    state: &WalletState,
+    electrum: Option<&electrum::ElectrumClient>,
+    broadcast_height: Option<u32>,
+    dated_height: u32,
+    leaf_index: Option<u64>,
+) -> churn::InclusionFind {
+    let Some(span) = churn::header_span(broadcast_height, dated_height) else {
+        return churn::InclusionFind::NotYet;
+    };
+    let heights: Vec<u32> = span.collect();
+    let mut hashes = Vec::with_capacity(heights.len());
+    let mut index_of = Vec::with_capacity(heights.len());
+    for height in &heights {
+        if let Some(hash) = block_hash_at(&state.wallet, electrum, *height) {
+            index_of.push(Some(hashes.len()));
+            hashes.push(hash);
+        } else {
+            index_of.push(None);
+        }
+    }
+    let preferred = state.mweb.as_ref().and_then(|mweb| mweb.last_good_peer);
+    let addrs = mweb::peers_for_headers(&state.mweb_peers, state.network, preferred);
+    let fetched = mweb::fetch_mmr_sizes_many(&addrs, state.network, &hashes);
+    let headers: Vec<(u32, Option<churn::MmrSizes>)> = heights
+        .into_iter()
+        .zip(index_of)
+        .map(|(height, idx)| {
+            let sizes = idx.and_then(|i| fetched.get(i).copied().flatten());
+            (height, sizes)
+        })
+        .collect();
+    churn::find_inclusion(&headers, leaf_index)
 }
 
 fn churn_start_facts(
     state: &WalletState,
     output_id: &str,
 ) -> Result<(mweb::ChurnCoinInfo, bool, bool, bool), WalletError> {
-    let mweb = state.mweb.as_ref().ok_or_else(|| {
-        WalletError::Mweb("MWEB runtime not initialized".into())
-    })?;
+    let mweb = state
+        .mweb
+        .as_ref()
+        .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     let tip = state.wallet.latest_checkpoint().height();
     let info = mweb::churn_coin_info(mweb, tip, output_id)?;
     let id = mweb_frozen::normalize_output_id(output_id)?;
     let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids.contains(&id);
-    let job_active = churn::read_job(&state.data_dir)?
-        .is_some_and(|job| job.phase.is_active());
+    let job_active = churn::read_job(&state.data_dir)?.is_some_and(|job| job.phase.is_active());
     let recorded = churn::depth_of(&state.data_dir, &id)?.is_some_and(|record| record.from_pegin);
     Ok((info, frozen, job_active, recorded))
 }
@@ -2798,9 +3166,11 @@ fn broadcast_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result
     let data_dir = state.data_dir.clone();
     let fee = job.fee_sats;
     let from_pegin = job.from_pegin;
-    let mweb = state.mweb.as_mut().ok_or_else(|| {
-        WalletError::Mweb("MWEB runtime not initialized".into())
-    })?;
+    let broadcast_height = state.wallet.latest_checkpoint().height();
+    let mweb = state
+        .mweb
+        .as_mut()
+        .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     match mweb::mweb_self_spend(
         &state.wallet,
         mweb,
@@ -2816,7 +3186,7 @@ fn broadcast_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result
             mweb_frozen::set_locked(&data_dir, &spent_id, false)?;
             mweb_frozen::set_locked(&data_dir, &spent.output_id, true)?;
             churn::inherit_depth(&data_dir, &spent_id, &spent.output_id, from_pegin)?;
-            churn::note_broadcast(job, &spent.wtxid, &spent.output_id)?;
+            churn::note_broadcast(job, &spent.wtxid, &spent.output_id, broadcast_height)?;
             churn::write_job(&data_dir, job)?;
             Ok(())
         }
@@ -2830,7 +3200,10 @@ fn broadcast_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result
 
 /// Score a confirmed hop, then broadcast the next one when the job asks for it.
 /// Broadcast failures stay on the job so sync itself still succeeds.
-fn drive_churn(state: &mut WalletState) -> Result<(), WalletError> {
+fn drive_churn(
+    state: &mut WalletState,
+    electrum: Option<&electrum::ElectrumClient>,
+) -> Result<(), WalletError> {
     let Some(mut job) = churn::read_job(&state.data_dir)? else {
         return Ok(());
     };
@@ -2838,20 +3211,53 @@ fn drive_churn(state: &mut WalletState) -> Result<(), WalletError> {
         job.phase,
         ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
     ) {
-        let height = state
-            .mweb
-            .as_ref()
-            .and_then(|mweb| mweb::coin_block_height(mweb, &job.current_output_id));
-        if let Some(height) = height {
-            let score = score_inclusion(state, height);
-            let output_id = job.current_output_id.clone();
-            let from_pegin = job.from_pegin;
-            churn::apply_score(&mut job, score)?;
-            churn::commit_score(&state.data_dir, &output_id, from_pegin, score)?;
-            if job.phase == ChurnPhase::Done {
-                mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
+        let output_id = job.current_output_id.clone();
+        let resolved = resolve_waiting_hop(state, electrum, &mut job);
+        // The check line and any header reads are worth keeping even when
+        // nothing else changed.
+        churn::write_job(&state.data_dir, &job)?;
+        match resolved {
+            ResolvedHop::Scored { height, score } => {
+                let found = churn::InclusionFind::Found { height, score };
+                if let Some((found_height, score)) = churn::consider_inclusion(&mut job, found)? {
+                    if let Some(mweb) = state.mweb.as_mut() {
+                        if mweb::set_coin_block_height(mweb, &output_id, found_height) {
+                            let _ = mweb.persist(&state.data_dir);
+                        }
+                    }
+                    let from_pegin = job.from_pegin;
+                    churn::commit_score(&state.data_dir, &output_id, from_pegin, score)?;
+                    if job.phase == ChurnPhase::Done {
+                        mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
+                    }
+                    churn::write_job(&state.data_dir, &job)?;
+                }
             }
-            churn::write_job(&state.data_dir, &job)?;
+            ResolvedHop::NotIncluded => {
+                let phantom = output_id;
+                let from_pegin = job.from_pegin;
+                let restored = job.pending_wtxid.clone().and_then(|wtxid| {
+                    let mweb = state.mweb.as_mut()?;
+                    let restored =
+                        mweb::recall_unlanded_spend(&mut mweb.history, mweb.store.db_mut(), &wtxid);
+                    if restored.is_some() {
+                        let _ = mweb.persist(&state.data_dir);
+                    }
+                    restored
+                });
+                if let Some(restored) = restored {
+                    let _ = churn::inherit_depth(&state.data_dir, &phantom, &restored, from_pegin);
+                    let _ = mweb_frozen::set_locked(&state.data_dir, &phantom, false);
+                    let _ = mweb_frozen::set_locked(&state.data_dir, &restored, true);
+                    churn::note_not_included(&mut job, &restored)?;
+                    churn::write_job(&state.data_dir, &job)?;
+                }
+            }
+            ResolvedHop::NotYet if job.phase == ChurnPhase::PausedUnscored => {
+                job.phase = ChurnPhase::WaitingConfirm;
+                churn::write_job(&state.data_dir, &job)?;
+            }
+            ResolvedHop::NotYet => {}
         }
     }
     if churn::ready_to_broadcast(&job) {
@@ -2927,8 +3333,7 @@ mod tests {
     #[test]
     fn merge_uses_persisted_confirmed_height() {
         let dir = tempfile::tempdir().unwrap();
-        let secret =
-            MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
+        let secret = MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
         let mut mweb = MwebRuntime::open(
             dir.path(),
             &secret,
@@ -2970,8 +3375,7 @@ mod tests {
     #[test]
     fn merge_overlays_mweb_height_on_unconfirmed_bdk_pegin() {
         let dir = tempfile::tempdir().unwrap();
-        let secret =
-            MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
+        let secret = MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
         let mut mweb = MwebRuntime::open(
             dir.path(),
             &secret,

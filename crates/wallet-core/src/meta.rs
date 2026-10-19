@@ -23,11 +23,11 @@ pub const MWEB_HISTORY_ENC_FILE: &str = "mweb_history.enc";
 /// only how many times the wallet has written, and its value is already visible
 /// in the cleartext header of each envelope.
 pub const MWEB_SEAL_COUNTER_FILE: &str = "mweb_seal_counter.txt";
+pub use crate::churn::{CHURN_DEPTH_FILE, CHURN_JOB_FILE};
 pub use crate::contacts::CONTACTS_FILE;
 pub use crate::labels::TX_LABELS_FILE;
 pub use crate::mweb_frozen::MWEB_FROZEN_FILE;
 pub use crate::split_ids::SPLIT_IDS_FILE;
-pub use crate::churn::{CHURN_DEPTH_FILE, CHURN_JOB_FILE};
 pub use crate::utxo_labels::UTXO_LABELS_FILE;
 
 fn default_true() -> bool {

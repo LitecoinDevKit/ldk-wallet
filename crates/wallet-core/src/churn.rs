@@ -10,17 +10,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{
-    ChurnDepthRecord, ChurnPhase, ChurnStatus, CHURN_MAX_TARGET,
-};
+use crate::dto::{ChurnDepthRecord, ChurnPhase, ChurnStatus, CHURN_MAX_TARGET};
 use crate::error::WalletError;
 use crate::mweb_frozen;
 
 pub const CHURN_JOB_FILE: &str = "churn_job.json";
 pub const CHURN_DEPTH_FILE: &str = "churn_depth.json";
 
-/// Kernel and output MMR sizes from one MWEB header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sizes from one MWEB header.
+///
+/// `output_mmr_size` is cumulative over the chain. `kernel_mmr_size` is not:
+/// litecoind rebuilds the kernel MMR for every block, so the field holds the
+/// number of kernels in that block alone. The name follows the wire field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MmrSizes {
     pub kernel_mmr_size: u64,
     pub output_mmr_size: u64,
@@ -31,7 +33,7 @@ pub struct MmrSizes {
 pub enum HopScore {
     /// Parent or inclusion header was missing, or the pair cannot contain our hop.
     Unscored,
-    /// Both MMR sizes grew by exactly 1: the block was only this spend.
+    /// One kernel in the block and one new output: the block was only this spend.
     Solo,
     /// At least one foreign kernel or output was in the block.
     Mixed {
@@ -40,27 +42,30 @@ pub enum HopScore {
     },
 }
 
-/// Compare adjacent headers for a known 1-in-1 (one kernel, one output of ours).
+/// Score a known 1-in-1 (one kernel, one output of ours) from its inclusion
+/// header and the parent. Kernels come from the inclusion header alone; outputs
+/// are the growth of the output MMR since the parent.
 pub fn score_1in1_hop(parent: Option<MmrSizes>, inclusion: Option<MmrSizes>) -> HopScore {
     let (Some(parent), Some(inclusion)) = (parent, inclusion) else {
         return HopScore::Unscored;
     };
-    let Some(kernel_delta) = inclusion.kernel_mmr_size.checked_sub(parent.kernel_mmr_size) else {
+    let kernels = inclusion.kernel_mmr_size;
+    let Some(output_delta) = inclusion
+        .output_mmr_size
+        .checked_sub(parent.output_mmr_size)
+    else {
         return HopScore::Unscored;
     };
-    let Some(output_delta) = inclusion.output_mmr_size.checked_sub(parent.output_mmr_size) else {
-        return HopScore::Unscored;
-    };
-    // Our hop adds one kernel and one output. A zero delta means this pair
-    // does not contain it (wrong height, or a header from before inclusion).
-    if kernel_delta == 0 || output_delta == 0 {
+    // Our hop adds one kernel and one output. A block with neither cannot
+    // contain it (wrong height, or a header from before inclusion).
+    if kernels == 0 || output_delta == 0 {
         return HopScore::Unscored;
     }
-    if kernel_delta == 1 && output_delta == 1 {
+    if kernels == 1 && output_delta == 1 {
         HopScore::Solo
     } else {
         HopScore::Mixed {
-            other_kernels: kernel_delta.saturating_sub(1),
+            other_kernels: kernels.saturating_sub(1),
             other_outputs: output_delta.saturating_sub(1),
         }
     }
@@ -88,6 +93,16 @@ pub struct ChurnJob {
     pub last_other_outputs: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Wallet tip when this hop was broadcast. The hop is in a later block.
+    #[serde(default)]
+    pub broadcast_height: Option<u32>,
+    /// What the last scoring pass saw. Diagnostic only; never shown in the UI.
+    #[serde(default)]
+    pub last_check: Option<String>,
+    /// MWEB header sizes read for this hop so far, by height. A pass that
+    /// reads some headers and then loses its peer keeps them for the next one.
+    #[serde(default)]
+    pub header_cache: BTreeMap<u32, MmrSizes>,
 }
 
 fn default_version() -> u32 {
@@ -301,15 +316,35 @@ pub fn new_job(
         last_other_kernels: None,
         last_other_outputs: None,
         last_error: None,
+        broadcast_height: None,
+        last_check: None,
+        header_cache: BTreeMap::new(),
     })
 }
 
+/// About a day of Litecoin blocks. The walk never looks further back than this.
+pub const SCORE_WINDOW_CAP: u32 = 576;
+
+/// Blocks mined after broadcast before an output that is still not on chain is
+/// treated as not included. One block is the first chance to land.
+pub const INCLUSION_GRACE_BLOCKS: u32 = 6;
+
 pub fn ready_to_broadcast(job: &ChurnJob) -> bool {
-    job.phase == ChurnPhase::WaitingToBroadcast
+    job.phase == ChurnPhase::WaitingToBroadcast && job.last_error.is_none()
+}
+
+pub fn grace_elapsed(broadcast_height: u32, tip_height: u32) -> bool {
+    tip_height.saturating_sub(broadcast_height) >= INCLUSION_GRACE_BLOCKS
 }
 
 /// Record a broadcast. The next hop must not be built until this one is scored.
-pub fn note_broadcast(job: &mut ChurnJob, wtxid: &str, new_output_id: &str) -> Result<(), WalletError> {
+/// `broadcast_height` is the wallet tip at send time; the hop lands strictly after it.
+pub fn note_broadcast(
+    job: &mut ChurnJob,
+    wtxid: &str,
+    new_output_id: &str,
+    broadcast_height: u32,
+) -> Result<(), WalletError> {
     if job.phase != ChurnPhase::WaitingToBroadcast {
         return Err(WalletError::BuildTx(
             "This self-spend is not ready to broadcast.".into(),
@@ -321,6 +356,263 @@ pub fn note_broadcast(job: &mut ChurnJob, wtxid: &str, new_output_id: &str) -> R
     job.current_output_id = new_id;
     job.phase = ChurnPhase::WaitingConfirm;
     job.last_error = None;
+    job.broadcast_height = Some(broadcast_height);
+    job.last_check = None;
+    job.header_cache.clear();
+    Ok(())
+}
+
+/// Where a hop can sit: `(broadcast_height, dated_height]`, capped at [`SCORE_WINDOW_CAP`] blocks.
+/// The range includes the parent of the first candidate so its MMR delta can be read.
+pub fn header_span(
+    broadcast_height: Option<u32>,
+    dated_height: u32,
+) -> Option<std::ops::RangeInclusive<u32>> {
+    if dated_height == 0 {
+        return None;
+    }
+    let oldest = dated_height.saturating_sub(SCORE_WINDOW_CAP - 1);
+    let first = match broadcast_height {
+        Some(broadcast) => {
+            let after = broadcast.saturating_add(1);
+            if after > dated_height {
+                return None;
+            }
+            after.max(oldest)
+        }
+        None => oldest.max(1),
+    };
+    let parent = first.checked_sub(1)?;
+    Some(parent..=dated_height)
+}
+
+/// A scored inclusion block, or a window that cannot be decided yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InclusionFind {
+    Found { height: u32, score: HopScore },
+    NotYet,
+}
+
+/// Find the block that contains a 1-in-1 hop.
+///
+/// `headers` runs from the parent of the first candidate through the dated height.
+/// `None` sizes mean that header could not be read. A zero MMR delta is a block
+/// that does not contain the hop, not a failed read.
+///
+/// With a leaf index, the inclusion block is the one whose output MMR crosses
+/// that index. Without one, the hop is scored only when a single block in the
+/// window grew. Anything else stays undecided so the job can wait.
+pub fn find_inclusion(
+    headers: &[(u32, Option<MmrSizes>)],
+    leaf_index: Option<u64>,
+) -> InclusionFind {
+    if headers.len() < 2 {
+        return InclusionFind::NotYet;
+    }
+    let mut grew = Vec::new();
+    let mut unread = false;
+    for pair in headers.windows(2) {
+        let height = pair[1].0;
+        let (Some(parent), Some(inclusion)) = (pair[0].1, pair[1].1) else {
+            unread = true;
+            continue;
+        };
+        let score = score_1in1_hop(Some(parent), Some(inclusion));
+        if let Some(leaf) = leaf_index {
+            if parent.output_mmr_size <= leaf && leaf < inclusion.output_mmr_size {
+                return match score {
+                    HopScore::Solo | HopScore::Mixed { .. } => {
+                        InclusionFind::Found { height, score }
+                    }
+                    HopScore::Unscored => InclusionFind::NotYet,
+                };
+            }
+        }
+        if matches!(score, HopScore::Solo | HopScore::Mixed { .. }) {
+            grew.push((height, score));
+        }
+    }
+    if leaf_index.is_some() || unread || grew.len() != 1 {
+        return InclusionFind::NotYet;
+    }
+    let (height, score) = grew[0];
+    InclusionFind::Found { height, score }
+}
+
+/// Apply a found inclusion. [`InclusionFind::NotYet`] leaves the phase alone.
+pub fn consider_inclusion(
+    job: &mut ChurnJob,
+    found: InclusionFind,
+) -> Result<Option<(u32, HopScore)>, WalletError> {
+    match found {
+        InclusionFind::NotYet => Ok(None),
+        InclusionFind::Found { height, score } => {
+            apply_score(job, score)?;
+            Ok(Some((height, score)))
+        }
+    }
+}
+
+/// Where a leaf sits relative to the blocks after broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafBlock {
+    /// Lowest height whose output MMR exceeds the leaf.
+    Found(u32),
+    /// The tip's output MMR does not contain this leaf.
+    NotInChain,
+    /// A header the search needed could not be read.
+    Unread,
+}
+
+/// Binary-search the block that created `leaf`.
+///
+/// Output MMR size is monotonic. `output_mmr_at` may be called for heights in
+/// `broadcast_height..=end_height`. A missing read stays [`LeafBlock::Unread`]
+/// so a later sync can try the same leaf again.
+pub fn locate_leaf_block(
+    broadcast_height: u32,
+    end_height: u32,
+    leaf: u64,
+    mut output_mmr_at: impl FnMut(u32) -> Option<u64>,
+) -> LeafBlock {
+    let Some(first) = broadcast_height.checked_add(1) else {
+        return LeafBlock::NotInChain;
+    };
+    if first > end_height {
+        return LeafBlock::NotInChain;
+    }
+    let Some(parent_size) = output_mmr_at(broadcast_height) else {
+        return LeafBlock::Unread;
+    };
+    // The hop's output did not exist at broadcast. A leaf already in that
+    // header is not this spend.
+    if parent_size > leaf {
+        return LeafBlock::Unread;
+    }
+    let Some(end_size) = output_mmr_at(end_height) else {
+        return LeafBlock::Unread;
+    };
+    if end_size <= leaf {
+        return LeafBlock::NotInChain;
+    }
+    let mut lo = first;
+    let mut hi = end_height;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let Some(size) = output_mmr_at(mid) else {
+            return LeafBlock::Unread;
+        };
+        if size <= leaf {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let Some(parent_of) = lo.checked_sub(1) else {
+        return LeafBlock::Unread;
+    };
+    let parent_of_size = if parent_of == broadcast_height {
+        parent_size
+    } else {
+        let Some(size) = output_mmr_at(parent_of) else {
+            return LeafBlock::Unread;
+        };
+        size
+    };
+    if parent_of_size <= leaf {
+        LeafBlock::Found(lo)
+    } else {
+        LeafBlock::Unread
+    }
+}
+
+/// Result of looking for the new output among leaves created after broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafHunt {
+    Found(u64),
+    Absent,
+    Unread,
+}
+
+/// What to do with a waiting hop whose new coin has no leaf index yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndatedHop {
+    UseLeaf(u64),
+    NotIncluded,
+    NotYet,
+}
+
+/// What the stored tip leafset alone says about an undated hop.
+///
+/// The spent input still being in the leafset means the spend is not in any
+/// block up to that tip. Past the grace window that is a miss. An input that
+/// has left the leafset, or no answer, needs the header and UTXO reads.
+pub fn leafset_verdict(
+    broadcast_height: u32,
+    tip_height: u32,
+    inputs_unspent: Option<bool>,
+) -> Option<UndatedHop> {
+    match inputs_unspent {
+        Some(true) if grace_elapsed(broadcast_height, tip_height) => Some(UndatedHop::NotIncluded),
+        Some(true) => Some(UndatedHop::NotYet),
+        _ => None,
+    }
+}
+
+/// Decide a hop that sync has not tagged with a leaf index.
+///
+/// A flat output MMR through the grace window means the spend cannot be in a
+/// block yet. Once other outputs exist, only a finished scan that missed our
+/// output — and a spent input that is still in the leafset — says the same.
+/// An input that has already left the leafset means the spend landed, so a
+/// missed scan stays waiting instead of putting that coin back.
+pub fn undated_hop(
+    broadcast_height: u32,
+    tip_height: u32,
+    parent_output_mmr: u64,
+    tip_output_mmr: u64,
+    hunt: LeafHunt,
+    inputs_unspent: Option<bool>,
+) -> UndatedHop {
+    if tip_output_mmr <= parent_output_mmr {
+        return if grace_elapsed(broadcast_height, tip_height) {
+            UndatedHop::NotIncluded
+        } else {
+            UndatedHop::NotYet
+        };
+    }
+    match hunt {
+        LeafHunt::Found(leaf) => UndatedHop::UseLeaf(leaf),
+        LeafHunt::Unread => UndatedHop::NotYet,
+        LeafHunt::Absent => {
+            if inputs_unspent == Some(true) && grace_elapsed(broadcast_height, tip_height) {
+                UndatedHop::NotIncluded
+            } else {
+                UndatedHop::NotYet
+            }
+        }
+    }
+}
+
+/// The broadcast never landed. Point the job at the coin that can be sent again.
+/// A saved error keeps [`ready_to_broadcast`] false until the user retries.
+pub fn note_not_included(job: &mut ChurnJob, restored_output_id: &str) -> Result<(), WalletError> {
+    if !matches!(
+        job.phase,
+        ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
+    ) {
+        return Err(WalletError::BuildTx(
+            "This self-spend is not waiting on a block.".into(),
+        ));
+    }
+    let id = mweb_frozen::normalize_output_id(restored_output_id)?;
+    job.current_output_id = id;
+    job.pending_wtxid = None;
+    job.created_output_id = None;
+    job.broadcast_height = None;
+    job.header_cache.clear();
+    job.last_error = Some("This spend was not included in a block.".into());
+    job.phase = ChurnPhase::WaitingToBroadcast;
     Ok(())
 }
 
@@ -491,29 +783,32 @@ mod tests {
 
     fn job_waiting_confirm() -> ChurnJob {
         let mut job = new_job(&"ab".repeat(32), true, 2, 50_000).unwrap();
-        note_broadcast(&mut job, "wtxid", &"cd".repeat(32)).unwrap();
+        note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 100).unwrap();
         job
     }
 
     #[test]
-    fn solo_when_both_deltas_are_one() {
+    fn solo_when_one_kernel_and_one_new_output() {
+        // The parent's kernel count is that block's own and does not matter.
         assert_eq!(
-            score_1in1_hop(Some(sizes(10, 20)), Some(sizes(11, 21))),
+            score_1in1_hop(Some(sizes(5, 20)), Some(sizes(1, 21))),
             HopScore::Solo
         );
     }
 
     #[test]
     fn foreign_kernel_or_output_counts() {
+        // Mainnet 3197964 -> 3197965: five kernels in the parent block, two in
+        // ours, one new output. The parent count must not be subtracted.
         assert_eq!(
-            score_1in1_hop(Some(sizes(10, 20)), Some(sizes(12, 21))),
+            score_1in1_hop(Some(sizes(5, 379_093)), Some(sizes(2, 379_094))),
             HopScore::Mixed {
                 other_kernels: 1,
                 other_outputs: 0
             }
         );
         assert_eq!(
-            score_1in1_hop(Some(sizes(10, 20)), Some(sizes(13, 24))),
+            score_1in1_hop(Some(sizes(0, 20)), Some(sizes(3, 24))),
             HopScore::Mixed {
                 other_kernels: 2,
                 other_outputs: 3
@@ -523,10 +818,15 @@ mod tests {
 
     #[test]
     fn missing_header_is_unscored() {
-        assert_eq!(score_1in1_hop(None, Some(sizes(11, 21))), HopScore::Unscored);
-        assert_eq!(score_1in1_hop(Some(sizes(10, 20)), None), HopScore::Unscored);
+        assert_eq!(score_1in1_hop(None, Some(sizes(1, 21))), HopScore::Unscored);
+        assert_eq!(score_1in1_hop(Some(sizes(1, 20)), None), HopScore::Unscored);
+        // No kernels, or no new output: this block cannot hold the hop.
         assert_eq!(
-            score_1in1_hop(Some(sizes(10, 20)), Some(sizes(10, 21))),
+            score_1in1_hop(Some(sizes(1, 20)), Some(sizes(0, 21))),
+            HopScore::Unscored
+        );
+        assert_eq!(
+            score_1in1_hop(Some(sizes(1, 20)), Some(sizes(1, 20))),
             HopScore::Unscored
         );
     }
@@ -571,7 +871,7 @@ mod tests {
     #[test]
     fn mixed_at_target_finishes() {
         let mut job = new_job(&"ab".repeat(32), false, 1, 50_000).unwrap();
-        note_broadcast(&mut job, "wtxid", &"cd".repeat(32)).unwrap();
+        note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 100).unwrap();
         apply_score(
             &mut job,
             HopScore::Mixed {
@@ -588,7 +888,7 @@ mod tests {
     fn second_hop_is_refused_while_unconfirmed() {
         let mut job = job_waiting_confirm();
         assert!(!ready_to_broadcast(&job));
-        let err = note_broadcast(&mut job, "again", &"ef".repeat(32)).unwrap_err();
+        let err = note_broadcast(&mut job, "again", &"ef".repeat(32), 100).unwrap_err();
         assert!(err.to_string().contains("not ready"));
         assert_eq!(job.phase, ChurnPhase::WaitingConfirm);
     }
@@ -663,7 +963,10 @@ mod tests {
         write_job(dir.path(), &job).unwrap();
         mweb_frozen::set_locked(dir.path(), &job.current_output_id, false).unwrap();
         assert!(!mweb_frozen::contains(dir.path(), &id));
-        assert_eq!(read_job(dir.path()).unwrap().unwrap().phase, ChurnPhase::Cancelled);
+        assert_eq!(
+            read_job(dir.path()).unwrap().unwrap().phase,
+            ChurnPhase::Cancelled
+        );
     }
 
     #[test]
@@ -692,5 +995,178 @@ mod tests {
         assert_eq!(mixed.last_other_kernels, Some(2));
         assert_eq!(mixed.last_other_outputs, Some(3));
         assert!(depth_of(dir.path(), &from).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_tip_scores_the_earlier_hop() {
+        let headers = [
+            (10, Some(sizes(3, 20))),
+            (11, Some(sizes(1, 21))),
+            (12, Some(sizes(0, 21))),
+        ];
+        let mut job = job_waiting_confirm();
+        let applied = consider_inclusion(&mut job, find_inclusion(&headers, None)).unwrap();
+        assert_eq!(applied.map(|(height, _)| height), Some(11));
+        assert_eq!(job.phase, ChurnPhase::PausedSolo);
+    }
+
+    #[test]
+    fn missing_headers_leave_the_job_waiting() {
+        let headers = [(10, None), (11, None)];
+        let mut job = job_waiting_confirm();
+        let applied = consider_inclusion(&mut job, find_inclusion(&headers, None)).unwrap();
+        assert!(applied.is_none());
+        assert_eq!(job.phase, ChurnPhase::WaitingConfirm);
+    }
+
+    #[test]
+    fn two_growing_blocks_without_a_leaf_stay_undecided() {
+        let headers = [
+            (10, Some(sizes(0, 20))),
+            (11, Some(sizes(1, 21))),
+            (12, Some(sizes(2, 23))),
+        ];
+        assert_eq!(find_inclusion(&headers, None), InclusionFind::NotYet);
+    }
+
+    #[test]
+    fn leaf_index_picks_the_block_that_crossed_it() {
+        let headers = [
+            (10, Some(sizes(0, 20))),
+            (11, Some(sizes(1, 21))),
+            (12, Some(sizes(2, 23))),
+        ];
+        assert_eq!(
+            find_inclusion(&headers, Some(21)),
+            InclusionFind::Found {
+                height: 12,
+                score: HopScore::Mixed {
+                    other_kernels: 1,
+                    other_outputs: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn old_job_without_broadcast_height_still_loads() {
+        let json = r#"{
+            "version": 1,
+            "phase": "waiting-confirm",
+            "current_output_id": "aa",
+            "origin_output_id": "aa",
+            "target_depth": 1,
+            "effective_depth": 0,
+            "fee_sats": 1
+        }"#;
+        let job: ChurnJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.broadcast_height, None);
+        assert_eq!(job.phase, ChurnPhase::WaitingConfirm);
+    }
+
+    fn chain(heights: &[(u32, u64)]) -> impl Fn(u32) -> Option<u64> + '_ {
+        move |height| {
+            heights
+                .iter()
+                .find(|(h, _)| *h == height)
+                .map(|(_, size)| *size)
+        }
+    }
+
+    #[test]
+    fn locate_picks_the_later_block_when_two_blocks_grew() {
+        let sizes = chain(&[(10, 20), (11, 21), (12, 23)]);
+        assert_eq!(locate_leaf_block(10, 12, 21, sizes), LeafBlock::Found(12));
+    }
+
+    #[test]
+    fn locate_stops_when_the_tip_has_not_reached_the_leaf() {
+        let sizes = chain(&[(10, 20), (14, 20)]);
+        assert_eq!(locate_leaf_block(10, 14, 20, sizes), LeafBlock::NotInChain);
+    }
+
+    #[test]
+    fn locate_stays_unread_when_a_probed_header_is_missing() {
+        let sizes = chain(&[(10, 20), (12, 23)]);
+        assert_eq!(locate_leaf_block(10, 12, 21, sizes), LeafBlock::Unread);
+    }
+
+    #[test]
+    fn flat_output_mmr_is_not_included_only_after_the_grace_window() {
+        assert_eq!(
+            undated_hop(100, 105, 20, 20, LeafHunt::Absent, None),
+            UndatedHop::NotYet
+        );
+        assert_eq!(
+            undated_hop(100, 106, 20, 20, LeafHunt::Absent, None),
+            UndatedHop::NotIncluded
+        );
+    }
+
+    #[test]
+    fn a_missed_output_is_not_included_when_the_input_is_still_unspent() {
+        assert_eq!(
+            undated_hop(100, 110, 20, 25, LeafHunt::Absent, Some(true)),
+            UndatedHop::NotIncluded
+        );
+        assert_eq!(
+            undated_hop(100, 110, 20, 25, LeafHunt::Absent, Some(false)),
+            UndatedHop::NotYet
+        );
+        assert_eq!(
+            undated_hop(100, 110, 20, 25, LeafHunt::Absent, None),
+            UndatedHop::NotYet
+        );
+        assert_eq!(
+            undated_hop(100, 110, 20, 25, LeafHunt::Found(22), None),
+            UndatedHop::UseLeaf(22)
+        );
+    }
+
+    #[test]
+    fn leafset_alone_decides_only_when_the_input_is_still_unspent() {
+        assert_eq!(
+            leafset_verdict(100, 110, Some(true)),
+            Some(UndatedHop::NotIncluded)
+        );
+        assert_eq!(
+            leafset_verdict(100, 103, Some(true)),
+            Some(UndatedHop::NotYet)
+        );
+        assert_eq!(leafset_verdict(100, 110, Some(false)), None);
+        assert_eq!(leafset_verdict(100, 110, None), None);
+    }
+
+    #[test]
+    fn header_cache_survives_a_reload_and_resets_on_a_new_hop() {
+        let mut job = job_waiting_confirm();
+        job.header_cache.insert(101, sizes(5, 9));
+        job.last_check = Some("tip=105".into());
+        let json = serde_json::to_string(&job).unwrap();
+        let loaded: ChurnJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.header_cache.get(&101), Some(&sizes(5, 9)));
+        assert_eq!(loaded.last_check.as_deref(), Some("tip=105"));
+        let mut job = loaded;
+        note_not_included(&mut job, &"ab".repeat(32)).unwrap();
+        assert!(job.header_cache.is_empty());
+        request_retry(&mut job).unwrap();
+        job.header_cache.insert(1, sizes(1, 1));
+        note_broadcast(&mut job, "w", &"cd".repeat(32), 200).unwrap();
+        assert!(job.header_cache.is_empty());
+        assert!(job.last_check.is_none());
+    }
+
+    #[test]
+    fn a_spend_that_missed_its_block_waits_for_the_user_to_retry() {
+        let mut job = job_waiting_confirm();
+        let restored = "ab".repeat(32);
+        note_not_included(&mut job, &restored).unwrap();
+        assert_eq!(job.phase, ChurnPhase::WaitingToBroadcast);
+        assert_eq!(job.current_output_id, restored);
+        assert!(job.broadcast_height.is_none());
+        assert!(job.pending_wtxid.is_none());
+        assert!(!ready_to_broadcast(&job));
+        request_retry(&mut job).unwrap();
+        assert!(ready_to_broadcast(&job));
     }
 }

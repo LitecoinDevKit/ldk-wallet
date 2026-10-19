@@ -47,7 +47,9 @@ fn rpc_call(
         }
     }
     let value: serde_json::Value = match request.send_json(body) {
-        Ok(resp) => resp.into_json().map_err(|e| WalletError::Rpc(e.to_string()))?,
+        Ok(resp) => resp
+            .into_json()
+            .map_err(|e| WalletError::Rpc(e.to_string()))?,
         // litecoind reports JSON-RPC failures (e.g. rejected txs) as HTTP 500
         // with the real reason in the body; surface that instead of the status.
         Err(ureq::Error::Status(code, resp)) => match resp.into_json::<serde_json::Value>() {
@@ -132,8 +134,14 @@ mod tests {
     #[test]
     fn normalize_adds_scheme_when_missing() {
         assert_eq!(normalize_rpc_url("127.0.0.1:9332"), "http://127.0.0.1:9332");
-        assert_eq!(normalize_rpc_url(" 127.0.0.1:9332 "), "http://127.0.0.1:9332");
-        assert_eq!(normalize_rpc_url("http://127.0.0.1:9332"), "http://127.0.0.1:9332");
+        assert_eq!(
+            normalize_rpc_url(" 127.0.0.1:9332 "),
+            "http://127.0.0.1:9332"
+        );
+        assert_eq!(
+            normalize_rpc_url("http://127.0.0.1:9332"),
+            "http://127.0.0.1:9332"
+        );
         assert_eq!(
             normalize_rpc_url("https://user:pass@host:9332"),
             "https://user:pass@host:9332"

@@ -175,7 +175,10 @@ mod tests {
     #[test]
     fn name_truncates() {
         let long: String = "n".repeat(80);
-        assert_eq!(normalize_name(&long).chars().count(), MAX_CONTACT_NAME_CHARS);
+        assert_eq!(
+            normalize_name(&long).chars().count(),
+            MAX_CONTACT_NAME_CHARS
+        );
     }
 
     #[test]

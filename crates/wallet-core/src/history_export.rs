@@ -53,8 +53,7 @@ fn kind_slug(kind: TxKind) -> &'static str {
 }
 
 fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r')
-    {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         let escaped = value.replace('"', "\"\"");
         format!("\"{escaped}\"")
     } else {
@@ -69,10 +68,7 @@ pub fn to_csv(txs: &[TxRecord], labels: &HashMap<String, String>) -> String {
     );
     for tx in txs {
         let note = labels.get(&tx.txid).map(String::as_str).unwrap_or("");
-        let fee = tx
-            .fee_sats
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let fee = tx.fee_sats.map(|v| v.to_string()).unwrap_or_default();
         let height = tx.height.map(|v| v.to_string()).unwrap_or_default();
         let timestamp = tx.timestamp.map(|v| v.to_string()).unwrap_or_default();
         out.push_str(&format!(

@@ -132,7 +132,10 @@ pub fn cross_check_tip(
 fn handshake(client: &ElectrumClient) -> Result<(), bdk_electrum::electrum_client::Error> {
     let version = client.inner.raw_call(
         "server.version",
-        vec![Param::String("ltc-wallet".into()), Param::String("1.4".into())],
+        vec![
+            Param::String("ltc-wallet".into()),
+            Param::String("1.4".into()),
+        ],
     );
     match version {
         Ok(_) => Ok(()),
@@ -141,10 +144,7 @@ fn handshake(client: &ElectrumClient) -> Result<(), bdk_electrum::electrum_clien
 }
 
 /// Connect, handshake, and read tip height — used by Settings “Test connection”.
-pub fn probe_tip(
-    url: &str,
-    validate_domain: bool,
-) -> Result<(u32, u64), WalletError> {
+pub fn probe_tip(url: &str, validate_domain: bool) -> Result<(u32, u64), WalletError> {
     let started = std::time::Instant::now();
     let client = connect_with_timeout(url, validate_domain, 15)?;
     handshake(&client).map_err(|e| WalletError::Electrum(e.to_string()))?;

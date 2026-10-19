@@ -1,6 +1,6 @@
 //! MWEB orchestration beside the transparent wallet.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::Path;
@@ -9,13 +9,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bdk_mweb::keys::{MasterKeyScheme, MasterKeys};
+use bdk_mweb::limits::MAX_REQUESTED_MWEB_UTXOS;
 use bdk_mweb::lip0006::MwebUtxoSource;
 use bdk_mweb::lip0006_tcp::{BroadcastAck, TcpMwebPeer};
 use bdk_mweb::mweb_sync::{
     leafset_has_leaf, FixedHeaderProvider, MwebSyncer, PeerPool, ReadyNotifier, SyncProgress,
     SyncState,
 };
-use bdk_mweb::p2p::MwebLeafset;
+use bdk_mweb::p2p::{GetMwebUtxos, MwebLeafset, OUTPUT_FORMAT_FULL};
 use bdk_mweb::pmmr::verify_leafset;
 use bdk_mweb::tx_builder::CHANGE_ADDRESS_INDEX;
 use bdk_mweb::MwebCoinDatabase;
@@ -192,6 +193,8 @@ pub struct MwebRuntime {
     pub history: MwebHistory,
     /// Warning from the last sync's second-peer leafset cross-check, if any.
     pub cross_check_warning: Option<String>,
+    /// Peer that served the last successful sync pass. Scoring asks it first.
+    pub last_good_peer: Option<std::net::SocketAddr>,
     /// Full aggregate coin changeset mirrored on disk (sealed persistence).
     agg: ChangeSet,
     /// Key for encrypting MWEB files at rest; `None` falls back to the legacy
@@ -267,6 +270,7 @@ impl MwebRuntime {
             stale: true,
             history,
             cross_check_warning: None,
+            last_good_peer: None,
             agg,
             sealing_key,
             secp,
@@ -501,6 +505,7 @@ impl MwebRuntime {
         if pending_unverifiable_outgoing(&self.history, self.store.db()) {
             self.sync_state.invalidate_leafset();
         }
+        let pool_first = addrs.first().copied();
         let mut pool = PeerPool::new(addrs);
         let syncer = MwebSyncer {
             progress,
@@ -536,6 +541,7 @@ impl MwebRuntime {
             )
         }) {
             Ok(result) => {
+                self.last_good_peer = pool.last_connected().or_else(|| pool_first);
                 self.last_synced_height = Some(tip_height);
                 self.stale = false;
                 self.last_status = format!(
@@ -647,10 +653,7 @@ fn is_outgoing_mweb(kind: TxKind) -> bool {
 }
 
 /// Minimum inclusion height among coins this entry created, if any are dated.
-pub(crate) fn history_entry_height(
-    entry: &MwebHistoryEntry,
-    db: &MwebCoinDatabase,
-) -> Option<u32> {
+pub(crate) fn history_entry_height(entry: &MwebHistoryEntry, db: &MwebCoinDatabase) -> Option<u32> {
     let mut height = entry.confirmed_height;
     for id_hex in &entry.output_ids {
         let Some(id) = decode_output_id(id_hex) else {
@@ -677,10 +680,7 @@ fn date_undated_outputs(db: &mut MwebCoinDatabase, output_ids: &[String], height
 
 /// Pending outgoing txs whose spent inputs have no `leaf_index`, so the
 /// leafset cannot prove inclusion or drop. A full UTXO download re-finds them.
-pub(crate) fn pending_unverifiable_outgoing(
-    history: &MwebHistory,
-    db: &MwebCoinDatabase,
-) -> bool {
+pub(crate) fn pending_unverifiable_outgoing(history: &MwebHistory, db: &MwebCoinDatabase) -> bool {
     history.entries.iter().any(|entry| {
         if entry.confirmed_height.is_some() || !is_outgoing_mweb(entry.kind) {
             return false;
@@ -736,11 +736,7 @@ fn restore_stale_unconfirmed_inputs(
     }
 }
 
-fn forget_stale_unlanded_outgoing(
-    history: &mut MwebHistory,
-    db: &mut MwebCoinDatabase,
-    now: u64,
-) {
+fn forget_stale_unlanded_outgoing(history: &mut MwebHistory, db: &mut MwebCoinDatabase, now: u64) {
     let mut forget: Vec<String> = Vec::new();
     for entry in &history.entries {
         if entry.confirmed_height.is_some() || !is_outgoing_mweb(entry.kind) {
@@ -864,10 +860,7 @@ mod tests {
     fn header_peers_keep_the_configured_node_ahead_of_public_ones() {
         let local: std::net::SocketAddr = "127.0.0.1:9333".parse().unwrap();
         let public: std::net::SocketAddr = "64.23.156.63:9333".parse().unwrap();
-        assert_eq!(
-            merge_header_peers(&[local], &[public]),
-            vec![local, public]
-        );
+        assert_eq!(merge_header_peers(&[local], &[public]), vec![local, public]);
         assert_eq!(merge_header_peers(&[], &[public]), vec![public]);
         assert_eq!(merge_header_peers(&[local], &[local]), vec![local]);
     }
@@ -1023,7 +1016,10 @@ mod tests {
         db.mark_spent(&[2; 32]);
         let got = run(vec![entry(TxKind::MwebSend, &[], &[2])], &mut db, &[3]);
         assert_eq!(got, vec![None]);
-        assert!(db.get(&[2; 32]).is_none(), "recent pending spend stays spent");
+        assert!(
+            db.get(&[2; 32]).is_none(),
+            "recent pending spend stays spent"
+        );
         assert!(db.get_spent(&[2; 32]).is_some());
     }
 
@@ -1053,6 +1049,34 @@ mod tests {
     }
 
     #[test]
+    fn recall_restores_the_spent_input_and_drops_the_unconfirmed_output() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, Some(50), Some(4)));
+        db.mark_spent(&[1; 32]);
+        db.insert(coin(2, None, None));
+        let mut history = MwebHistory::default();
+        history.record(entry(TxKind::MwebChurn, &[2], &[1]));
+        let restored = recall_unlanded_spend(&mut history, &mut db, "tx").unwrap();
+        assert_eq!(restored, id_hex(1));
+        assert!(db.get(&[1; 32]).is_some());
+        assert!(db.get(&[2; 32]).is_none());
+        assert!(history.entries.is_empty());
+    }
+
+    #[test]
+    fn recall_leaves_a_landed_output_alone() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, Some(50), Some(4)));
+        db.mark_spent(&[1; 32]);
+        db.insert(coin(2, None, Some(9)));
+        let mut history = MwebHistory::default();
+        history.record(entry(TxKind::MwebChurn, &[2], &[1]));
+        assert!(recall_unlanded_spend(&mut history, &mut db, "tx").is_none());
+        assert!(db.get(&[2; 32]).is_some());
+        assert!(db.get_spent(&[1; 32]).is_some());
+    }
+
+    #[test]
     fn undated_change_with_present_inputs_stays_pending() {
         let mut db = MwebCoinDatabase::default();
         db.insert(coin(1, None, None));
@@ -1075,11 +1099,7 @@ mod tests {
         db.insert(coin(1, None, None));
         db.insert(coin(2, Some(100), Some(3)));
         db.mark_spent(&[2; 32]);
-        let got = run(
-            vec![entry(TxKind::MwebSplit, &[1], &[2])],
-            &mut db,
-            &[9],
-        );
+        let got = run(vec![entry(TxKind::MwebSplit, &[1], &[2])], &mut db, &[9]);
         assert_eq!(got, vec![Some(TIP)]);
         assert_eq!(db.get(&[1; 32]).unwrap().block_height, Some(TIP));
         assert!(db.get(&[1; 32]).unwrap().is_spendable(TIP, 6));
@@ -1098,7 +1118,10 @@ mod tests {
             &[3, 9],
             now,
         );
-        assert!(heights.is_empty(), "dropped split must leave history: {heights:?}");
+        assert!(
+            heights.is_empty(),
+            "dropped split must leave history: {heights:?}"
+        );
         assert!(history.entries.is_empty());
         assert!(
             db.get(&[2; 32]).is_some(),
@@ -1202,8 +1225,8 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].output_id, [1; 32]);
         let frozen = BTreeSet::from([id_hex(1)]);
-        let err = resolve_spend_coins(&db, TIP, &frozen, Some(&ids), 1_000_000, "spending")
-            .unwrap_err();
+        let err =
+            resolve_spend_coins(&db, TIP, &frozen, Some(&ids), 1_000_000, "spending").unwrap_err();
         assert!(err.to_string().contains("frozen"));
         let mut immature = coin(3, Some(TIP), Some(1));
         immature.is_pegin = true;
@@ -1223,12 +1246,8 @@ mod tests {
 
     #[test]
     fn plan_pegout_per_coin_takes_fee_from_largest() {
-        let plan = plan_pegout_per_coin(
-            &[5_000_000, 10_000_000, 20_000_000],
-            50_000,
-            2_940,
-        )
-        .unwrap();
+        let plan =
+            plan_pegout_per_coin(&[5_000_000, 10_000_000, 20_000_000], 50_000, 2_940).unwrap();
         assert_eq!(plan.fee_output_index, 2);
         assert_eq!(plan.amounts, vec![5_000_000, 10_000_000, 19_950_000]);
         assert_eq!(plan.amounts.iter().sum::<u64>(), 34_950_000);
@@ -1303,8 +1322,7 @@ mod tests {
         use crate::dto::MwebScheme;
         use crate::seed::MasterSecret;
         let dir = tempfile::tempdir().unwrap();
-        let secret =
-            MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
+        let secret = MasterSecret::parse(&descriptors::generate_mnemonic().unwrap(), None).unwrap();
         let runtime = MwebRuntime::open(
             dir.path(),
             &secret,
@@ -1321,14 +1339,8 @@ mod tests {
         let selected = select_split_coin(&db, &id_hex(2), TIP, &BTreeSet::new()).unwrap();
         assert_eq!(selected.output_id, [2; 32]);
         let kind = NetworkKind::Test;
-        let addr0 = runtime
-            .keys
-            .address(0, kind, &runtime.secp)
-            .unwrap();
-        let addr1 = runtime
-            .keys
-            .address(1, kind, &runtime.secp)
-            .unwrap();
+        let addr0 = runtime.keys.address(0, kind, &runtime.secp).unwrap();
+        let addr1 = runtime.keys.address(1, kind, &runtime.secp).unwrap();
         // Dummy coin secrets will not produce a valid spend, but funding must
         // still take exactly the selected input rather than the whole pool.
         let funded = bdk_mweb::fund_mweb_spend(
@@ -2146,9 +2158,8 @@ pub fn list_mweb_unspent(
     let labels = utxo_labels::read_labels(data_dir)
         .map(|f| f.labels)
         .unwrap_or_default();
-    let (depth, job) = crate::churn::annotations(data_dir).unwrap_or_else(|_| {
-        (std::collections::BTreeMap::new(), None)
-    });
+    let (depth, job) = crate::churn::annotations(data_dir)
+        .unwrap_or_else(|_| (std::collections::BTreeMap::new(), None));
     let mut rows: Vec<MwebUtxoRecord> = runtime
         .store
         .db()
@@ -2252,10 +2263,124 @@ fn churn_fields(
     }
 }
 
-/// Block height of an unspent output, once sync has dated it.
-pub fn coin_block_height(runtime: &MwebRuntime, output_id_hex: &str) -> Option<u32> {
+/// Height and output-MMR leaf of an unspent coin. Either may still be unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct CoinAnchor {
+    pub height: Option<u32>,
+    pub leaf_index: Option<u64>,
+}
+
+pub fn coin_anchor(runtime: &MwebRuntime, output_id_hex: &str) -> Option<CoinAnchor> {
     let id = decode_output_id(output_id_hex)?;
-    runtime.store.db().get(&id).and_then(|c| c.block_height)
+    let coin = runtime.store.db().get(&id)?;
+    Some(CoinAnchor {
+        height: coin.block_height,
+        leaf_index: coin.leaf_index,
+    })
+}
+
+/// Replace the height stamped at detection time with the block that contains the coin.
+pub fn set_coin_block_height(runtime: &mut MwebRuntime, output_id_hex: &str, height: u32) -> bool {
+    let Some(id) = decode_output_id(output_id_hex) else {
+        return false;
+    };
+    let db = runtime.store.db_mut();
+    if db.get(&id).is_none() {
+        return false;
+    }
+    db.set_block_height(&id, height);
+    true
+}
+
+/// Remember the output-MMR leaf once a peer has shown which UTXO this coin is.
+pub fn set_coin_leaf_index(
+    runtime: &mut MwebRuntime,
+    output_id_hex: &str,
+    leaf_index: u64,
+) -> bool {
+    let Some(id) = decode_output_id(output_id_hex) else {
+        return false;
+    };
+    runtime.store.db_mut().set_leaf_index(&id, leaf_index)
+}
+
+/// Put a self-spend that never landed back on the coin it spent.
+///
+/// Returns that coin's id. Refuses when an output from the spend already has a
+/// height or leaf, which means the transaction is on chain.
+pub fn recall_unlanded_spend(
+    history: &mut MwebHistory,
+    db: &mut MwebCoinDatabase,
+    wtxid: &str,
+) -> Option<String> {
+    let entry = history.entries.iter().find(|e| e.id == wtxid)?.clone();
+    if entry.confirmed_height.is_some() || entry.input_ids.is_empty() {
+        return None;
+    }
+    for id_hex in &entry.output_ids {
+        let Some(id) = decode_output_id(id_hex) else {
+            continue;
+        };
+        if db
+            .get(&id)
+            .is_some_and(|coin| coin.block_height.is_some() || coin.leaf_index.is_some())
+        {
+            return None;
+        }
+    }
+    let restored = entry.input_ids[0].clone();
+    for id_hex in &entry.input_ids {
+        let Some(id) = decode_output_id(id_hex) else {
+            continue;
+        };
+        if let Some(coin) = db.get_spent(&id).cloned() {
+            db.insert(coin);
+        }
+    }
+    for id_hex in &entry.output_ids {
+        let Some(id) = decode_output_id(id_hex) else {
+            continue;
+        };
+        let _ = db.mark_spent(&id);
+    }
+    history.forget_ids(std::slice::from_ref(&entry.id));
+    Some(restored)
+}
+
+/// `Some(true)` when every input that has a leaf index is still in the leafset.
+/// `Some(false)` when one of those leaves has been spent. `None` when the
+/// leafset or the input leaves cannot answer.
+pub fn churn_inputs_still_unspent(runtime: &MwebRuntime, wtxid: &str) -> Option<bool> {
+    if runtime.sync_state.leafset.is_empty() {
+        return None;
+    }
+    let entry = runtime.history.entries.iter().find(|e| e.id == wtxid)?;
+    let mut saw_leaf = false;
+    for id_hex in &entry.input_ids {
+        let Some(id) = decode_output_id(id_hex) else {
+            continue;
+        };
+        let Some(coin) = runtime
+            .store
+            .db()
+            .get(&id)
+            .or_else(|| runtime.store.db().get_spent(&id))
+        else {
+            continue;
+        };
+        let Some(leaf) = coin.leaf_index else {
+            continue;
+        };
+        saw_leaf = true;
+        if !leafset_has_leaf(&runtime.sync_state.leafset, leaf) {
+            return Some(false);
+        }
+    }
+    if saw_leaf {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Amount and maturity for a self-spend preview. Does not apply the freeze list.
@@ -2304,33 +2429,190 @@ pub(crate) fn merge_header_peers(
     addrs
 }
 
-/// Peers to ask for an MWEB header: the user's node, then public seeds.
-pub fn peers_for_headers(peers: &[String], network: WalletNetwork) -> Vec<std::net::SocketAddr> {
-    let configured = resolve_peers(peers).unwrap_or_default();
+/// Peers to ask for an MWEB header: the peer that served the last sync, the
+/// user's node, then public seeds.
+pub fn peers_for_headers(
+    peers: &[String],
+    network: WalletNetwork,
+    preferred: Option<std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let mut configured = resolve_peers(peers).unwrap_or_default();
+    if let Some(first) = preferred {
+        configured.retain(|addr| *addr != first);
+        configured.insert(0, first);
+    }
     let discovered = crate::discovery::discover_mweb_peers(network);
     merge_header_peers(&configured, &discovered)
 }
 
-/// Kernel and output MMR sizes at `block_hash`, from the first peer that answers.
-pub fn fetch_mmr_sizes(
+/// MMR sizes for several blocks. One connection serves as many as it can; the next peer fills gaps.
+pub fn fetch_mmr_sizes_many(
     addrs: &[std::net::SocketAddr],
     network: WalletNetwork,
-    block_hash: bdk_wallet::bitcoin::BlockHash,
-) -> Option<crate::churn::MmrSizes> {
+    hashes: &[bdk_wallet::bitcoin::BlockHash],
+) -> Vec<Option<crate::churn::MmrSizes>> {
+    let mut out = vec![None; hashes.len()];
+    if hashes.is_empty() {
+        return out;
+    }
+    let bdk_net = network.to_bitcoin_network();
+    for addr in addrs {
+        if out.iter().all(|slot| slot.is_some()) {
+            break;
+        }
+        let Ok(mut peer) = TcpMwebPeer::connect(*addr, bdk_net) else {
+            continue;
+        };
+        for (i, hash) in hashes.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
+            }
+            let Ok(hdr) = MwebUtxoSource::get_header(&mut peer, *hash) else {
+                break;
+            };
+            out[i] = Some(crate::churn::MmrSizes {
+                kernel_mmr_size: hdr.mweb_header.kernel_mmr_size,
+                output_mmr_size: hdr.mweb_header.output_mmr_size,
+            });
+        }
+    }
+    out
+}
+
+/// One peer connection reused across the header reads for a single hop.
+pub struct MmrLookup {
+    addrs: Vec<std::net::SocketAddr>,
+    network: WalletNetwork,
+    peer_at: usize,
+    peer: Option<TcpMwebPeer>,
+    cache: HashMap<bdk_wallet::bitcoin::BlockHash, crate::churn::MmrSizes>,
+}
+
+impl MmrLookup {
+    pub fn new(addrs: Vec<std::net::SocketAddr>, network: WalletNetwork) -> Self {
+        Self {
+            addrs,
+            network,
+            peer_at: 0,
+            peer: None,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Peers this lookup will try, in order.
+    pub fn peers(&self) -> &[std::net::SocketAddr] {
+        &self.addrs
+    }
+
+    pub fn get(&mut self, hash: bdk_wallet::bitcoin::BlockHash) -> Option<crate::churn::MmrSizes> {
+        if let Some(hit) = self.cache.get(&hash) {
+            return Some(*hit);
+        }
+        let bdk_net = self.network.to_bitcoin_network();
+        while self.peer_at < self.addrs.len() {
+            if self.peer.is_none() {
+                match TcpMwebPeer::connect(self.addrs[self.peer_at], bdk_net) {
+                    Ok(peer) => self.peer = Some(peer),
+                    Err(_) => {
+                        self.peer_at += 1;
+                        continue;
+                    }
+                }
+            }
+            let peer = self.peer.as_mut().expect("peer was just connected");
+            match MwebUtxoSource::get_header(peer, hash) {
+                Ok(hdr) => {
+                    let sizes = crate::churn::MmrSizes {
+                        kernel_mmr_size: hdr.mweb_header.kernel_mmr_size,
+                        output_mmr_size: hdr.mweb_header.output_mmr_size,
+                    };
+                    self.cache.insert(hash, sizes);
+                    return Some(sizes);
+                }
+                Err(_) => {
+                    self.peer = None;
+                    self.peer_at += 1;
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Whether a scan of unspent leaves after broadcast found our output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainLeaf {
+    Found(u64),
+    Absent,
+    Unread,
+}
+
+/// Look for `output_id_hex` among unspent leaves in `[start_index, end_output_mmr)`.
+///
+/// A short or empty batch means the peer has no further unspent leaves. A full
+/// batch that never reaches `end_output_mmr` is unread, so the caller does not
+/// treat a truncated reply as proof the output is missing.
+pub fn find_output_leaf(
+    addrs: &[std::net::SocketAddr],
+    network: WalletNetwork,
+    tip_hash: bdk_wallet::bitcoin::BlockHash,
+    start_index: u64,
+    end_output_mmr: u64,
+    output_id_hex: &str,
+) -> ChainLeaf {
+    if start_index >= end_output_mmr {
+        return ChainLeaf::Absent;
+    }
+    let Some(want) = decode_output_id(output_id_hex) else {
+        return ChainLeaf::Unread;
+    };
     let bdk_net = network.to_bitcoin_network();
     for addr in addrs {
         let Ok(mut peer) = TcpMwebPeer::connect(*addr, bdk_net) else {
             continue;
         };
-        let Ok(hdr) = MwebUtxoSource::get_header(&mut peer, block_hash) else {
-            continue;
-        };
-        return Some(crate::churn::MmrSizes {
-            kernel_mmr_size: hdr.mweb_header.kernel_mmr_size,
-            output_mmr_size: hdr.mweb_header.output_mmr_size,
-        });
+        let mut start = start_index;
+        let mut covered = true;
+        for _ in 0..4 {
+            let req = GetMwebUtxos {
+                block_hash: tip_hash,
+                start_index: start,
+                num_requested: MAX_REQUESTED_MWEB_UTXOS,
+                output_format: OUTPUT_FORMAT_FULL,
+            };
+            let Ok(batch) = MwebUtxoSource::get_utxos(&mut peer, req) else {
+                covered = false;
+                break;
+            };
+            if batch.output_format != OUTPUT_FORMAT_FULL {
+                covered = false;
+                break;
+            }
+            if batch.utxos.is_empty() {
+                return ChainLeaf::Absent;
+            }
+            for entry in &batch.utxos {
+                if bdk_mweb::scan::output_id(&entry.output) == want {
+                    return ChainLeaf::Found(entry.leaf_index);
+                }
+            }
+            let last = batch
+                .utxos
+                .last()
+                .map(|entry| entry.leaf_index)
+                .unwrap_or(start);
+            if (batch.utxos.len() as u16) < MAX_REQUESTED_MWEB_UTXOS
+                || last.saturating_add(1) >= end_output_mmr
+            {
+                return ChainLeaf::Absent;
+            }
+            start = last.saturating_add(1);
+        }
+        if covered {
+            return ChainLeaf::Unread;
+        }
     }
-    None
+    ChainLeaf::Unread
 }
 
 /// Resolve one mature, unfrozen MWEB coin by output id.
@@ -2462,9 +2744,7 @@ pub fn mweb_split(
     )
     .map_err(|e| WalletError::Mweb(e.to_string()))?;
     if funded.spent_coins.len() != 1 {
-        return Err(WalletError::BuildTx(
-            "Split uses exactly one coin".into(),
-        ));
+        return Err(WalletError::BuildTx("Split uses exactly one coin".into()));
     }
     let spent_ids: Vec<_> = funded.spent_coins.iter().map(|c| c.output_id).collect();
     let (tx, _change) = wallet
@@ -2481,9 +2761,9 @@ pub fn mweb_split(
         let index = if let Some(ci) = staged.change_index {
             ci
         } else {
-            let idx = *indexes.get(recip_i).ok_or_else(|| {
-                WalletError::Mweb("split staged output count mismatch".into())
-            })?;
+            let idx = *indexes
+                .get(recip_i)
+                .ok_or_else(|| WalletError::Mweb("split staged output count mismatch".into()))?;
             recip_i += 1;
             idx
         };
@@ -2530,7 +2810,13 @@ pub fn mweb_self_spend(
     if let Ok(id) = mweb_frozen::normalize_output_id(output_id_hex) {
         frozen.remove(&id);
     }
-    let coin = select_mweb_coin(runtime.store.db(), output_id_hex, tip, &frozen, "spending to self")?;
+    let coin = select_mweb_coin(
+        runtime.store.db(),
+        output_id_hex,
+        tip,
+        &frozen,
+        "spending to self",
+    )?;
     if coin.amount <= fee_sats {
         return Err(WalletError::BuildTx(
             "This coin is too small to pay the fee.".into(),
@@ -2589,10 +2875,7 @@ pub fn mweb_self_spend(
         input_ids: spent_ids.iter().map(hex::encode).collect(),
         confirmed_height: None,
     });
-    Ok(SelfSpendResult {
-        wtxid,
-        output_id,
-    })
+    Ok(SelfSpendResult { wtxid, output_id })
 }
 
 pub fn pegout(

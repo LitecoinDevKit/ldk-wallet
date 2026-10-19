@@ -22,7 +22,12 @@ pub const CHART_ALLOWLIST: &[(&str, &str, &str, &str)] = &[
     ("tx_count_sum_24h", "day", "Tx count (24h)", "count"),
     ("hash_rate", "day", "Hash rate", "H/s"),
     ("mweb_balance", "day", "MWEB balance", "LTC"),
-    ("mweb_pegin_count_sum_1m", "day", "MWEB peg-ins (1m)", "count"),
+    (
+        "mweb_pegin_count_sum_1m",
+        "day",
+        "MWEB peg-ins (1m)",
+        "count",
+    ),
 ];
 
 /// Litview SPA path for a series id (see LRK `website/scripts/options/*` tree).
@@ -141,9 +146,9 @@ pub fn fetch_network_pulse(base: &str) -> Result<NetworkPulse, WalletError> {
         let mempool = s.spawn(|| mempool_stats(b));
         let change = s.spawn(|| fetch_series_raw(b, "price", "day", -2));
 
-        let tip_height = tip.join().map_err(|_| {
-            WalletError::Insights("tip height request panicked".into())
-        })??;
+        let tip_height = tip
+            .join()
+            .map_err(|_| WalletError::Insights("tip height request panicked".into()))??;
         let price_usd = price
             .join()
             .map_err(|_| WalletError::Insights("price request panicked".into()))?

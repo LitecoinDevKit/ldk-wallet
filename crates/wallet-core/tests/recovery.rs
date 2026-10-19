@@ -185,7 +185,10 @@ fn reveal_mnemonic_requires_passphrase_and_returns_phrase() {
     assert_eq!(revealed.kind, "BIP39 mnemonic");
     assert_eq!(revealed.phrase, created.mnemonic);
     assert!(revealed.aezeed_passphrase.is_none());
-    assert!(!app.is_locked(), "successful reveal leaves the wallet unlocked");
+    assert!(
+        !app.is_locked(),
+        "successful reveal leaves the wallet unlocked"
+    );
 }
 
 #[test]

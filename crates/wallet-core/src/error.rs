@@ -111,7 +111,9 @@ pub(crate) fn humanize_broadcast_error(raw: &str) -> String {
     {
         Some("this transaction was already broadcast — sync the wallet to see it")
     } else if lower.contains("script-verify") || lower.contains("non-final") {
-        Some("the network rejected this transaction as invalid (signature or timelock check failed)")
+        Some(
+            "the network rejected this transaction as invalid (signature or timelock check failed)",
+        )
     } else {
         None
     };
@@ -150,8 +152,7 @@ pub fn classify_broadcast_failure(message: &str) -> BroadcastFailureKind {
         || (lower.contains("could not read this transaction") && lower.contains("mweb"))
     {
         BroadcastFailureKind::NeedsRpc
-    } else if lower.contains("mempool-conflict") || lower.contains("conflicts with another")
-    {
+    } else if lower.contains("mempool-conflict") || lower.contains("conflicts with another") {
         BroadcastFailureKind::MempoolConflict
     } else if lower.contains("already broadcast")
         || lower.contains("already known")
@@ -199,7 +200,10 @@ mod tests {
         let msg = humanize_broadcast_error(raw);
         assert!(msg.contains("could not read this transaction"), "{msg}");
         assert!(msg.contains("MWEB"), "{msg}");
-        assert!(!msg.contains("020000000009"), "raw hex must be stripped: {msg}");
+        assert!(
+            !msg.contains("020000000009"),
+            "raw hex must be stripped: {msg}"
+        );
     }
 
     #[test]
@@ -217,9 +221,7 @@ mod tests {
 
     #[test]
     fn classifies_mweb_rpc_need() {
-        let msg = humanize_broadcast_error(
-            r#"{"code":1,"message":"TX decode failed\n[0200]"}"#,
-        );
+        let msg = humanize_broadcast_error(r#"{"code":1,"message":"TX decode failed\n[0200]"}"#);
         assert_eq!(
             classify_broadcast_failure(&msg),
             BroadcastFailureKind::NeedsRpc

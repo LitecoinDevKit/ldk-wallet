@@ -5057,6 +5057,9 @@ let churnPending: "retry" | "cancel" | null = null;
 let churnActionError: string | null = null;
 let churnSawActive = false;
 let churnSuppressFinish = false;
+/** Coin the user just confirmed, until start_churn settles and the real job is visible. */
+let churnStartingId: string | null = null;
+let churnStartingTarget = 1;
 
 function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
   return (
@@ -5067,12 +5070,26 @@ function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
   );
 }
 
+/** Show Sending on the confirmed coin before the broadcast returns. */
+function stampChurnStarting() {
+  if (!churnStartingId) return;
+  const coin = mwebUtxoCache.find((row) => row.output_id === churnStartingId);
+  if (!coin || churnPhaseActive(coin.churn_phase)) return;
+  coin.churn_phase = "waiting-to-broadcast";
+  coin.locked = true;
+  coin.churn_target = churnStartingTarget;
+  coin.churn_counted = 0;
+}
+
 function activeChurnCoin(): MwebUtxoRecord | undefined {
   return mwebUtxoCache.find((coin) => churnPhaseActive(coin.churn_phase));
 }
 
 function churnCompanySentence(coin: MwebUtxoRecord): string | null {
   const phase = coin.churn_phase;
+  if (phase === "waiting-to-broadcast" && (coin.churn_error || churnActionError)) {
+    return "The spend can be sent again.";
+  }
   if (phase === "waiting-to-broadcast" || phase === "waiting-confirm") {
     return "Waiting for the next block.";
   }
@@ -5301,14 +5318,18 @@ function renderChurnStatus() {
     again.addEventListener("click", () => void retryChurn());
     actions.append(again);
   }
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "btn btn-ghost btn-sm";
-  cancel.textContent = "Cancel";
-  cancel.disabled = churnPending != null;
-  cancel.addEventListener("click", () => void cancelChurn());
-  actions.append(cancel);
-  card.append(actions);
+  // Waiting means the hop is already broadcast. Cancel would only drop the local job.
+  const canCancel = phase !== "waiting-confirm";
+  if (canCancel) {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn btn-ghost btn-sm";
+    cancel.textContent = "Cancel";
+    cancel.disabled = churnPending != null;
+    cancel.addEventListener("click", () => void cancelChurn());
+    actions.append(cancel);
+  }
+  if (actions.childElementCount > 0) card.append(actions);
 }
 
 function renderMwebCoinsList() {
@@ -5573,15 +5594,22 @@ async function openChurnModal(coin: MwebUtxoRecord) {
     ],
   });
   if (choice !== "start" || !previewOk) return;
+  churnStartingId = coin.output_id;
+  churnStartingTarget = targetDepth;
+  stampChurnStarting();
+  renderMwebCoinsList();
+  let startError: unknown = null;
   try {
     await invoke("start_churn", {
       req: { output_id: coin.output_id, target_depth: targetDepth },
     });
-    await refreshUtxos();
   } catch (err) {
+    startError = err;
+  } finally {
+    churnStartingId = null;
     await refreshUtxos();
-    if (!activeChurnCoin()) setStatus(String(err), "error");
   }
+  if (startError && !activeChurnCoin()) setStatus(String(startError), "error");
 }
 
 const sendCoinPanel: CoinControlPanel = {
@@ -5719,6 +5747,8 @@ function renderMwebControlList(panel: CoinControlPanel) {
 }
 
 function noteChurnFinished() {
+  // The stamp is not a real job. Recording it would toast "finished" if the start fails.
+  if (churnStartingId) return;
   const active = !!activeChurnCoin();
   if (churnSawActive && !active && !churnSuppressFinish) {
     setStatus("Self-spend finished.", "info");
@@ -5740,6 +5770,7 @@ async function refreshUtxos() {
   } catch {
     mwebUtxoCache = [];
   }
+  stampChurnStarting();
   pruneSelectedOutpoints(sendSelectedOutpoints);
   pruneSelectedOutpoints(peginSelectedOutpoints);
   pruneSelectedMwebIds(mwebSendSelectedIds);

@@ -6,14 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::churn;
 use crate::contacts::{self, ContactsFile};
-use crate::dto::ContactRecord;
 use crate::dto::ChurnDepthRecord;
+use crate::dto::ContactRecord;
 use crate::error::WalletError;
 use crate::labels::{self, TxLabelsFile};
 use crate::mweb_frozen::{self, MwebFrozenFile};
 use crate::split_ids::{self, SplitIdsFile};
-use crate::churn;
 use crate::utxo_labels::{self, UtxoLabelsFile};
 
 pub const METADATA_BUNDLE_VERSION: u32 = 1;
@@ -65,14 +65,8 @@ pub fn export_bundle(data_dir: &Path) -> Result<MetadataBundle, WalletError> {
     let contacts = contacts::read_contacts(data_dir)?.contacts;
     let tx_labels = labels::read_labels(data_dir)?.labels;
     let utxo_labels = utxo_labels::read_labels(data_dir)?.labels;
-    let split_txids = split_ids::read_ids(data_dir)?
-        .txids
-        .into_iter()
-        .collect();
-    let mweb_frozen = mweb_frozen::read_ids(data_dir)?
-        .ids
-        .into_iter()
-        .collect();
+    let split_txids = split_ids::read_ids(data_dir)?.txids.into_iter().collect();
+    let mweb_frozen = mweb_frozen::read_ids(data_dir)?.ids.into_iter().collect();
     let churn_depth = churn::list_depth(data_dir)?;
     Ok(MetadataBundle {
         version: METADATA_BUNDLE_VERSION,
@@ -94,8 +88,8 @@ pub fn export_json(data_dir: &Path) -> Result<String, WalletError> {
 /// Merge imported metadata into local sidecars (import overlays; does not delete
 /// local entries that are absent from the file).
 pub fn import_json(data_dir: &Path, json: &str) -> Result<MetadataImportResult, WalletError> {
-    let bundle: MetadataBundle =
-        serde_json::from_str(json).map_err(|e| WalletError::Meta(format!("invalid metadata JSON: {e}")))?;
+    let bundle: MetadataBundle = serde_json::from_str(json)
+        .map_err(|e| WalletError::Meta(format!("invalid metadata JSON: {e}")))?;
     if bundle.version == 0 || bundle.version > METADATA_BUNDLE_VERSION {
         return Err(WalletError::Meta(format!(
             "unsupported metadata bundle version {}",
@@ -130,10 +124,13 @@ pub fn import_json(data_dir: &Path, json: &str) -> Result<MetadataImportResult, 
     if contacts_file.contacts.is_empty() {
         let _ = contacts_file;
     } else {
-        contacts::write_contacts(data_dir, &ContactsFile {
-            version: 1,
-            contacts: contacts_file.contacts,
-        })?;
+        contacts::write_contacts(
+            data_dir,
+            &ContactsFile {
+                version: 1,
+                contacts: contacts_file.contacts,
+            },
+        )?;
     }
 
     let mut tx_file = labels::read_labels(data_dir)?;

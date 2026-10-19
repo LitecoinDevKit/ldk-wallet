@@ -69,6 +69,9 @@ struct WalletState {
     needs_mweb_scan: bool,
     mweb: Option<MwebRuntime>,
     last_tip_height: u32,
+    /// Unix seconds of the Electrum header at `tip_time_height`, if read this session.
+    tip_time: Option<u64>,
+    tip_time_height: u32,
 }
 
 /// Snapshot the persistable subset of `state` (single source of truth for
@@ -126,6 +129,13 @@ fn connect_electrum(
     Ok(client)
 }
 
+/// Explorer settings Insights needs. Kept off the wallet mutex so a litview
+/// refresh does not wait out Electrum or MWEB sync.
+struct InsightsEndpoint {
+    enabled: bool,
+    base_url: String,
+}
+
 /// Application-facing wallet handle. BDK types stay private.
 pub struct WalletApp {
     state: Mutex<Option<WalletState>>,
@@ -137,6 +147,9 @@ pub struct WalletApp {
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
+    /// Copied from wallet state on load and settings save. Insights reads this
+    /// instead of the wallet mutex.
+    insights_endpoint: Mutex<Option<InsightsEndpoint>>,
 }
 
 impl WalletApp {
@@ -151,6 +164,22 @@ impl WalletApp {
             mweb_progress: Arc::new(SyncProgress::default()),
             mweb_sync_active: AtomicBool::new(false),
             pending_lock: AtomicBool::new(false),
+            insights_endpoint: Mutex::new(None),
+        }
+    }
+
+    fn publish_insights(&self, state: &WalletState) {
+        if let Ok(mut slot) = self.insights_endpoint.lock() {
+            *slot = Some(InsightsEndpoint {
+                enabled: state.insights_enabled,
+                base_url: state.explorer_base_url.clone(),
+            });
+        }
+    }
+
+    fn clear_insights(&self) {
+        if let Ok(mut slot) = self.insights_endpoint.lock() {
+            *slot = None;
         }
     }
 
@@ -244,6 +273,7 @@ impl WalletApp {
     /// Does **not** block on an in-flight sync.
     pub fn lock(&self) {
         self.secrets.lock();
+        self.clear_insights();
         self.pending_lock.store(true, Ordering::Release);
         match self.state.try_lock() {
             Ok(mut guard) => {
@@ -270,6 +300,7 @@ impl WalletApp {
             return Ok(());
         }
         **guard = None;
+        self.clear_insights();
         self.secrets.lock();
         self.pending_lock.store(false, Ordering::Release);
         Err(WalletError::Locked)
@@ -282,6 +313,7 @@ impl WalletApp {
     /// Delete wallet files and mnemonic secret. Safe if already absent.
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
         *self.lock_state()? = None;
+        self.clear_insights();
         self.secrets.delete_mnemonic()?;
         meta::remove_wallet_files(data_dir)?;
         Ok(())
@@ -354,6 +386,8 @@ impl WalletApp {
 
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
+            tip_time: None,
+            tip_time_height: 0,
             wallet,
             db,
             network: meta.network,
@@ -375,6 +409,7 @@ impl WalletApp {
             mweb,
         };
         let summary = build_summary(&mut state)?;
+        self.publish_insights(&state);
         *self.lock_state()? = Some(state);
         Ok(summary)
     }
@@ -697,6 +732,7 @@ impl WalletApp {
         state.show_fiat = req.show_fiat;
         state.use_explorer_fee_hints = req.use_explorer_fee_hints;
         state.insights_enabled = req.insights_enabled;
+        self.publish_insights(state);
         meta::write_meta(&state.data_dir, &meta_from_state(state))?;
         Ok(())
     }
@@ -760,14 +796,17 @@ impl WalletApp {
 
     fn require_insights_enabled(&self) -> Result<String, WalletError> {
         self.ensure_unlocked()?;
-        let guard = self.lock_state()?;
-        let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
-        if !state.insights_enabled {
+        let guard = self
+            .insights_endpoint
+            .lock()
+            .map_err(|_| WalletError::Persist("insights endpoint lock poisoned".into()))?;
+        let endpoint = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+        if !endpoint.enabled {
             return Err(WalletError::Insights(
                 "Insights are disabled in Settings".into(),
             ));
         }
-        Ok(state.explorer_base_url.clone())
+        Ok(endpoint.base_url.clone())
     }
 
     /// Litview network pulse for Balance strip / Insights header.
@@ -831,6 +870,18 @@ impl WalletApp {
             }
         }
         state.last_tip_height = tip_height;
+        let timed_height = state.wallet.local_chain().tip().height();
+        match electrum::header_time(&client, timed_height) {
+            Ok(time) => {
+                state.tip_time = Some(time);
+                state.tip_time_height = timed_height;
+            }
+            Err(_) => {
+                if state.tip_time_height != timed_height {
+                    state.tip_time = None;
+                }
+            }
+        }
 
         if did_full_scan {
             state.needs_full_scan = false;
@@ -1488,6 +1539,8 @@ impl WalletApp {
 
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
+            tip_time: None,
+            tip_time_height: 0,
             wallet,
             db,
             network,
@@ -1509,6 +1562,7 @@ impl WalletApp {
             mweb,
         };
         let summary = build_summary(&mut state)?;
+        self.publish_insights(&state);
         *self.lock_state()? = Some(state);
         Ok(summary)
     }
@@ -1599,6 +1653,8 @@ impl MemoryBackedApp {
             .ok_or(WalletError::NotFound)?;
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
+            tip_time: None,
+            tip_time_height: 0,
             wallet,
             db,
             network: meta.network,
@@ -1940,6 +1996,8 @@ impl MemoryBackedApp {
         meta::write_meta(data_dir, &meta)?;
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
+            tip_time: None,
+            tip_time_height: 0,
             wallet,
             db,
             network,
@@ -3484,6 +3542,9 @@ fn compute_address_reuse_hint(
 fn build_summary(state: &mut WalletState) -> Result<WalletSummary, WalletError> {
     let balance = state.wallet.balance();
     let tip_height = state.wallet.local_chain().tip().height();
+    let tip_time = state
+        .tip_time
+        .filter(|_| state.tip_time_height == tip_height);
     // Prefer the last revealed address while it is still unused so a "New
     // address" click sticks across sync/reload. Once it has been used, reveal
     // the next index instead of falling back to an earlier unused gap address.
@@ -3501,6 +3562,7 @@ fn build_summary(state: &mut WalletState) -> Result<WalletSummary, WalletError> 
         immature_sats: balance.immature.to_sat(),
         total_sats: balance.total().to_sat(),
         tip_height,
+        tip_time,
         receive_address,
     })
 }

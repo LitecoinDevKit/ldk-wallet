@@ -11,6 +11,8 @@ type WalletSummary = {
   immature_sats: number;
   total_sats: number;
   tip_height: number;
+  /** Unix seconds of the tip header, when this session has read it. */
+  tip_time?: number | null;
   receive_address: string;
 };
 
@@ -435,7 +437,8 @@ const SPLIT_PREFS_KEY = "ltc-split-prefs";
 const SPLIT_DENOMS_LTC = [0.1, 0.25, 0.5, 1, 5, 10, 20, 50, 100];
 const SPLIT_DENOMS_SATS = SPLIT_DENOMS_LTC.map((ltc) => Math.round(ltc * 100_000_000));
 const PEGOUT_PREP_SATS = new Set([5, 10, 20, 50].map((ltc) => ltc * 100_000_000));
-const AUTO_SYNC_MS = 60_000;
+const AUTO_SYNC_MS = 180_000;
+const SPOT_PRICE_MS = 60_000;
 const QR_CSS_SIZE = 176;
 const RECENT_TX_COUNT = 6;
 const MIN_PASSPHRASE_LEN = 8;
@@ -712,7 +715,8 @@ const el = {
   btnMwebSend: document.querySelector<HTMLButtonElement>("#btn-mweb-send")!,
   btnPegout: document.querySelector<HTMLButtonElement>("#btn-pegout")!,
   statusStrip: document.querySelector<HTMLElement>("#status-strip")!,
-  statusElectrum: document.querySelector<HTMLElement>("#status-electrum")!,
+  statusBlock: document.querySelector<HTMLButtonElement>("#status-block")!,
+  statusSep: document.querySelector<HTMLElement>("#status-sep")!,
   statusMweb: document.querySelector<HTMLElement>("#status-mweb")!,
   coinsUtxoList: document.querySelector<HTMLUListElement>("#coins-utxo-list")!,
   coinsUtxoEmpty: document.querySelector<HTMLElement>("#coins-utxo-empty")!,
@@ -769,7 +773,6 @@ let historySearchQuery = "";
 let contactsCache: ContactRecord[] = [];
 let utxoCache: UtxoRecord[] = [];
 let mwebUtxoCache: MwebUtxoRecord[] = [];
-let lastElectrumUrl: string | null = null;
 const sendSelectedOutpoints = new Set<string>();
 const peginSelectedOutpoints = new Set<string>();
 const mwebSendSelectedIds = new Set<string>();
@@ -777,6 +780,7 @@ const pegoutSelectedIds = new Set<string>();
 /** Local notes keyed by txid/wtxid (never sent to litview). */
 let txLabels: Record<string, string> = {};
 let autoSyncTimer: number | null = null;
+let spotPriceTimer: number | null = null;
 let mwebProgressTimer: number | null = null;
 let statusTimer: number | null = null;
 let showFiat = true;
@@ -1243,12 +1247,26 @@ async function refreshInsightsView() {
   el.btnRefreshInsights.disabled = false;
 }
 
+let insightsRefreshInFlight = false;
+
+/** Pulse always; charts only while the Insights view is open. Never waits on wallet sync. */
+async function refreshInsightsAsync() {
+  if (insightsRefreshInFlight || !insightsEnabled || currentPhase !== "ready") return;
+  insightsRefreshInFlight = true;
+  try {
+    if (currentView === "insights") await refreshInsightsView();
+    else await refreshNetworkPulse();
+  } finally {
+    insightsRefreshInFlight = false;
+  }
+}
+
 function startInsightsPulse() {
   stopInsightsPulse();
   if (!insightsEnabled || currentPhase !== "ready") return;
-  void refreshNetworkPulse();
+  void refreshInsightsAsync();
   insightsPulseTimer = window.setInterval(() => {
-    void refreshNetworkPulse();
+    void refreshInsightsAsync();
   }, INSIGHTS_PULSE_MS);
 }
 
@@ -1590,9 +1608,11 @@ function setPhase(next: Phase) {
   if (next === "ready") {
     startAutoSync();
     startInsightsPulse();
+    startStatusStripClock();
   } else {
     stopAutoSync();
     stopInsightsPulse();
+    stopStatusStripClock();
   }
   if (next !== "mnemonic") showMnemonicStep("show");
   updateBackupBanner();
@@ -2157,55 +2177,138 @@ function formatMwebStripStatus(
   tip: number | null,
 ): string {
   const lower = mwebStatus.toLowerCase();
-  if (!mwebStatus && mwebHeight == null) return "MWEB · idle";
+  if (!mwebStatus && mwebHeight == null) return "MWEB idle";
   if (lower.includes("unavailable") || lower.includes("error") || lower.includes("failed")) {
     // Keep the first clause only (drop trailing leafset chatter).
     const short = mwebStatus.split(" · ")[0]?.trim() || mwebStatus;
     return `MWEB · ${short}`;
   }
-  if (mwebHeight == null) return "MWEB · not synced";
+  if (mwebHeight == null) return "MWEB not synced";
+  if (mwebStale) return "MWEB stale";
+  if (tip != null && mwebHeight === tip) return "MWEB synced";
+  return `MWEB at ${mwebHeight.toLocaleString("en-US")}`;
+}
 
-  const peerMatch = mwebStatus.match(/leafset confirmed by (\d+) peers?/i);
-  const peersPart = peerMatch ? ` · ${peerMatch[1]} peers` : "";
-  const stalePart = mwebStale ? " · stale" : "";
-  // When MWEB matches the transparent tip, don't repeat the height.
-  if (tip != null && mwebHeight === tip && !mwebStale) {
-    return `MWEB · synced${peersPart}`;
+function formatLastBlockAge(unixSeconds: number, nowMs = Date.now()): string {
+  const deltaSec = Math.max(0, Math.floor(nowMs / 1000) - unixSeconds);
+  if (deltaSec < 60) return "last block was just now";
+  const minutes = Math.floor(deltaSec / 60);
+  if (minutes < 60) {
+    return minutes === 1
+      ? "last block was 1 minute ago"
+      : `last block was ${minutes} minutes ago`;
   }
-  return `MWEB · synced ${mwebHeight.toLocaleString("en-US")}${stalePart}${peersPart}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return hours === 1 ? "last block was 1 hour ago" : `last block was ${hours} hours ago`;
+  }
+  const days = Math.floor(hours / 24);
+  return days === 1 ? "last block was 1 day ago" : `last block was ${days} days ago`;
+}
+
+type StatusStripModel = {
+  tip: number | null;
+  error: string | null;
+  showMweb: boolean;
+  mwebStatus: string;
+  mwebHeight: number | null;
+  mwebStale: boolean;
+};
+
+let statusStripModel: StatusStripModel = {
+  tip: null,
+  error: null,
+  showMweb: false,
+  mwebStatus: "",
+  mwebHeight: null,
+  mwebStale: false,
+};
+/** Header time is only shown when it belongs to the displayed tip height. */
+let knownTipTime: { height: number; time: number } | null = null;
+let statusStripTimer: number | null = null;
+
+function setControlText(node: HTMLElement, text: string) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+function paintStatusStrip() {
+  const { tip, error, showMweb, mwebStatus, mwebHeight, mwebStale } = statusStripModel;
+  const block = el.statusBlock;
+  if (error) {
+    setControlText(block, `Electrum error — ${error}`);
+    block.disabled = true;
+    block.removeAttribute("aria-label");
+    block.title = error;
+  } else if (tip == null) {
+    setControlText(block, "Not synced");
+    block.disabled = true;
+    block.removeAttribute("aria-label");
+    block.title = "";
+  } else {
+    const heightLabel = tip.toLocaleString("en-US");
+    const age =
+      knownTipTime != null && knownTipTime.height === tip
+        ? formatLastBlockAge(knownTipTime.time)
+        : null;
+    setControlText(block, age ? `Block ${heightLabel} · ${age}` : `Block ${heightLabel}`);
+    block.disabled = false;
+    const label = `Open block ${heightLabel} in the explorer`;
+    if (block.getAttribute("aria-label") !== label) block.setAttribute("aria-label", label);
+    block.title = "";
+  }
+
+  el.statusSep.hidden = !showMweb;
+  el.statusMweb.hidden = !showMweb;
+  if (showMweb) {
+    setControlText(
+      el.statusMweb,
+      formatMwebStripStatus(mwebStatus, mwebHeight, mwebStale, tip),
+    );
+  }
 }
 
 function updateStatusStrip(opts?: {
   tip?: number | null;
-  electrumUrl?: string | null;
+  tipTime?: number | null;
   mwebStatus?: string | null;
   mwebHeight?: number | null;
   mwebStale?: boolean;
   error?: string | null;
 }) {
   const tip = opts?.tip ?? lastSummary?.tip_height ?? null;
-  const url = opts?.electrumUrl ?? lastElectrumUrl;
-  const tipPart = tip != null ? `tip ${tip.toLocaleString("en-US")}` : "not synced";
-  const host = electrumHostLabel(url);
-  if (opts?.error) {
-    el.statusElectrum.textContent = `Electrum · error — ${opts.error}`;
-  } else {
-    el.statusElectrum.textContent = `Electrum · ${tipPart} · ${host}`;
+  if (opts?.tipTime != null && tip != null) {
+    knownTipTime = { height: tip, time: opts.tipTime };
   }
   const mwebStatus = opts?.mwebStatus ?? lastCombined?.mweb_status ?? "";
   const mwebHeight = opts?.mwebHeight ?? lastCombined?.mweb_synced_height ?? null;
   const mwebStale = opts?.mwebStale ?? lastCombined?.mweb_stale ?? false;
-  const showMweb = Boolean(lastCombined) || Boolean(mwebStatus);
-  el.statusMweb.hidden = !showMweb;
-  if (showMweb) {
-    el.statusMweb.textContent = formatMwebStripStatus(
-      mwebStatus,
-      mwebHeight,
-      mwebStale,
-      tip,
-    );
+  statusStripModel = {
+    tip,
+    error: opts?.error ?? null,
+    showMweb: Boolean(lastCombined) || Boolean(mwebStatus),
+    mwebStatus,
+    mwebHeight,
+    mwebStale,
+  };
+  paintStatusStrip();
+}
+
+function startStatusStripClock() {
+  if (statusStripTimer != null) return;
+  statusStripTimer = window.setInterval(() => paintStatusStrip(), 15_000);
+}
+
+function stopStatusStripClock() {
+  if (statusStripTimer != null) {
+    clearInterval(statusStripTimer);
+    statusStripTimer = null;
   }
 }
+
+el.statusBlock.addEventListener("click", () => {
+  if (el.statusBlock.disabled || statusStripModel.tip == null || statusStripModel.error) return;
+  openLitviewPath(`/block/${statusStripModel.tip}`);
+});
 
 async function showBroadcastFailure(raw: unknown): Promise<void> {
   const message = String(raw);
@@ -3284,7 +3387,7 @@ function renderSummary(s: WalletSummary) {
   updateBackupBanner();
   updateEmptyFundingState();
   updateSecurityChecklist();
-  updateStatusStrip({ tip: s.tip_height });
+  updateStatusStrip({ tip: s.tip_height, tipTime: s.tip_time ?? null });
 }
 
 function renderCombined(c: CombinedSummary) {
@@ -3345,6 +3448,7 @@ function renderCombined(c: CombinedSummary) {
   updateMaturityBanner(c.mweb_immature_sats);
   updateStatusStrip({
     tip: c.transparent.tip_height,
+    tipTime: c.transparent.tip_time ?? null,
     mwebStatus: c.mweb_status,
     mwebHeight: c.mweb_synced_height,
     mwebStale: c.mweb_stale,
@@ -3931,11 +4035,9 @@ async function loadSettings() {
     el.settingsRpc.value = s.litecoin_rpc_url ?? "";
     el.settingsPeers.value = s.mweb_peers.join(", ");
     el.settingsMwebScheme.value = s.mweb_scheme ?? "litecoin-core";
-    if (s.electrum_active_url) lastElectrumUrl = s.electrum_active_url;
-    else lastElectrumUrl = s.electrum_url;
     updateStatusStrip({
       tip: lastSummary?.tip_height,
-      electrumUrl: lastElectrumUrl,
+      tipTime: lastSummary?.tip_time ?? null,
       mwebStatus: lastCombined?.mweb_status,
       mwebHeight: lastCombined?.mweb_synced_height,
       mwebStale: lastCombined?.mweb_stale,
@@ -4022,14 +4124,21 @@ function startAutoSync() {
   autoSyncTimer = window.setInterval(() => {
     if (currentPhase !== "ready" || syncing || sending) return;
     void runSync({ quiet: true });
-    void refreshSpotPrice();
   }, AUTO_SYNC_MS);
+  spotPriceTimer = window.setInterval(() => {
+    if (currentPhase !== "ready") return;
+    void refreshSpotPrice();
+  }, SPOT_PRICE_MS);
 }
 
 function stopAutoSync() {
   if (autoSyncTimer != null) {
     clearInterval(autoSyncTimer);
     autoSyncTimer = null;
+  }
+  if (spotPriceTimer != null) {
+    clearInterval(spotPriceTimer);
+    spotPriceTimer = null;
   }
 }
 
@@ -4191,8 +4300,7 @@ el.btnTestElectrum.addEventListener("click", async () => {
     el.electrumTestResult.textContent = `OK · tip ${probe.tip_height.toLocaleString(
       "en-US",
     )} · ${probe.latency_ms} ms · ${electrumHostLabel(probe.url)}`;
-    lastElectrumUrl = probe.url;
-    updateStatusStrip({ tip: probe.tip_height, electrumUrl: probe.url });
+    updateStatusStrip({ tip: probe.tip_height });
   } catch (e) {
     el.electrumTestResult.textContent = String(e);
   }
@@ -4396,13 +4504,12 @@ async function runSync(opts: { quiet: boolean }): Promise<boolean> {
     const receivedSignal = result.new_txs > 0 || pendingRose;
     lastPendingSats = pendingNow;
     if (result.electrum_server) {
-      lastElectrumUrl = result.electrum_server;
       el.settingsActiveServer.hidden = false;
       el.settingsActiveServer.textContent = `Last sync used: ${result.electrum_server}`;
     }
     updateStatusStrip({
       tip: result.summary.tip_height,
-      electrumUrl: result.electrum_server ?? lastElectrumUrl,
+      tipTime: result.summary.tip_time ?? null,
       mwebStatus: lastCombined?.mweb_status,
       mwebHeight: lastCombined?.mweb_synced_height,
       mwebStale: lastCombined?.mweb_stale,
@@ -7451,8 +7558,7 @@ el.btnTestElectrum.addEventListener("click", async () => {
     el.electrumTestResult.textContent = `OK · tip ${probe.tip_height.toLocaleString(
       "en-US",
     )} · ${probe.latency_ms} ms · ${electrumHostLabel(probe.url)}`;
-    lastElectrumUrl = probe.url;
-    updateStatusStrip({ tip: probe.tip_height, electrumUrl: probe.url });
+    updateStatusStrip({ tip: probe.tip_height });
   } catch (e) {
     el.electrumTestResult.textContent = String(e);
   }

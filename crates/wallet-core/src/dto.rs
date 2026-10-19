@@ -69,6 +69,10 @@ pub struct WalletSummary {
     pub immature_sats: u64,
     pub total_sats: u64,
     pub tip_height: u32,
+    /// Unix seconds of the tip block header, when this session has read it
+    /// for [`Self::tip_height`]. Absent until the first successful header read.
+    #[serde(default)]
+    pub tip_time: Option<u64>,
     pub receive_address: String,
 }
 

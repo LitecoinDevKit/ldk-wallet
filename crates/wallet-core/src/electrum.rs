@@ -143,6 +143,15 @@ fn handshake(client: &ElectrumClient) -> Result<(), bdk_electrum::electrum_clien
     }
 }
 
+/// Unix time of the block header at `height` on this server.
+pub fn header_time(client: &ElectrumClient, height: u32) -> Result<u64, WalletError> {
+    let header = client
+        .inner
+        .block_header(height as usize)
+        .map_err(|e| WalletError::Electrum(e.to_string()))?;
+    Ok(u64::from(header.time))
+}
+
 /// Connect, handshake, and read tip height — used by Settings “Test connection”.
 pub fn probe_tip(url: &str, validate_domain: bool) -> Result<(u32, u64), WalletError> {
     let started = std::time::Instant::now();

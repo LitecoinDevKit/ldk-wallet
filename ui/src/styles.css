@@ -2113,6 +2113,12 @@ textarea {
   opacity: 0.72;
 }
 
+.utxo-row.is-just-spent {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  outline: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
 .utxo-main {
   min-width: 0;
   flex: 1;
@@ -2135,6 +2141,11 @@ textarea {
   padding: 0.75rem 0.85rem;
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
   border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.churn-status[data-tone="settled"] {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
 }
 

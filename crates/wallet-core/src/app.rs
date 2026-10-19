@@ -3244,6 +3244,7 @@ fn broadcast_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result
             mweb_frozen::set_locked(&data_dir, &spent_id, false)?;
             mweb_frozen::set_locked(&data_dir, &spent.output_id, true)?;
             churn::inherit_depth(&data_dir, &spent_id, &spent.output_id, from_pegin)?;
+            let _ = utxo_labels::move_label(&data_dir, &spent_id, &spent.output_id);
             churn::note_broadcast(job, &spent.wtxid, &spent.output_id, broadcast_height)?;
             churn::write_job(&data_dir, job)?;
             Ok(())
@@ -3305,6 +3306,7 @@ fn drive_churn(
                 });
                 if let Some(restored) = restored {
                     let _ = churn::inherit_depth(&state.data_dir, &phantom, &restored, from_pegin);
+                    let _ = utxo_labels::move_label(&state.data_dir, &phantom, &restored);
                     let _ = mweb_frozen::set_locked(&state.data_dir, &phantom, false);
                     let _ = mweb_frozen::set_locked(&state.data_dir, &restored, true);
                     churn::note_not_included(&mut job, &restored)?;

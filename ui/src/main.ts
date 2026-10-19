@@ -5167,6 +5167,11 @@ let churnSuppressFinish = false;
 /** Coin the user just confirmed, until start_churn settles and the real job is visible. */
 let churnStartingId: string | null = null;
 let churnStartingTarget = 1;
+/** Output id of the active self-spend on the last successful coin list. */
+let churnWatchId: string | null = null;
+/** Output id to keep marked after that job leaves the active phases. */
+let churnSettledId: string | null = null;
+let churnSettledNeedsScroll = false;
 
 function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
   return (
@@ -5350,10 +5355,80 @@ function updateChurnBanner() {
   el.navCoinsDot.hidden = !(showJob && !!job && churnNeedsAttention(job));
 }
 
+function settledChurnCoin(): MwebUtxoRecord | undefined {
+  if (!churnSettledId) return undefined;
+  return mwebUtxoCache.find((coin) => coin.output_id === churnSettledId);
+}
+
+function dismissSettledChurn() {
+  churnSettledId = null;
+  churnSettledNeedsScroll = false;
+  renderMwebCoinsList();
+}
+
+function renderSettledChurnStatus(coin: MwebUtxoRecord) {
+  const card = el.churnStatus;
+  card.hidden = false;
+  card.dataset.tone = "settled";
+  card.setAttribute("aria-busy", "false");
+  card.textContent = "";
+
+  const head = document.createElement("div");
+  head.className = "churn-status-head";
+  const title = document.createElement("div");
+  title.className = "churn-status-title";
+  const kicker = document.createElement("span");
+  kicker.className = "churn-kicker";
+  kicker.textContent = "Self-spend";
+  title.append(kicker);
+  const amt = document.createElement("span");
+  amt.textContent = formatAmountPlain(coin.amount_sats);
+  head.append(title, amt);
+
+  const sentence = churnCompanySentence(coin);
+  const main = document.createElement("p");
+  main.className = "churn-status-main";
+  main.textContent = sentence ?? "Highlighted in the list.";
+  card.append(head, main);
+  if (sentence) {
+    const sub = document.createElement("p");
+    sub.className = "churn-status-sub";
+    sub.textContent = "Highlighted in the list.";
+    card.append(sub);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "churn-status-actions";
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "btn btn-ghost btn-sm";
+  dismiss.textContent = "Dismiss";
+  dismiss.addEventListener("click", () => dismissSettledChurn());
+  actions.append(dismiss);
+  card.append(actions);
+}
+
+/** Scroll the finished coin into view once, and only while Coins → Private is showing. */
+function maybeScrollSettledCoin() {
+  if (!churnSettledNeedsScroll || !churnSettledId) return;
+  if (currentView !== "coins" || coinsMode !== "private") return;
+  const row = el.coinsMwebList.querySelector<HTMLElement>(
+    `[data-output-id="${CSS.escape(churnSettledId)}"]`,
+  );
+  if (!row) return;
+  row.scrollIntoView({ block: "nearest" });
+  churnSettledNeedsScroll = false;
+}
+
 function renderChurnStatus() {
   const card = el.churnStatus;
   const coin = activeChurnCoin();
   if (!coin) {
+    const settled = settledChurnCoin();
+    if (settled) {
+      renderSettledChurnStatus(settled);
+      return;
+    }
     card.hidden = true;
     card.textContent = "";
     delete card.dataset.tone;
@@ -5447,9 +5522,13 @@ function renderMwebCoinsList() {
   for (const coin of mwebUtxoCache) {
     if (!coin.mature) immature += 1;
     const jobHolds = churnPhaseActive(coin.churn_phase);
+    const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const li = document.createElement("li");
-    li.className =
-      !coin.mature || (coin.locked && !jobHolds) ? "utxo-row is-locked" : "utxo-row";
+    li.dataset.outputId = coin.output_id;
+    const rowClass = ["utxo-row"];
+    if (!coin.mature || (coin.locked && !jobHolds)) rowClass.push("is-locked");
+    if (justSpent) rowClass.push("is-just-spent");
+    li.className = rowClass.join(" ");
     const main = document.createElement("div");
     main.className = "utxo-main";
     const amtRow = document.createElement("div");
@@ -5462,6 +5541,11 @@ function renderMwebCoinsList() {
       const pill = document.createElement("span");
       pill.className = churnPillClass(pillInfo.kind);
       pill.textContent = pillInfo.label;
+      amtRow.append(pill);
+    } else if (justSpent) {
+      const pill = document.createElement("span");
+      pill.className = "pill churn-pill-accent";
+      pill.textContent = "Just spent";
       amtRow.append(pill);
     }
     const meta = document.createElement("span");
@@ -5571,6 +5655,7 @@ function renderMwebCoinsList() {
     el.coinsMwebSum.textContent = bits.join(" · ");
   }
   updateChurnBanner();
+  maybeScrollSettledCoin();
 }
 
 async function retryChurn() {
@@ -5703,6 +5788,8 @@ async function openChurnModal(coin: MwebUtxoRecord) {
   if (choice !== "start" || !previewOk) return;
   churnStartingId = coin.output_id;
   churnStartingTarget = targetDepth;
+  churnSettledId = null;
+  churnSettledNeedsScroll = false;
   stampChurnStarting();
   renderMwebCoinsList();
   let startError: unknown = null;
@@ -5856,9 +5943,30 @@ function renderMwebControlList(panel: CoinControlPanel) {
 function noteChurnFinished() {
   // The stamp is not a real job. Recording it would toast "finished" if the start fails.
   if (churnStartingId) return;
-  const active = !!activeChurnCoin();
+  const activeCoin = activeChurnCoin();
+  const active = !!activeCoin;
+  if (active && activeCoin) {
+    churnWatchId = activeCoin.output_id;
+    churnSettledId = null;
+    churnSettledNeedsScroll = false;
+  } else if (
+    churnSettledId &&
+    !mwebUtxoCache.some((coin) => coin.output_id === churnSettledId)
+  ) {
+    churnSettledId = null;
+    churnSettledNeedsScroll = false;
+  }
   if (churnSawActive && !active && !churnSuppressFinish) {
-    setStatus("Self-spend finished.", "info");
+    const settled = churnWatchId
+      ? mwebUtxoCache.find((coin) => coin.output_id === churnWatchId)
+      : undefined;
+    if (settled) {
+      churnSettledId = settled.output_id;
+      churnSettledNeedsScroll = true;
+      setStatus(`Self-spend finished. ${formatAmount(settled.amount_sats)}.`, "info");
+    } else {
+      setStatus("Self-spend finished.", "info");
+    }
   }
   if (!active) churnActionError = null;
   churnSawActive = active;
@@ -5878,6 +5986,7 @@ async function refreshUtxos() {
     mwebUtxoCache = [];
   }
   stampChurnStarting();
+  if (mwebListOk) noteChurnFinished();
   pruneSelectedOutpoints(sendSelectedOutpoints);
   pruneSelectedOutpoints(peginSelectedOutpoints);
   pruneSelectedMwebIds(mwebSendSelectedIds);
@@ -5888,7 +5997,6 @@ async function refreshUtxos() {
   renderMwebControlList(pegoutCoinPanel);
   renderCoinsList();
   renderMwebCoinsList();
-  if (mwebListOk) noteChurnFinished();
   reapplyPressedAmountPresets();
 }
 

@@ -1,0 +1,39 @@
+# The Release workflow uploads a draft. Publishing that draft is what puts it
+# on the public Release list. This workflow then deletes every other published
+# release so the list shows only the one just published.
+#
+# Git tags stay: `gh release delete` is called without `--cleanup-tag`.
+# Drafts stay too, so a build that is still uploading is not removed.
+name: Prune old releases
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep only the release that was just published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEEP}" ]]; then
+            echo "Published release has no tag; refusing to delete anything."
+            exit 1
+          fi
+          mapfile -t tags < <(gh release list --repo "$REPO" --exclude-drafts --limit 200 --json tagName --jq '.[].tagName')
+          for tag in "${tags[@]}"; do
+            if [[ "$tag" == "$KEEP" ]]; then
+              continue
+            fi
+            echo "Deleting release ${tag}"
+            gh release delete "$tag" --repo "$REPO" --yes
+          done
+          echo "Release list kept: ${KEEP}"

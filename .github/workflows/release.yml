@@ -2,6 +2,10 @@
 # to a draft GitHub Release. Trigger via Actions → "Release" → Run workflow,
 # or by pushing to the `release` branch.
 #
+# Publishing that draft runs prune-releases.yml, which deletes every other
+# published release and leaves the git tags in place. The public Release list
+# then shows only the release that was just published.
+#
 # All fork dependencies (LitecoinDevKit/bdk, bdk_wallet, rust-litecoin) are
 # rev-pinned git deps in the manifests with a committed Cargo.lock, so the
 # build is reproducible from this checkout alone. All third-party actions are

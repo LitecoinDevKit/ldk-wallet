@@ -113,6 +113,104 @@ async function main() {
     await page.locator("#coins-seg-private").click();
     await page.getByText("This block also had 4 other kernels and 7 other outputs.").waitFor();
     await page.locator(".content").screenshot({ path: path.join(outDir, "self-spend.png") });
+
+    await prepare(page, "balance");
+    // Opening Send from another view folds the balance hero. A click while
+    // Balance is already showing leaves that hero at full height.
+    await page.locator("#nav-insights").click();
+    await page.locator(".chart-card").first().waitFor();
+    await page.locator("#nav-send").click();
+    await page.locator("#send-balance-public", { hasNotText: "—" }).waitFor();
+    await page.locator("#fee-chip-row .fee-chip").first().waitFor();
+    await page.waitForFunction(() => {
+      const hero = document.querySelector(".hero");
+      return hero != null && parseFloat(getComputedStyle(hero).maxHeight) < 100;
+    });
+    if (await page.locator("#coin-control").evaluate((el) => el.hasAttribute("open"))) {
+      throw new Error("#coin-control is open on the send shot");
+    }
+    await page.locator("#sheet-body").evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    // The card fades in. A shot during that fade leaves the form nearly black.
+    await page.locator("#card-send").evaluate(async (el) => {
+      for (const animation of el.getAnimations({ subtree: true })) animation.finish();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await page.locator(".content").screenshot({ path: path.join(outDir, "send.png"), animations: "disabled" });
+
+    await page.locator("#nav-swap").waitFor({ state: "visible" });
+    await page.locator("#nav-swap").click();
+    await page.getByRole("button", { name: "Move to private" }).waitFor();
+    await page.locator("#swap-balance-public", { hasNotText: "—" }).waitFor();
+    await page.waitForFunction(() => {
+      const hero = document.querySelector(".hero");
+      return hero != null && parseFloat(getComputedStyle(hero).maxHeight) < 100;
+    });
+    if (await page.locator("#pegin-coin-control").evaluate((el) => el.hasAttribute("open"))) {
+      throw new Error("#pegin-coin-control is open on the swap shot");
+    }
+    await page.locator("#sheet-body").evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await page.locator("#card-swap").evaluate(async (el) => {
+      for (const animation of el.getAnimations({ subtree: true })) animation.finish();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await page.locator(".content").screenshot({ path: path.join(outDir, "swap.png"), animations: "disabled" });
+
+    await page.locator("#nav-receive").click();
+    await page.locator("#address", { hasText: "ltc1qsampledata" }).waitFor();
+    await page.locator("#receive-balance-public", { hasNotText: "—" }).waitFor();
+    await page.locator("#receive-private").waitFor({ state: "hidden" });
+    await page.waitForFunction(() => {
+      const canvas = document.querySelector("#receive-qr");
+      if (!(canvas instanceof HTMLCanvasElement)) return false;
+      const ctx = canvas.getContext("2d");
+      if (!ctx || canvas.width < 10) return false;
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return data.some((value, index) => index % 4 !== 3 && value < 250);
+    });
+    await page.waitForFunction(() => {
+      const hero = document.querySelector(".hero");
+      return hero != null && parseFloat(getComputedStyle(hero).maxHeight) < 100;
+    });
+    await page.locator("#sheet-body").evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await page.locator("#card-receive").evaluate(async (el) => {
+      for (const animation of el.getAnimations({ subtree: true })) animation.finish();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await page.locator(".content").screenshot({ path: path.join(outDir, "receive.png"), animations: "disabled" });
+
+    await prepare(page, "balance");
+    await page.locator("#nav-settings").click();
+    await page.waitForFunction(() => {
+      const input = document.querySelector("#settings-electrum");
+      return input instanceof HTMLInputElement && input.value.includes("electrum.example.com");
+    });
+    await page.getByText("Last sync used: electrum.example.com:50002").waitFor();
+    await page.locator("#electrum-preset-buttons .btn").waitFor();
+    const connection = page
+      .locator("#view-settings .card")
+      .filter({ has: page.getByRole("heading", { name: "Connection" }) });
+    const connectionHeight = await connection.evaluate((el) => Math.ceil(el.offsetHeight));
+    await page.setViewportSize({ width: 1000, height: connectionHeight + 48 });
+    await connection.screenshot({
+      path: path.join(outDir, "connection.png"),
+      animations: "disabled",
+    });
+
+    await page.goto(`${base}/?shots=1&scene=recovery`);
+    await page.locator("#onboarding").waitFor({ state: "visible" });
+    await page.locator("#ready").waitFor({ state: "hidden" });
+    const restore = page.locator("#onboarding .card").filter({ hasText: "Restore from backup" });
+    await restore.getByRole("combobox").waitFor();
+    await restore.screenshot({
+      path: path.join(outDir, "recovery.png"),
+      animations: "disabled",
+    });
   } finally {
     await browser.close();
     vite.child.kill("SIGTERM");

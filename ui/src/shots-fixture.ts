@@ -6,9 +6,10 @@
  * - balance (default): two balances, a quiet sheet, status strip with an age
  * - coins: Private list with frozen, labeled, and maturing rows
  * - self-spend: that list, plus one row after a scored hop
+ * - recovery: no wallet yet, so boot stays on create / restore
  */
 
-type Scene = "balance" | "coins" | "self-spend";
+type Scene = "balance" | "coins" | "self-spend" | "recovery";
 
 const TIP = 3_104_218;
 const S = {
@@ -30,7 +31,7 @@ const PRIVATE_ADDRESS =
 
 function scene(): Scene {
   const raw = new URLSearchParams(window.location.search).get("scene");
-  if (raw === "coins" || raw === "self-spend") return raw;
+  if (raw === "coins" || raw === "self-spend" || raw === "recovery") return raw;
   return "balance";
 }
 
@@ -315,7 +316,7 @@ function litvmHistory() {
 }
 
 const COMMANDS: Record<string, () => unknown> = {
-  wallet_exists: () => true,
+  wallet_exists: () => scene() !== "recovery",
   wallet_needs_migration: () => false,
   wallet_is_locked: () => false,
   load_wallet: () => combined().transparent,

@@ -26,12 +26,12 @@ impl From<CliNetwork> for WalletNetwork {
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum CliMwebScheme {
-    /// Litecoin Core: m/0'/100'/{0,1}'
+    /// Litecoin Core and current LIP-0004: m/0'/100'/{0,1}'
     #[default]
     LitecoinCore,
-    /// LIP-0004: m/1/0/{100',101'}
+    /// LIP-0004, updated to the implemented Core path: m/0'/100'/{0,1}'
     Lip0004,
-    /// mwebd / Nexus: m/1000'/2'/0'/{0,1}'
+    /// Legacy mwebd / Nexus before 2026-06-01: m/1000'/2'/0'/{0,1}'
     Mwebd,
 }
 
@@ -80,7 +80,9 @@ enum Command {
         network: CliNetwork,
         #[arg(long)]
         electrum: Option<String>,
-        /// MWEB key-derivation scheme (use mwebd for Nexus seeds).
+        /// MWEB key-derivation scheme. The default is Litecoin Core's path
+        /// (LIP-0004 follows it). mwebd is only for Nexus seeds created
+        /// before 2026-06-01.
         #[arg(long, value_enum, default_value_t = CliMwebScheme::LitecoinCore)]
         mweb_scheme: CliMwebScheme,
         /// aezeed cipher-seed passphrase, if one was set.

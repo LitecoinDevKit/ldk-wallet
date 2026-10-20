@@ -37,23 +37,28 @@ pub struct RestoreWalletRequest {
 }
 
 /// Which BIP32 layout derives the MWEB scan/spend keys.
+///
+/// Litecoin Core implements scan `m/0'/100'/0'` and spend `m/0'/100'/1'`.
+/// The LIP-0004 draft was written before that implementation and still says
+/// `m/1/0/{100',101'}`; [`Self::Lip0004`] follows the implemented path, same
+/// as [`Self::LitecoinCore`]. [`Self::Mwebd`] is the pre-migration path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MwebScheme {
-    /// Litecoin Core 0.21: `m/0'/100'/{0,1}'`.
+    /// Litecoin Core and current LIP-0004: `m/0'/100'/{0,1}'`.
     #[default]
     LitecoinCore,
-    /// LIP-0004 text: `m/1/0/{100',101'}`.
+    /// LIP-0004 updated to the implemented Core path: `m/0'/100'/{0,1}'`.
     Lip0004,
-    /// mwebd / Nexus (BIP43 purpose 1000): `m/1000'/2'/0'/{0,1}'`.
+    /// Legacy mwebd, and Nexus before 2026-06-01: `m/1000'/2'/0'/{0,1}'`.
     Mwebd,
 }
 
 impl MwebScheme {
     pub(crate) fn to_master_scheme(self) -> bdk_mweb::keys::MasterKeyScheme {
         match self {
-            Self::LitecoinCore => bdk_mweb::keys::MasterKeyScheme::LitecoinCore,
-            Self::Lip0004 => bdk_mweb::keys::MasterKeyScheme::Lip0004,
+            // LIP-0004's written path predates Core's LoadMWEBKeychain.
+            Self::LitecoinCore | Self::Lip0004 => bdk_mweb::keys::MasterKeyScheme::LitecoinCore,
             Self::Mwebd => bdk_mweb::keys::MasterKeyScheme::Mwebd,
         }
     }

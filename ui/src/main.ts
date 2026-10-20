@@ -4040,7 +4040,9 @@ async function loadSettings() {
     }
     el.settingsRpc.value = s.litecoin_rpc_url ?? "";
     el.settingsPeers.value = s.mweb_peers.join(", ");
-    el.settingsMwebScheme.value = s.mweb_scheme ?? "litecoin-core";
+    // lip0004 now stores the same keys as litecoin-core.
+    const scheme = s.mweb_scheme === "lip0004" ? "litecoin-core" : s.mweb_scheme;
+    el.settingsMwebScheme.value = scheme ?? "litecoin-core";
     updateStatusStrip({
       tip: lastSummary?.tip_height,
       tipTime: lastSummary?.tip_time ?? null,

@@ -217,8 +217,8 @@ pub struct MwebSchemePreview {
     pub scheme: String,
     pub scan_path: String,
     pub spend_path: String,
-    /// Addresses at indices 0..count. Note: mwebd/Nexus treat index 0 as the
-    /// change address and hand out indices 1+ for receiving.
+    /// Addresses at indices 0..count. Legacy mwebd treats index 0 as the
+    /// change address and hands out indices 1+ for receiving.
     pub addresses: Vec<String>,
 }
 
@@ -249,9 +249,10 @@ pub fn derive_preview(
             .collect()
     };
 
+    // LIP-0004 follows the implemented Core path. Both names preview those keys.
     let schemes = [
         ("litecoin-core", MasterKeyScheme::LitecoinCore),
-        ("lip-0004", MasterKeyScheme::Lip0004),
+        ("lip-0004", MasterKeyScheme::LitecoinCore),
         ("mwebd", MasterKeyScheme::Mwebd),
     ];
     let mut mweb = Vec::with_capacity(schemes.len());

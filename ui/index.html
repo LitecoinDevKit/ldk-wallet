@@ -144,13 +144,16 @@
             <label class="field">
               <span class="field-label">MWEB derivation</span>
               <select id="restore-mweb-scheme">
-                <option value="litecoin-core" selected>Litecoin Core (default)</option>
-                <option value="mwebd">Nexus / mwebd</option>
-                <option value="lip0004">LIP-0004</option>
+                <option value="litecoin-core" selected>Litecoin Core / LIP-0004 (default)</option>
+                <option value="mwebd">mwebd (before 1 June 2026)</option>
               </select>
               <span class="hint">
-                Where the wallet looks for MWEB coins. Pick “Nexus / mwebd” when restoring a
-                Nexus seed; transparent addresses are unaffected.
+                Litecoin Core, LIP-0004, and Nexus since 1 June 2026 use
+                <code>m/0'/100'/{0,1}'</code>. The LIP-0004 draft text
+                (<code>m/1/0/{100',101'}</code>) was written before that
+                implementation. Choose “mwebd (before 1 June 2026)” only for an
+                older Nexus seed or an app that still derives
+                <code>m/1000'/2'/0'</code>. Transparent addresses are unaffected.
               </span>
             </label>
             <label class="field">
@@ -1443,14 +1446,14 @@
               <label class="field">
                 <span class="field-label">MWEB derivation scheme</span>
                 <select id="settings-mweb-scheme">
-                  <option value="litecoin-core">Litecoin Core (default)</option>
-                  <option value="mwebd">Nexus / mwebd</option>
-                  <option value="lip0004">LIP-0004</option>
+                  <option value="litecoin-core">Litecoin Core / LIP-0004 (default)</option>
+                  <option value="mwebd">mwebd (before 1 June 2026)</option>
                 </select>
                 <span class="hint">
-                  Which BIP32 branch derives your MWEB keys. Changing it wipes local MWEB data
-                  and rescans under the new scheme — coins are re-discovered from the chain,
-                  and transparent funds are untouched.
+                  Litecoin Core and LIP-0004 share <code>m/0'/100'/{0,1}'</code>. Nexus
+                  since 1 June 2026 uses that path too. Older Nexus seeds and legacy mwebd
+                  apps use “mwebd (before 1 June 2026)”. Changing the scheme wipes local
+                  MWEB data and rescans. Transparent funds are untouched.
                 </span>
               </label>
               <div class="row">

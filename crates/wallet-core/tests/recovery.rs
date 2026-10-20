@@ -40,10 +40,9 @@ const CHILD_ZPRV: &str = "zprvAYwxAu3aPgFFtbyACXnREEYDwzAJCcwDYcyNKJuxc6YSSaYTyH
 
 /// Frozen derivation vectors for the standard test mnemonic on mainnet.
 ///
-/// The litecoin-core MWEB addresses are cross-validated against ltcd/Core in
-/// bdk_mweb's key tests; the mwebd addresses implement the derivation path
-/// documented in mwebd's README (`m/1000'/2'/0'/{0,1}'`) and freeze current
-/// behavior until byte-for-byte confirmation against a live Nexus wallet.
+/// Litecoin Core and LIP-0004 share the implemented path (`m/0'/100'/{0,1}'`).
+/// The LIP-0004 draft text (`m/1/0/{100',101'}`) predates that implementation.
+/// The mwebd addresses are the pre-migration path (`m/1000'/2'/0'/{0,1}'`).
 #[test]
 fn frozen_derivation_vectors_all_schemes() {
     let p = derive_preview(BIP39_TEST, None, WalletNetwork::Mainnet, 2).unwrap();
@@ -66,6 +65,7 @@ fn frozen_derivation_vectors_all_schemes() {
 
     let core = by_scheme("litecoin-core");
     assert_eq!(core.scan_path, "m/0'/100'/0'");
+    assert_eq!(core.spend_path, "m/0'/100'/1'");
     assert_eq!(
         core.addresses[0],
         "ltcmweb1qqv2g556ddyyqxvr25avn9vsepu75fnygr92pwxewl72ua26su57nsqu5r89cpckmja4m7mc3tm3jremaddk8637697afaswaee78z3ztyy8sevgm"
@@ -79,12 +79,12 @@ fn frozen_derivation_vectors_all_schemes() {
         "ltcmweb1qqw8xawh8m5qrkdaw3sx3mhycrraqt9djvrnhf7yxtfykuhl7nuanvqa6909hkvx8vgqlx82c59chdn0uuzlmt3pl6yk59dafqpqavdrnlgzu996x"
     );
 
-    // The three schemes must disagree — a regression where they collapse to
-    // one path would silently scan the wrong keyspace.
+    // Litecoin Core and LIP-0004 are one layout. mwebd stays on its own path.
     let lip = by_scheme("lip-0004");
+    assert_eq!(core.scan_path, lip.scan_path);
+    assert_eq!(core.spend_path, lip.spend_path);
+    assert_eq!(core.addresses, lip.addresses);
     assert_ne!(core.addresses[0], mwebd.addresses[0]);
-    assert_ne!(core.addresses[0], lip.addresses[0]);
-    assert_ne!(mwebd.addresses[0], lip.addresses[0]);
 }
 
 #[test]

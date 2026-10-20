@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./ipc";
 import QRCode from "qrcode";
 
 type WalletNetwork = "mainnet" | "testnet";

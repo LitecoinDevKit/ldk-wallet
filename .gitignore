@@ -9,6 +9,7 @@ ui/dist/
 .ui-dist/
 # Scratch harness for browser-only UI screenshots
 ui/.preview/
+ui/screenshots/
 
 # Tauri
 src-tauri/target

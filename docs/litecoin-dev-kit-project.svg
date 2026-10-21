@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200">
+  <rect width="1200" height="1200" fill="#10131A"/>
+  <!-- Tile is 46% of the square so a 16:9 cover crop still clears the L. -->
+  <g transform="translate(324 324) scale(17.25)">
+    <rect width="32" height="32" rx="7" fill="#10131A"/>
+    <rect x="0.5" y="0.5" width="31" height="31" rx="6.5" fill="none" stroke="#2A3140" stroke-width="1"/>
+    <path fill="#8EB0FF" d="M9 6h6v14h8v6H9V6z"/>
+  </g>
+</svg>

@@ -5,15 +5,15 @@ use std::sync::{mpsc, Arc};
 use tauri::{AppHandle, Manager, State};
 use wallet_core::{
     AddressReuseHint, CombinedSummary, ContactRecord, CreateWalletRequest, CreateWalletResponse,
-    DeleteContactRequest, ElectrumProbe, FeeEstimate, FeeLadder, HistoryExportFormat,
-    MetadataImportResult, MetricSeries, MigrateEncryptRequest, MwebBroadcastResult,
-    MwebSendPreview, MwebSendRequest, MwebSyncProgress, MwebUtxoRecord, NetworkPulse, PeginPreview,
-    PeginRequest, PeginResult, PegoutPreview, PegoutRequest, RestoreWalletRequest,
-    RevealMnemonicRequest, RevealMnemonicResponse, SendPreview, SendRequest, SendResult,
-    SetTxLabelRequest, SetUtxoLabelRequest, SetMwebUtxoLockedRequest, SetUtxoLockedRequest,
-    SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment, TxRecord, UnlockRequest,
-    UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletApp, WalletSettings,
-    WalletSummary, ChurnPreview, ChurnRequest, ChurnStatus,
+    DeleteContactRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder,
+    HistoryExportFormat, MetadataImportResult, MetricSeries, MigrateEncryptRequest,
+    MwebBroadcastResult, MwebSendPreview, MwebSendRequest, MwebSyncProgress, MwebUtxoRecord,
+    NetworkPulse, PeginPreview, PeginRequest, PeginResult, PegoutPreview, PegoutRequest,
+    RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse, SendPreview, SendRequest,
+    SendResult, SetTxLabelRequest, SetUtxoLabelRequest, SetMwebUtxoLockedRequest,
+    SetUtxoLockedRequest, SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment,
+    TxRecord, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletApp,
+    WalletSettings, WalletSummary, ChurnPreview, ChurnRequest, ChurnStatus,
 };
 
 mod litvm;
@@ -641,6 +641,49 @@ async fn mweb_sync_progress(
     Ok(state.mweb_sync_progress())
 }
 
+/// Redacted support bundle (no mnemonic / sealed secrets).
+#[tauri::command]
+async fn get_diagnostics(
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<DiagnosticsBundle, String> {
+    let wallet = Arc::clone(&state);
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    Ok(tauri::async_runtime::spawn_blocking(move || wallet.diagnostics(&version))
+        .await
+        .map_err(|e| e.to_string())?)
+}
+
+/// Export diagnostics to a user-chosen text file. Returns the path, or `None` if cancelled.
+#[tauri::command]
+async fn export_diagnostics(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<Option<String>, String> {
+    let wallet = Arc::clone(&state);
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let bundle = tauri::async_runtime::spawn_blocking(move || wallet.diagnostics(&version))
+        .await
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::to_string_pretty(&bundle).map_err(|e| e.to_string())?;
+
+    let (tx, rx) = mpsc::channel();
+    app.run_on_main_thread(move || {
+        let path = rfd::FileDialog::new()
+            .set_title("Export diagnostics")
+            .set_file_name("ldk-wallet-diagnostics.json")
+            .add_filter("JSON", &["json"])
+            .save_file();
+        let _ = tx.send(path);
+    })
+    .map_err(|e| e.to_string())?;
+
+    let Some(path) = rx.recv().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(Some(path.display().to_string()))
+}
+
 #[tauri::command]
 async fn get_settings(state: State<'_, Arc<WalletApp>>) -> Result<WalletSettings, String> {
     let wallet = Arc::clone(&state);
@@ -854,6 +897,8 @@ pub fn run() {
             resync_mweb,
             set_mweb_scheme,
             mweb_sync_progress,
+            get_diagnostics,
+            export_diagnostics,
             get_settings,
             update_settings,
             explorer_tx_url,

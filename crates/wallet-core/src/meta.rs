@@ -38,8 +38,10 @@ fn default_auto_lock_minutes() -> u32 {
     15
 }
 
+/// Empty by default: sync and broadcast discover public MWEB peers via DNS.
+/// Users running litecoind locally can still set `127.0.0.1:9333` in Settings.
 fn default_mweb_peers() -> Vec<String> {
-    vec!["127.0.0.1:9333".into()]
+    Vec::new()
 }
 
 fn default_explorer_base_url() -> String {
@@ -175,7 +177,32 @@ pub fn read_meta(data_dir: &Path) -> Result<WalletMeta, WalletError> {
             WalletError::Io(e)
         }
     })?;
-    serde_json::from_str(&bytes).map_err(|e| WalletError::Meta(e.to_string()))
+    let mut meta: WalletMeta =
+        serde_json::from_str(&bytes).map_err(|e| WalletError::Meta(e.to_string()))?;
+    // Older builds defaulted to localhost only. With no local litecoind that
+    // stalled first sync / broadcast before DNS discovery. Clear the bare
+    // default once so existing installs pick up auto-discovery; users who
+    // run a node can set 127.0.0.1:9333 again in Settings.
+    if migrate_localhost_only_peers(&mut meta) {
+        let _ = write_meta(data_dir, &meta);
+    }
+    Ok(meta)
+}
+
+fn migrate_localhost_only_peers(meta: &mut WalletMeta) -> bool {
+    if meta.mweb_peers.len() != 1 {
+        return false;
+    }
+    let peer = meta.mweb_peers[0].trim();
+    let is_loopback_default = matches!(
+        peer,
+        "127.0.0.1:9333" | "localhost:9333" | "[::1]:9333"
+    );
+    if !is_loopback_default {
+        return false;
+    }
+    meta.mweb_peers.clear();
+    true
 }
 
 pub fn wallet_files_exist(data_dir: &Path) -> bool {
@@ -236,4 +263,35 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clears_bare_localhost_default_peer() {
+        let mut meta = WalletMeta::new(WalletNetwork::Mainnet, None);
+        meta.mweb_peers = vec!["127.0.0.1:9333".into()];
+        assert!(migrate_localhost_only_peers(&mut meta));
+        assert!(meta.mweb_peers.is_empty());
+    }
+
+    #[test]
+    fn keeps_custom_or_multi_peer_lists() {
+        let mut multi = WalletMeta::new(WalletNetwork::Mainnet, None);
+        multi.mweb_peers = vec!["127.0.0.1:9333".into(), "1.2.3.4:9333".into()];
+        assert!(!migrate_localhost_only_peers(&mut multi));
+        assert_eq!(multi.mweb_peers.len(), 2);
+
+        let mut custom = WalletMeta::new(WalletNetwork::Mainnet, None);
+        custom.mweb_peers = vec!["node.example:9333".into()];
+        assert!(!migrate_localhost_only_peers(&mut custom));
+    }
+
+    #[test]
+    fn new_wallets_default_to_empty_mweb_peers() {
+        let meta = WalletMeta::new(WalletNetwork::Mainnet, None);
+        assert!(meta.mweb_peers.is_empty());
+    }
 }

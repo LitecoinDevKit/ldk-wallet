@@ -7,6 +7,7 @@ mod app;
 mod churn;
 mod contacts;
 mod descriptors;
+mod diag;
 mod discovery;
 mod dto;
 mod electrum;
@@ -34,12 +35,12 @@ pub use dto::{
     CombinedSummary, ContactKind, ContactRecord, CreateWalletRequest, CreateWalletResponse,
     DeleteContactRequest, ElectrumProbe, FeeEstimate, FeeLadder, MetricSeries,
     MigrateEncryptRequest, MwebBroadcastResult, MwebScheme, MwebSendPreview, MwebSendRequest,
-    MwebSyncProgress, MwebUtxoRecord, NetworkPulse, PeginPreview, PeginRequest, PeginResult,
-    PegoutPreview, PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest,
+    DiagnosticsBundle, MwebSyncProgress, MwebUtxoRecord, NetworkPulse, PeginPreview, PeginRequest,
+    PeginResult, PegoutPreview, PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest,
     RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest,
     SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitOutput,
-    SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment, TxIo, TxKind, TxRecord,
-    TxStatus, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
+    SplitPreview, SplitRequest, SplitResult, SyncPhase, SyncResult, TxEnrichment, TxIo, TxKind,
+    TxRecord, TxStatus, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
     WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_MAX_TARGET, CHURN_QUIET_NOTE,
     DEFAULT_MWEB_FEE_SATS,
 };

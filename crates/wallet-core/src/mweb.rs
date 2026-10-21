@@ -355,7 +355,7 @@ impl MwebRuntime {
         network: WalletNetwork,
         progress: Option<Arc<SyncProgress>>,
     ) -> Result<(), WalletError> {
-        let configured = resolve_peers(peers)?;
+        let configured = resolve_reachable_peers(peers)?;
         let mut configured_failure = None;
         if !configured.is_empty() {
             match self.sync_pass(
@@ -1880,6 +1880,34 @@ fn resolve_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>, WalletEr
     Ok(out)
 }
 
+/// TCP connect probe before a full LIP handshake. Skips dead configured peers
+/// (especially the old default `127.0.0.1:9333`) so sync/broadcast fall through
+/// to DNS discovery instead of hanging on OS connect timeouts.
+const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn probe_reachable(addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    addrs
+        .into_iter()
+        .filter(|addr| {
+            match std::net::TcpStream::connect_timeout(addr, PEER_PROBE_TIMEOUT) {
+                Ok(stream) => {
+                    // Drop immediately — TcpMwebPeer will reconnect + handshake.
+                    drop(stream);
+                    true
+                }
+                Err(_) => {
+                    crate::diag::log(format!("mweb peer probe: {addr} unreachable, skipping"));
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
+fn resolve_reachable_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>, WalletError> {
+    Ok(probe_reachable(resolve_peers(peers)?))
+}
+
 pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
@@ -2004,7 +2032,7 @@ fn broadcast_mweb_tx(
     peers: &[String],
     network: WalletNetwork,
 ) -> Result<(), WalletError> {
-    let p2p_err = match broadcast_via_p2p(tx, resolve_peers(peers)?, network) {
+    let p2p_err = match broadcast_via_p2p(tx, resolve_reachable_peers(peers)?, network) {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
@@ -2014,7 +2042,9 @@ fn broadcast_mweb_tx(
     if !discovered.is_empty() {
         match broadcast_via_p2p(tx, discovered, network) {
             Ok(()) => return Ok(()),
-            Err(e) => eprintln!("MWEB broadcast: discovered peers also failed ({e})"),
+            Err(e) => crate::diag::log(format!(
+                "MWEB broadcast: discovered peers also failed ({e})"
+            )),
         }
     }
     let Some(url) = rpc_url else {
@@ -2025,7 +2055,7 @@ fn broadcast_mweb_tx(
     };
     match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
         Ok(_) => {
-            eprintln!("MWEB broadcast: fell back to litecoind RPC ({p2p_err})");
+            crate::diag::log(format!("MWEB broadcast: fell back to litecoind RPC ({p2p_err})"));
             Ok(())
         }
         Err(rpc_err) => Err(WalletError::Mweb(format!(
@@ -2034,7 +2064,10 @@ fn broadcast_mweb_tx(
     }
 }
 
-/// Offer the tx to each peer in turn until one takes it.
+/// Offer the tx to each peer in turn until one confirms acceptance.
+///
+/// [`BroadcastAck::Sent`] is optimistic (peer may not have relayed). Keep
+/// trying other peers for a Confirmed ack before accepting a bare Sent.
 fn broadcast_via_p2p(
     tx: &bdk_wallet::bitcoin::Transaction,
     addrs: Vec<std::net::SocketAddr>,
@@ -2045,18 +2078,23 @@ fn broadcast_via_p2p(
     }
     let bdk_net = network.to_bitcoin_network();
     let mut last_err = String::from("no MWEB peers reachable");
+    let mut sent_ok: Option<std::net::SocketAddr> = None;
     for addr in addrs {
         match TcpMwebPeer::connect(addr, bdk_net) {
             Ok(mut peer) => match peer.broadcast_tx(tx) {
                 Ok(BroadcastAck::Confirmed) => {
-                    eprintln!("MWEB broadcast: {addr} accepted the transaction");
+                    crate::diag::log(format!(
+                        "MWEB broadcast: {addr} accepted the transaction"
+                    ));
                     return Ok(());
                 }
                 Ok(BroadcastAck::Sent) => {
-                    eprintln!(
-                        "MWEB broadcast: sent to {addr}; acceptance not confirmed before deadline"
-                    );
-                    return Ok(());
+                    crate::diag::log(format!(
+                        "MWEB broadcast: sent to {addr}; acceptance not confirmed before deadline — trying more peers"
+                    ));
+                    if sent_ok.is_none() {
+                        sent_ok = Some(addr);
+                    }
                 }
                 Err(e) => {
                     last_err = format!(
@@ -2067,6 +2105,12 @@ fn broadcast_via_p2p(
             },
             Err(e) => last_err = format!("{addr}: {e}"),
         }
+    }
+    if let Some(addr) = sent_ok {
+        crate::diag::log(format!(
+            "MWEB broadcast: no peer confirmed acceptance; keeping optimistic send via {addr}"
+        ));
+        return Ok(());
     }
     Err(WalletError::Mweb(format!(
         "P2P broadcast failed: {last_err}"
@@ -2439,7 +2483,7 @@ pub fn peers_for_headers(
     network: WalletNetwork,
     preferred: Option<std::net::SocketAddr>,
 ) -> Vec<std::net::SocketAddr> {
-    let mut configured = resolve_peers(peers).unwrap_or_default();
+    let mut configured = probe_reachable(resolve_peers(peers).unwrap_or_default());
     if let Some(first) = preferred {
         configured.retain(|addr| *addr != first);
         configured.insert(0, first);

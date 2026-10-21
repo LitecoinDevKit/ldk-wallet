@@ -154,6 +154,8 @@
                 implementation. Choose “mwebd (before 1 June 2026)” only for an
                 older Nexus seed or an app that still derives
                 <code>m/1000'/2'/0'</code>. Transparent addresses are unaffected.
+                The first sync after restore can take several minutes (Electrum
+                address scan + full MWEB UTXO download).
               </span>
             </label>
             <label class="field">
@@ -1338,6 +1340,22 @@
               </div>
             </div>
 
+            <div class="card" id="diagnostics-card">
+              <h3>Diagnostics</h3>
+              <p class="hint">
+                Share this with support when sync is stuck. It includes connection settings, sync
+                phase, and recent non-secret log lines — never your recovery phrase or passphrase.
+              </p>
+              <div class="row">
+                <button type="button" id="btn-export-diagnostics" class="btn btn-secondary">
+                  Export diagnostics…
+                </button>
+                <button type="button" id="btn-copy-diagnostics" class="btn btn-ghost">
+                  Copy to clipboard
+                </button>
+              </div>
+            </div>
+
             <div class="card" id="privacy-disclosure">
               <h3>What leaves this computer</h3>
               <ul class="privacy-list">
@@ -1422,11 +1440,12 @@
                   class="mono"
                   type="text"
                   spellcheck="false"
-                  placeholder="127.0.0.1:9333"
+                  placeholder="leave empty for auto-discovery"
                 />
                 <span class="hint">
-                  Comma-separated <code>host:port</code> pairs. Optional — public MWEB
-                  peers are found automatically when these are empty or unreachable.
+                  Comma-separated <code>host:port</code> pairs. Leave empty to use public
+                  MWEB peers (recommended). Set <code>127.0.0.1:9333</code> only if you
+                  run litecoind locally — a dead localhost peer used to stall first sync.
                 </span>
               </label>
               <div class="row">

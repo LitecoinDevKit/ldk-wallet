@@ -468,15 +468,74 @@ pub struct CombinedSummary {
     pub mweb_status: String,
 }
 
-/// Progress of an in-flight MWEB UTXO download (poll while a sync runs).
+/// Coarse phase of an in-flight wallet sync (poll with MWEB progress).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyncPhase {
+    #[default]
+    Idle,
+    ElectrumFullScan,
+    ElectrumSync,
+    MwebDownload,
+    Done,
+}
+
+impl SyncPhase {
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ElectrumFullScan,
+            2 => Self::ElectrumSync,
+            3 => Self::MwebDownload,
+            4 => Self::Done,
+            _ => Self::Idle,
+        }
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::ElectrumFullScan => 1,
+            Self::ElectrumSync => 2,
+            Self::MwebDownload => 3,
+            Self::Done => 4,
+        }
+    }
+}
+
+/// Progress of an in-flight sync (poll while a sync runs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MwebSyncProgress {
+    /// Coarse phase of the overall wallet sync (Electrum then MWEB).
+    #[serde(default)]
+    pub phase: SyncPhase,
     /// True while an MWEB sync pass is running.
     pub active: bool,
     /// UTXO leaves fetched so far in the current pass.
     pub fetched: u64,
     /// Total UTXO leaves the current pass will download (0 until known).
     pub total: u64,
+}
+
+/// Redacted support bundle (no mnemonic, passphrase, or sealed blobs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticsBundle {
+    pub app_version: String,
+    pub os: String,
+    pub generated_unix: u64,
+    pub network: Option<String>,
+    pub electrum_url: Option<String>,
+    pub electrum_validate_domain: Option<bool>,
+    pub electrum_use_public_fallback: Option<bool>,
+    pub active_electrum_url: Option<String>,
+    pub mweb_scheme: Option<String>,
+    pub mweb_peers: Option<Vec<String>>,
+    pub needs_full_scan: Option<bool>,
+    pub needs_mweb_scan: Option<bool>,
+    pub tip_height: Option<u32>,
+    pub mweb_synced_height: Option<u32>,
+    pub mweb_status: Option<String>,
+    pub sync_phase: SyncPhase,
+    pub recent_log_lines: Vec<String>,
 }
 
 /// Default MWEB kernel fee (0.0005 LTC). Used when the request leaves fee as 0.

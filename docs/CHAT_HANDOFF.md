@@ -1,4 +1,4 @@
-# Chat handoff — Litecoin Mac wallet (v0.4.6)
+# Chat handoff — Litecoin Mac wallet (v0.4.7)
 
 Paste or `@`-reference this file when starting a new Cursor chat in this repo.
 
@@ -31,7 +31,7 @@ Paste or `@`-reference this file when starting a new Cursor chat in this repo.
 | mainnet | `ssl://electrum-ltc.bysh.me:50002` |
 | testnet | `ssl://electrum-ltc.bysh.me:51002` |
 
-MWEB peers default to `127.0.0.1:9333` (user-configurable). Electrum TLS certificate validation is on by default (cipig.net defaults have CA certs); the self-signed community servers need the Settings toggle off.
+MWEB peers default to empty (DNS auto-discovery). A sole `127.0.0.1:9333` leftover from older builds is cleared on meta load. Electrum TLS certificate validation is on by default (cipig.net defaults have CA certs); the self-signed community servers need the Settings toggle off.
 
 ## `wallet-core` surface
 

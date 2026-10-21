@@ -364,7 +364,15 @@ type ParsedPaymentUri = {
   label: string | null;
 };
 
+type SyncPhase =
+  | "idle"
+  | "electrum-full-scan"
+  | "electrum-sync"
+  | "mweb-download"
+  | "done";
+
 type MwebSyncProgress = {
+  phase?: SyncPhase;
   active: boolean;
   fetched: number;
   total: number;
@@ -743,6 +751,8 @@ const el = {
   electrumTestResult: document.querySelector<HTMLElement>("#electrum-test-result")!,
   btnExportMetadata: document.querySelector<HTMLButtonElement>("#btn-export-metadata")!,
   btnImportMetadata: document.querySelector<HTMLButtonElement>("#btn-import-metadata")!,
+  btnExportDiagnostics: document.querySelector<HTMLButtonElement>("#btn-export-diagnostics")!,
+  btnCopyDiagnostics: document.querySelector<HTMLButtonElement>("#btn-copy-diagnostics")!,
 };
 
 const views = Object.fromEntries(
@@ -4090,10 +4100,38 @@ async function loadElectrumPresets() {
   }
 }
 
+function syncPhaseLoadingLabel(p: MwebSyncProgress): string | null {
+  switch (p.phase) {
+    case "electrum-full-scan":
+      return "Scanning transparent addresses…";
+    case "electrum-sync":
+      return "Syncing transparent transactions…";
+    case "mweb-download":
+      if (p.active && p.total === 0) return "Connecting to MWEB peers…";
+      if (p.active && p.total > 0) {
+        const pct = Math.min(100, Math.round((p.fetched / p.total) * 100));
+        return `Downloading MWEB outputs: ${p.fetched.toLocaleString(
+          "en-US",
+        )} / ${p.total.toLocaleString("en-US")} (${pct}%)`;
+      }
+      return "Downloading MWEB outputs…";
+    default:
+      return null;
+  }
+}
+
 function renderMwebProgress(p: MwebSyncProgress) {
-  // Only worth showing for real downloads; steady-state diffs finish instantly.
-  if (!p.active || p.total < 100) {
+  const phaseLabel = syncPhaseLoadingLabel(p);
+  if (phaseLabel) setLoadingLabel(phaseLabel);
+
+  if (!p.active) {
     el.mwebProgress.hidden = true;
+    return;
+  }
+  if (p.total === 0) {
+    el.mwebProgress.hidden = false;
+    el.mwebProgressFill.style.width = "0%";
+    el.mwebProgressText.textContent = "Connecting to MWEB peers…";
     return;
   }
   const pct = Math.min(100, Math.round((p.fetched / p.total) * 100));
@@ -4103,8 +4141,6 @@ function renderMwebProgress(p: MwebSyncProgress) {
   el.mwebProgress.hidden = false;
   el.mwebProgressFill.style.width = `${pct}%`;
   el.mwebProgressText.textContent = text;
-  // The loading overlay covers the bar during a resync, so mirror it there.
-  setLoadingLabel(text);
 }
 
 function startMwebProgressPolling() {
@@ -4293,53 +4329,9 @@ async function boot() {
   }
 }
 
-async function enterReady() {
-  
-el.btnRefreshCoins.addEventListener("click", () => void refreshUtxos());
-
-el.btnTestElectrum.addEventListener("click", async () => {
-  el.electrumTestResult.textContent = "Testing…";
-  try {
-    // Persist TLS toggle for the probe by saving is not required — probe uses stored settings.
-    // Use the URL currently typed in the field.
-    const probe = await invoke<ElectrumProbe>("test_electrum", {
-      url: el.settingsElectrum.value.trim() || null,
-    });
-    el.electrumTestResult.textContent = `OK · tip ${probe.tip_height.toLocaleString(
-      "en-US",
-    )} · ${probe.latency_ms} ms · ${electrumHostLabel(probe.url)}`;
-    updateStatusStrip({ tip: probe.tip_height });
-  } catch (e) {
-    el.electrumTestResult.textContent = String(e);
-  }
-});
-
-el.btnExportMetadata.addEventListener("click", async () => {
-  try {
-    const path = await invoke<string | null>("export_metadata");
-    if (path) setStatus(`Metadata exported to ${path}`, "success");
-  } catch (e) {
-    setError(String(e));
-  }
-});
-
-el.btnImportMetadata.addEventListener("click", async () => {
-  try {
-    const result = await invoke<MetadataImportResult | null>("import_metadata");
-    if (!result) return;
-    await refreshContacts();
-    await refreshTxLabels();
-    await refreshUtxos();
-    setStatus(
-      `Imported ${result.contacts_upserted} contacts, ${result.tx_labels_upserted} tx labels, ${result.utxo_labels_upserted} coin labels.`,
-      "success",
-    );
-  } catch (e) {
-    setError(String(e));
-  }
-});
-
-displayUnit = readDisplayUnit();
+async function enterReady(opts?: { sync?: boolean }) {
+  const shouldSync = opts?.sync !== false;
+  displayUnit = readDisplayUnit();
   hideBalances = readHideBalances();
   syncAmountFieldLabels();
   const s = await invoke<WalletSummary>("load_wallet");
@@ -4355,7 +4347,7 @@ displayUnit = readDisplayUnit();
   await initLitvm();
   void refreshSpotPrice();
   void refreshFeeLadder();
-  void runSync({ quiet: false });
+  if (shouldSync) void runSync({ quiet: false });
   maybeShowMwebCoach();
 }
 
@@ -4645,7 +4637,7 @@ el.btnRestore.addEventListener("click", async () => {
   syncing = true;
   setError(null);
   updateBusyUi();
-  showLoading("Restoring wallet and scanning for coins…");
+  showLoading("Creating encrypted wallet…");
   try {
     const passphrase = el.restorePassphrase.value;
     const aezeedPass = el.restoreAezeedPass.value;
@@ -4668,7 +4660,9 @@ el.btnRestore.addEventListener("click", async () => {
     syncPassMeters();
     syncing = false;
     updateBusyUi();
-    await enterReady();
+    await enterReady({ sync: false });
+    setLoadingLabel("Scanning transparent addresses…");
+    await runSync({ quiet: false });
   } catch (e) {
     setError(String(e));
     syncing = false;
@@ -7723,6 +7717,27 @@ el.btnImportMetadata.addEventListener("click", async () => {
     setStatus(
       `Imported ${result.contacts_upserted} contacts, ${result.tx_labels_upserted} tx labels, ${result.utxo_labels_upserted} coin labels.`,
       "success",
+    );
+  } catch (e) {
+    setError(String(e));
+  }
+});
+
+el.btnExportDiagnostics.addEventListener("click", async () => {
+  try {
+    const path = await invoke<string | null>("export_diagnostics");
+    if (path) setStatus(`Diagnostics exported to ${path}`, "success");
+  } catch (e) {
+    setError(String(e));
+  }
+});
+
+el.btnCopyDiagnostics.addEventListener("click", async () => {
+  try {
+    const bundle = await invoke<Record<string, unknown>>("get_diagnostics");
+    await copyText(
+      JSON.stringify(bundle, null, 2),
+      "Diagnostics copied to clipboard.",
     );
   } catch (e) {
     setError(String(e));

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bdk_electrum::electrum_client::ElectrumApi;
@@ -16,17 +17,18 @@ use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions};
 use crate::churn;
 use crate::contacts;
 use crate::descriptors::{self, create_params, load_params};
+use crate::diag;
 use crate::dto::{
     AddressReuseHint, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary,
-    ContactRecord, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest, ElectrumProbe,
-    FeeEstimate, MigrateEncryptRequest, MwebBroadcastResult, MwebScheme, MwebSendPreview,
-    MwebSendRequest, MwebUtxoRecord, PeginPreview, PeginRequest, PeginResult, PegoutPreview,
-    PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse,
-    SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest, SetTxLabelRequest,
-    SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitPreview, SplitRequest, SplitResult,
-    SyncResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest,
-    UtxoRecord, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_QUIET_NOTE,
-    DEFAULT_MWEB_FEE_SATS,
+    ContactRecord, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest, DiagnosticsBundle,
+    ElectrumProbe, FeeEstimate, MigrateEncryptRequest, MwebBroadcastResult, MwebScheme,
+    MwebSendPreview, MwebSendRequest, MwebUtxoRecord, PeginPreview, PeginRequest, PeginResult,
+    PegoutPreview, PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest,
+    RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest,
+    SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitPreview,
+    SplitRequest, SplitResult, SyncPhase, SyncResult, TxKind, TxRecord, UnlockRequest,
+    UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary,
+    CHURN_AMOUNT_NOTE, CHURN_QUIET_NOTE, DEFAULT_MWEB_FEE_SATS,
 };
 use crate::electrum::{self, BATCH_SIZE, MIN_FEE_RATE_SAT_VB, STOP_GAP};
 use crate::error::WalletError;
@@ -123,7 +125,9 @@ fn connect_electrum(
     let candidates = electrum_candidates(state);
     let (client, used) = electrum::connect_first(&candidates, state.electrum_validate_domain)?;
     if used != state.electrum_url {
-        eprintln!("electrum: configured server unavailable; using fallback {used}");
+        diag::log(format!(
+            "electrum: configured server unavailable; using fallback {used}"
+        ));
     }
     state.active_electrum_url = Some(used);
     Ok(client)
@@ -144,6 +148,8 @@ pub struct WalletApp {
     /// polled while a sync (which holds that mutex) is in flight.
     mweb_progress: Arc<SyncProgress>,
     mweb_sync_active: AtomicBool,
+    /// Coarse sync phase for UI polling (see [`SyncPhase`]).
+    sync_phase: AtomicU8,
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
@@ -163,9 +169,14 @@ impl WalletApp {
             )),
             mweb_progress: Arc::new(SyncProgress::default()),
             mweb_sync_active: AtomicBool::new(false),
+            sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
             pending_lock: AtomicBool::new(false),
             insights_endpoint: Mutex::new(None),
         }
+    }
+
+    fn set_sync_phase(&self, phase: SyncPhase) {
+        self.sync_phase.store(phase.as_u8(), Ordering::Relaxed);
     }
 
     fn publish_insights(&self, state: &WalletState) {
@@ -183,15 +194,78 @@ impl WalletApp {
         }
     }
 
-    /// Progress of the current MWEB UTXO download. Does not take the wallet state
-    /// lock, so it is safe to poll while [`Self::sync`] or [`Self::resync_mweb`] runs.
+    /// Progress of the current sync. Does not take the wallet state lock, so it
+    /// is safe to poll while [`Self::sync`] or [`Self::resync_mweb`] runs.
     pub fn mweb_sync_progress(&self) -> crate::dto::MwebSyncProgress {
         let (fetched, total) = self.mweb_progress.snapshot();
         crate::dto::MwebSyncProgress {
+            phase: SyncPhase::from_u8(self.sync_phase.load(Ordering::Relaxed)),
             active: self.mweb_sync_active.load(Ordering::Relaxed),
             fetched,
             total,
         }
+    }
+
+    /// Redacted support bundle for Export diagnostics (no secrets).
+    pub fn diagnostics(&self, app_version: &str) -> DiagnosticsBundle {
+        let generated_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let sync_phase = SyncPhase::from_u8(self.sync_phase.load(Ordering::Relaxed));
+        let recent_log_lines = diag::snapshot();
+
+        let mut bundle = DiagnosticsBundle {
+            app_version: app_version.to_string(),
+            os: std::env::consts::OS.to_string(),
+            generated_unix,
+            network: None,
+            electrum_url: None,
+            electrum_validate_domain: None,
+            electrum_use_public_fallback: None,
+            active_electrum_url: None,
+            mweb_scheme: None,
+            mweb_peers: None,
+            needs_full_scan: None,
+            needs_mweb_scan: None,
+            tip_height: None,
+            mweb_synced_height: None,
+            mweb_status: None,
+            sync_phase,
+            recent_log_lines,
+        };
+
+        let Ok(guard) = self.state.try_lock() else {
+            bundle
+                .recent_log_lines
+                .push("note: wallet busy (sync in progress); meta snapshot skipped".into());
+            return bundle;
+        };
+        let Some(state) = guard.as_ref() else {
+            return bundle;
+        };
+
+        bundle.network = Some(format!("{:?}", state.network).to_lowercase());
+        bundle.electrum_url = Some(state.electrum_url.clone());
+        bundle.electrum_validate_domain = Some(state.electrum_validate_domain);
+        bundle.electrum_use_public_fallback = Some(state.electrum_use_public_fallback);
+        bundle.active_electrum_url = state.active_electrum_url.clone();
+        bundle.mweb_scheme = Some(match state.mweb_scheme {
+            MwebScheme::LitecoinCore => "litecoin-core".into(),
+            MwebScheme::Lip0004 => "lip0004".into(),
+            MwebScheme::Mwebd => "mwebd".into(),
+        });
+        bundle.mweb_peers = Some(state.mweb_peers.clone());
+        bundle.needs_full_scan = Some(state.needs_full_scan);
+        bundle.needs_mweb_scan = Some(state.needs_mweb_scan);
+        bundle.tip_height = Some(state.last_tip_height);
+        if let Some(ref mweb) = state.mweb {
+            bundle.mweb_synced_height = mweb.last_synced_height.or(mweb.sync_state.tip_height);
+            if !mweb.last_status.is_empty() {
+                bundle.mweb_status = Some(mweb.last_status.clone());
+            }
+        }
+        bundle
     }
 
     /// Reset shared progress and mark an MWEB pass active/inactive around `f`.
@@ -836,23 +910,38 @@ impl WalletApp {
         let prev_tip = state.last_tip_height;
 
         if did_full_scan {
+            self.set_sync_phase(SyncPhase::ElectrumFullScan);
+            diag::log("sync: electrum full_scan starting");
             let request = state.wallet.start_full_scan();
             let update = client
                 .full_scan(request, STOP_GAP, BATCH_SIZE, false)
-                .map_err(|e| WalletError::Electrum(e.to_string()))?;
+                .map_err(|e| {
+                    self.set_sync_phase(SyncPhase::Idle);
+                    WalletError::Electrum(e.to_string())
+                })?;
             state
                 .wallet
                 .apply_update(update)
-                .map_err(|e| WalletError::Electrum(e.to_string()))?;
+                .map_err(|e| {
+                    self.set_sync_phase(SyncPhase::Idle);
+                    WalletError::Electrum(e.to_string())
+                })?;
         } else {
+            self.set_sync_phase(SyncPhase::ElectrumSync);
             let request = state.wallet.start_sync_with_revealed_spks();
             let update = client
                 .sync(request, BATCH_SIZE, false)
-                .map_err(|e| WalletError::Electrum(e.to_string()))?;
+                .map_err(|e| {
+                    self.set_sync_phase(SyncPhase::Idle);
+                    WalletError::Electrum(e.to_string())
+                })?;
             state
                 .wallet
                 .apply_update(update)
-                .map_err(|e| WalletError::Electrum(e.to_string()))?;
+                .map_err(|e| {
+                    self.set_sync_phase(SyncPhase::Idle);
+                    WalletError::Electrum(e.to_string())
+                })?;
         }
 
         state
@@ -920,6 +1009,8 @@ impl WalletApp {
         // MWEB sync (best-effort; peer failure → stale, not hard error).
         let mut mweb_ms = 0u64;
         if let Some(ref mut mweb) = state.mweb {
+            self.set_sync_phase(SyncPhase::MwebDownload);
+            diag::log("sync: mweb download starting");
             let mweb_started = std::time::Instant::now();
             let peers = state.mweb_peers.clone();
             let network = state.network;
@@ -948,6 +1039,7 @@ impl WalletApp {
             }
             let _ = mweb.persist(&state.data_dir);
             mweb_ms = mweb_started.elapsed().as_millis() as u64;
+            diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
         }
 
         self.abort_if_locked(&mut guard)?;
@@ -973,6 +1065,12 @@ impl WalletApp {
         let new_txs = tx_count_after.saturating_sub(tx_count_before) as u32;
         let summary = build_summary(state)?;
         self.abort_if_locked(&mut guard)?;
+        self.set_sync_phase(SyncPhase::Done);
+        diag::log(format!(
+            "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs}"
+        ));
+        // Leave Done briefly visible to pollers, then idle on next pollers' natural gap.
+        // Callers that poll after sync returns still see Done once.
         Ok(SyncResult {
             summary,
             new_txs,
@@ -1025,6 +1123,8 @@ impl WalletApp {
         let tip_height = state.wallet.latest_checkpoint().height();
         let tip_hash = state.wallet.latest_checkpoint().hash();
         if let Some(ref mut mweb) = state.mweb {
+            self.set_sync_phase(SyncPhase::MwebDownload);
+            diag::log("resync_mweb: mweb download starting");
             let peers = state.mweb_peers.clone();
             let network = state.network;
             // Fresh runtime after wipe: no previous sync state, so no extension hint.
@@ -1037,6 +1137,7 @@ impl WalletApp {
         self.abort_if_locked(&mut guard)?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         state.needs_mweb_scan = false;
+        self.set_sync_phase(SyncPhase::Done);
         Ok(())
     }
 

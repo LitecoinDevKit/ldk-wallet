@@ -215,6 +215,9 @@ type MwebUtxoRecord = {
   churn_target?: number | null;
   churn_counted?: number | null;
   churn_cover_hold?: "no-rpc" | "waiting" | null;
+  churn_cover_min?: number | null;
+  churn_cover_seen?: number | null;
+  churn_spreading?: boolean | null;
 };
 
 type ChurnPhase =
@@ -235,6 +238,8 @@ type ChurnPreview = {
   amount_note: string;
   quiet_block_note: string;
   has_litecoin_rpc: boolean;
+  cover_min: number;
+  spread_send: boolean;
 };
 
 type SplitOutput = {
@@ -4210,10 +4215,7 @@ function stopAutoSync() {
 let coverPumpTimer: number | null = null;
 let coverPumpOn = false;
 
-function coverPumpDelayMs(): number {
-  const jitter = Math.floor(Math.random() * 91) - 45;
-  return (180 + jitter) * 1000;
-}
+const COVER_PUMP_MS = 60_000;
 
 function scheduleCoverPump() {
   if (!coverPumpOn) return;
@@ -4221,7 +4223,7 @@ function scheduleCoverPump() {
   coverPumpTimer = window.setTimeout(() => {
     coverPumpTimer = null;
     void pumpCover();
-  }, coverPumpDelayMs());
+  }, COVER_PUMP_MS);
 }
 
 async function pumpCover() {
@@ -5357,6 +5359,7 @@ let churnStartingId: string | null = null;
 let churnStartingTarget = 1;
 /** Cover hold to paint before start_churn returns. Comes from the confirm preview. */
 let churnStartingCoverHold: "no-rpc" | "waiting" = "waiting";
+let churnStartingCoverMin = 2;
 /** Output id of the active self-spend on the last successful coin list. */
 let churnWatchId: string | null = null;
 /** Output id to keep marked after that job leaves the active phases. */
@@ -5380,9 +5383,22 @@ function stampChurnStarting() {
   if (!coin || churnPhaseActive(coin.churn_phase)) return;
   coin.churn_phase = "waiting-for-cover";
   coin.churn_cover_hold = churnStartingCoverHold;
+  coin.churn_cover_min = churnStartingCoverMin;
+  coin.churn_cover_seen = null;
+  coin.churn_spreading = false;
   coin.locked = true;
   coin.churn_target = churnStartingTarget;
   coin.churn_counted = 0;
+}
+
+/** "Needs N other private transactions. Last check saw M." while a hop waits on the mempool. */
+function churnCoverLine(coin: MwebUtxoRecord): string | null {
+  if (coin.churn_phase !== "waiting-for-cover" || coin.churn_cover_hold !== "waiting") return null;
+  const need = coin.churn_cover_min ?? 2;
+  const parts = [`Needs ${need} other private transaction${need === 1 ? "" : "s"}.`];
+  if (coin.churn_cover_seen != null) parts.push(`Last check saw ${coin.churn_cover_seen}.`);
+  if (coin.churn_spreading) parts.push("Waiting to spread the send.");
+  return parts.join(" ");
 }
 
 function activeChurnCoin(): MwebUtxoRecord | undefined {
@@ -5833,6 +5849,13 @@ function renderChurnStatus() {
     node.textContent = "Save a Litecoin RPC URL in Settings → Connection.";
     card.append(node);
   }
+  const cover = churnCoverLine(coin);
+  if (cover) {
+    const line = document.createElement("p");
+    line.className = "churn-status-sub";
+    line.textContent = cover;
+    card.append(line);
+  }
 
   const smaller = churnSmallerLine(coin);
   if (smaller) {
@@ -6173,6 +6196,8 @@ async function cancelChurn() {
 
 async function openChurnModal(coin: MwebUtxoRecord) {
   let targetDepth = 1;
+  let coverMin = 2;
+  let spreadSend = false;
   let previewOk = false;
   let previewHasRpc = true;
   const choice = await openModal({
@@ -6185,6 +6210,29 @@ async function openChurnModal(coin: MwebUtxoRecord) {
         "Spend this coin to an address of this wallet. It mixes only if that block also has other private activity.",
         "hint",
       );
+      const coverField = document.createElement("label");
+      coverField.className = "field";
+      const coverCaption = document.createElement("span");
+      coverCaption.className = "field-label";
+      coverCaption.textContent = "Other private transactions in the mempool";
+      const coverInput = document.createElement("input");
+      coverInput.type = "number";
+      coverInput.min = "1";
+      coverInput.max = "10";
+      coverInput.step = "1";
+      coverInput.value = "2";
+      coverField.append(coverCaption, coverInput);
+      const spreadField = document.createElement("label");
+      spreadField.className = "check";
+      const spreadInput = document.createElement("input");
+      spreadInput.type = "checkbox";
+      const spreadText = document.createElement("span");
+      spreadText.textContent = "Spread out the send";
+      spreadField.append(spreadInput, spreadText);
+      const spreadHint = document.createElement("p");
+      spreadHint.className = "hint";
+      spreadHint.textContent =
+        "After the mempool has enough other private transactions, wait a random 1–3 minutes before sending. This can take longer.";
       const wait = document.createElement("p");
       wait.className = "hint";
       const feeBox = document.createElement("div");
@@ -6216,7 +6264,7 @@ async function openChurnModal(coin: MwebUtxoRecord) {
       input.value = "2";
       field.append(caption, input);
       details.append(summary, field);
-      sheet.append(wait, feeBox, amount, quiet, pattern, err, details);
+      sheet.append(coverField, spreadField, spreadHint, wait, feeBox, amount, quiet, pattern, err, details);
       body.append(sheet);
 
       let seq = 0;
@@ -6231,9 +6279,13 @@ async function openChurnModal(coin: MwebUtxoRecord) {
           }
           feeBox.append(buildDetailList(rows));
           previewHasRpc = preview.has_litecoin_rpc;
-          wait.textContent = preview.has_litecoin_rpc
-            ? "This hop will not be sent until other private transactions appear in the mempool. That can take a long time."
-            : "This hop will be signed now. It will not be sent until a Litecoin RPC URL is saved in Settings → Connection. It will then wait for other private transactions.";
+          const n = preview.cover_min;
+          const others = `${n} other private transaction${n === 1 ? "" : "s"}`;
+          wait.textContent = !preview.has_litecoin_rpc
+            ? "This hop will be signed now. It will not be sent until a Litecoin RPC URL is saved in Settings → Connection. It will then wait for other private transactions."
+            : preview.spread_send
+              ? `This hop waits until a check finds at least ${others} in the node's mempool. Then it waits 1–3 minutes before sending. That can take a long time.`
+              : `This hop is sent on the first check that finds at least ${others} in the node's mempool. That can take a long time.`;
           amount.textContent = preview.amount_note;
           quiet.textContent = preview.quiet_block_note;
         }
@@ -6250,10 +6302,17 @@ async function openChurnModal(coin: MwebUtxoRecord) {
         targetDepth = details.open
           ? Math.min(10, Math.max(2, Math.floor(Number(input.value) || 2)))
           : 1;
+        coverMin = Math.min(10, Math.max(1, Math.floor(Number(coverInput.value) || 2)));
+        spreadSend = spreadInput.checked;
         const ticket = ++seq;
         try {
           const preview = await invoke<ChurnPreview>("preview_churn", {
-            req: { output_id: coin.output_id, target_depth: targetDepth },
+            req: {
+              output_id: coin.output_id,
+              target_depth: targetDepth,
+              cover_min: coverMin,
+              spread_send: spreadSend,
+            },
           });
           if (ticket !== seq) return;
           paint(preview, null);
@@ -6269,6 +6328,8 @@ async function openChurnModal(coin: MwebUtxoRecord) {
       });
       details.addEventListener("toggle", () => void refresh());
       input.addEventListener("input", () => void refresh());
+      coverInput.addEventListener("input", () => void refresh());
+      spreadInput.addEventListener("change", () => void refresh());
       void refresh();
     },
     actions: [
@@ -6280,6 +6341,7 @@ async function openChurnModal(coin: MwebUtxoRecord) {
   churnStartingId = coin.output_id;
   churnStartingTarget = targetDepth;
   churnStartingCoverHold = previewHasRpc ? "waiting" : "no-rpc";
+  churnStartingCoverMin = coverMin;
   churnSettledId = null;
   churnSettledNeedsScroll = false;
   stampChurnStarting();
@@ -6287,7 +6349,12 @@ async function openChurnModal(coin: MwebUtxoRecord) {
   let startError: unknown = null;
   try {
     await invoke("start_churn", {
-      req: { output_id: coin.output_id, target_depth: targetDepth },
+      req: {
+        output_id: coin.output_id,
+        target_depth: targetDepth,
+        cover_min: coverMin,
+        spread_send: spreadSend,
+      },
     });
   } catch (err) {
     startError = err;

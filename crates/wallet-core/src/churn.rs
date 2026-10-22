@@ -30,14 +30,13 @@ pub const ARMED_EXPIRY_SECS: u64 = 24 * 60 * 60;
 /// Or this many blocks, whichever comes first. About a day of Litecoin blocks.
 pub const ARMED_EXPIRY_BLOCKS: u32 = 576;
 
-/// Inclusive range for the per-job cover minimum.
-pub const COVER_MIN_LOW: u32 = 2;
-pub const COVER_MIN_HIGH: u32 = 5;
+/// Other MWEB mempool transactions a hop waits for when the sheet leaves the count alone.
+pub const COVER_MIN_DEFAULT: u32 = 2;
+pub const COVER_MIN_MAX: u32 = 10;
 
-const LOOK_GAP_SECS: u64 = 180;
-const LOOK_JITTER_SECS: u64 = 45;
-const SEND_DELAY_MIN_SECS: u64 = 60;
-const SEND_DELAY_MAX_SECS: u64 = 240;
+/// Opt-in spread drawn after the first check that meets the count.
+pub const SPREAD_MIN_SECS: u64 = 60;
+pub const SPREAD_MAX_SECS: u64 = 180;
 
 pub const EXPIRED_SPEND: &str = "This signed self-spend expired. Try again to prepare a new one.";
 pub const FOREIGN_SPEND: &str = "This coin was spent by another transaction.";
@@ -134,6 +133,22 @@ pub struct ChurnJob {
     /// Why a signed hop is still on disk.
     #[serde(default)]
     pub cover_hold: Option<CoverHold>,
+    /// Other MWEB mempool transactions a hop waits for. Chosen on the sheet.
+    #[serde(default = "default_cover_min")]
+    pub cover_min: u32,
+    /// Wait a random 1–3 minutes after the count is first met.
+    #[serde(default)]
+    pub spread_send: bool,
+    /// What the last successful mempool read counted.
+    #[serde(default)]
+    pub last_cover_count: Option<u64>,
+    /// A spread deadline is running on the armed record.
+    #[serde(default)]
+    pub spreading: bool,
+}
+
+fn default_cover_min() -> u32 {
+    COVER_MIN_DEFAULT
 }
 
 fn default_version() -> u32 {
@@ -296,6 +311,21 @@ pub fn normalize_target(target_depth: u32) -> Result<u32, WalletError> {
     Ok(target)
 }
 
+/// `0` means the default. Otherwise 1 through `COVER_MIN_MAX`.
+pub fn normalize_cover_min(cover_min: u32) -> Result<u32, WalletError> {
+    let n = if cover_min == 0 {
+        COVER_MIN_DEFAULT
+    } else {
+        cover_min
+    };
+    if !(1..=COVER_MIN_MAX).contains(&n) {
+        return Err(WalletError::BuildTx(format!(
+            "Choose between 1 and {COVER_MIN_MAX} other private transactions."
+        )));
+    }
+    Ok(n)
+}
+
 /// Inputs the start command already resolved from the coin and the job file.
 pub struct StartCheck {
     pub mature: bool,
@@ -336,6 +366,8 @@ pub fn new_job(
     from_pegin: bool,
     target_depth: u32,
     fee_sats: u64,
+    cover_min: u32,
+    spread_send: bool,
 ) -> Result<ChurnJob, WalletError> {
     let id = mweb_frozen::normalize_output_id(output_id)?;
     Ok(ChurnJob {
@@ -357,6 +389,10 @@ pub fn new_job(
         header_cache: BTreeMap::new(),
         needs_resign: false,
         cover_hold: None,
+        cover_min,
+        spread_send,
+        last_cover_count: None,
+        spreading: false,
     })
 }
 
@@ -404,6 +440,8 @@ pub fn note_broadcast(
     job.header_cache.clear();
     job.cover_hold = None;
     job.needs_resign = false;
+    job.last_cover_count = None;
+    job.spreading = false;
     Ok(())
 }
 
@@ -820,6 +858,10 @@ pub fn status_view(job: &ChurnJob) -> ChurnStatus {
         last_other_outputs: job.last_other_outputs,
         last_error: job.last_error.clone(),
         cover_hold: job.cover_hold,
+        cover_min: job.cover_min,
+        spread_send: job.spread_send,
+        last_cover_count: job.last_cover_count,
+        spreading: job.spreading,
     }
 }
 
@@ -882,18 +924,8 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
-pub fn draw_cover_min() -> u32 {
-    rand::thread_rng().gen_range(COVER_MIN_LOW..=COVER_MIN_HIGH)
-}
-
-pub fn random_look_gap() -> u64 {
-    let jitter: i64 =
-        rand::thread_rng().gen_range(-(LOOK_JITTER_SECS as i64)..=LOOK_JITTER_SECS as i64);
-    (LOOK_GAP_SECS as i64 + jitter) as u64
-}
-
-pub fn random_send_delay() -> u64 {
-    rand::thread_rng().gen_range(SEND_DELAY_MIN_SECS..=SEND_DELAY_MAX_SECS)
+pub fn random_spread() -> u64 {
+    rand::thread_rng().gen_range(SPREAD_MIN_SECS..=SPREAD_MAX_SECS)
 }
 
 pub fn armed_expired(armed_at: u64, armed_height: u32, now: u64, tip: Option<u32>) -> bool {
@@ -935,12 +967,9 @@ pub struct ArmedRecord {
     pub armed_at_unix: u64,
     pub armed_height: u32,
     pub cover_min: u32,
+    /// Opt-in spread deadline, drawn after the first check that met the count.
     #[serde(default)]
-    pub first_look_at: Option<u64>,
-    #[serde(default)]
-    pub delay_until: Option<u64>,
-    #[serde(default)]
-    pub next_look_at: u64,
+    pub send_after: Option<u64>,
     #[serde(default)]
     pub own_ids: BTreeSet<String>,
     /// Raw transactions were deleted. Unlock still needs the wtxid to undo a local mark.
@@ -977,8 +1006,7 @@ pub fn wipe_raw_tail(record: &mut ArmedRecord) {
         hop.created_coin = None;
     }
     record.expired = true;
-    record.first_look_at = None;
-    record.delay_until = None;
+    record.send_after = None;
 }
 
 pub fn arm_next(record: &mut ArmedRecord, now: u64, height: u32) -> bool {
@@ -988,9 +1016,7 @@ pub fn arm_next(record: &mut ArmedRecord, now: u64, height: u32) -> bool {
     record.armed_index = record.armed_index.saturating_add(1);
     record.armed_at_unix = now;
     record.armed_height = height;
-    record.first_look_at = None;
-    record.delay_until = None;
-    record.next_look_at = 0;
+    record.send_after = None;
     record.expired = false;
     true
 }
@@ -1016,54 +1042,44 @@ pub fn is_foreign_id(txid: &str, wtxid: &str, own: &BTreeSet<String>) -> bool {
     !own.contains(txid) && !own.contains(wtxid)
 }
 
-/// Two-look clock stored on the armed record.
-#[derive(Debug, Clone, Copy)]
-pub struct CoverClock {
-    pub first_look_at: Option<u64>,
-    pub delay_until: Option<u64>,
-    pub next_look_at: u64,
-}
-
+/// One mempool check against the user's count.
+///
+/// `Below` and `Spreading` are separate so the caller only drops a spread
+/// deadline when the count has actually fallen under the minimum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoverAction {
-    Wait,
-    RecordFirst { next_look_at: u64 },
-    RecordDelay { delay_until: u64 },
+pub enum CoverStep {
+    /// Fewer other transactions than the count. Any spread deadline is dropped.
+    Below,
+    /// The count was met for the first time with the spread on.
+    StartSpread {
+        send_after: u64,
+    },
+    /// The count still holds and the spread deadline has not passed.
+    Spreading,
     Send,
-    Reset,
 }
 
-/// Advance the mempool gate. `gap_secs` and `delay_secs` are chosen by the caller
-/// so a test can pin them. A count below the minimum clears a streak in progress.
-pub fn step_cover(
+/// `spread_secs` is chosen by the caller so a test can pin it.
+pub fn cover_step(
     now: u64,
     count: u64,
     minimum: u32,
-    clock: CoverClock,
-    gap_secs: u64,
-    delay_secs: u64,
-) -> CoverAction {
+    spread: bool,
+    send_after: Option<u64>,
+    spread_secs: u64,
+) -> CoverStep {
     if count < u64::from(minimum) {
-        return if clock.first_look_at.is_some() || clock.delay_until.is_some() {
-            CoverAction::Reset
-        } else {
-            CoverAction::Wait
-        };
+        return CoverStep::Below;
     }
-    if clock.first_look_at.is_none() {
-        return CoverAction::RecordFirst {
-            next_look_at: now.saturating_add(gap_secs),
-        };
+    if !spread {
+        return CoverStep::Send;
     }
-    if now < clock.next_look_at {
-        return CoverAction::Wait;
-    }
-    match clock.delay_until {
-        None => CoverAction::RecordDelay {
-            delay_until: now.saturating_add(delay_secs),
+    match send_after {
+        None => CoverStep::StartSpread {
+            send_after: now.saturating_add(spread_secs),
         },
-        Some(until) if now < until => CoverAction::Wait,
-        Some(_) => CoverAction::Send,
+        Some(deadline) if now < deadline => CoverStep::Spreading,
+        Some(_) => CoverStep::Send,
     }
 }
 
@@ -1121,7 +1137,7 @@ mod tests {
     }
 
     fn job_waiting_confirm() -> ChurnJob {
-        let mut job = new_job(&"ab".repeat(32), true, 2, 50_000).unwrap();
+        let mut job = new_job(&"ab".repeat(32), true, 2, 50_000, COVER_MIN_DEFAULT, false).unwrap();
         note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 100).unwrap();
         job
     }
@@ -1209,7 +1225,8 @@ mod tests {
 
     #[test]
     fn mixed_at_target_finishes() {
-        let mut job = new_job(&"ab".repeat(32), false, 1, 50_000).unwrap();
+        let mut job =
+            new_job(&"ab".repeat(32), false, 1, 50_000, COVER_MIN_DEFAULT, false).unwrap();
         note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 100).unwrap();
         apply_score(
             &mut job,
@@ -1283,7 +1300,7 @@ mod tests {
     fn active_job_holds_the_coin_until_cancel() {
         let dir = tempdir().unwrap();
         let id = "ab".repeat(32);
-        let mut job = new_job(&id, false, 1, 50_000).unwrap();
+        let mut job = new_job(&id, false, 1, 50_000, COVER_MIN_DEFAULT, false).unwrap();
         write_job(dir.path(), &job).unwrap();
         assert!(held_by_active_job(dir.path(), &id).unwrap());
         request_cancel(&mut job).unwrap();
@@ -1303,7 +1320,7 @@ mod tests {
     fn cancel_unfreezes_the_current_coin() {
         let dir = tempdir().unwrap();
         let id = "ab".repeat(32);
-        let mut job = new_job(&id, true, 1, 50_000).unwrap();
+        let mut job = new_job(&id, true, 1, 50_000, COVER_MIN_DEFAULT, false).unwrap();
         mweb_frozen::set_locked(dir.path(), &id, true).unwrap();
         write_job(dir.path(), &job).unwrap();
         request_cancel(&mut job).unwrap();
@@ -1561,46 +1578,39 @@ mod tests {
         assert!(!ready_to_broadcast(&job));
     }
 
-    fn clock(first: Option<u64>, delay: Option<u64>, next: u64) -> CoverClock {
-        CoverClock {
-            first_look_at: first,
-            delay_until: delay,
-            next_look_at: next,
-        }
+    #[test]
+    fn cover_sends_on_one_look() {
+        assert_eq!(cover_step(1_000, 1, 2, false, None, 90), CoverStep::Below);
+        assert_eq!(cover_step(1_000, 2, 2, false, None, 90), CoverStep::Send);
+        assert_eq!(cover_step(1_000, 7, 2, false, None, 90), CoverStep::Send);
     }
 
     #[test]
-    fn cover_gate_needs_two_looks_and_a_delay() {
-        let open = clock(None, None, 0);
+    fn spread_waits_once_then_sends() {
         assert_eq!(
-            step_cover(1_000, 3, 2, open, 180, 60),
-            CoverAction::RecordFirst {
-                next_look_at: 1_180
-            }
-        );
-        let held = clock(Some(1_000), None, 1_180);
-        assert_eq!(step_cover(1_100, 3, 2, held, 180, 60), CoverAction::Wait);
-        assert_eq!(
-            step_cover(1_180, 3, 2, held, 180, 60),
-            CoverAction::RecordDelay { delay_until: 1_240 }
-        );
-        let delaying = clock(Some(1_000), Some(1_240), 1_180);
-        assert_eq!(
-            step_cover(1_200, 3, 2, delaying, 180, 60),
-            CoverAction::Wait
+            cover_step(1_000, 3, 2, true, None, 90),
+            CoverStep::StartSpread { send_after: 1_090 }
         );
         assert_eq!(
-            step_cover(1_240, 3, 2, delaying, 180, 60),
-            CoverAction::Send
+            cover_step(1_060, 3, 2, true, Some(1_090), 90),
+            CoverStep::Spreading
+        );
+        assert_eq!(
+            cover_step(1_090, 3, 2, true, Some(1_090), 90),
+            CoverStep::Send
+        );
+        assert_eq!(
+            cover_step(1_060, 1, 2, true, Some(1_090), 90),
+            CoverStep::Below
         );
     }
 
     #[test]
-    fn cover_gate_resets_when_the_count_drops() {
-        let held = clock(Some(1_000), None, 1_180);
-        assert_eq!(step_cover(1_180, 1, 2, held, 180, 60), CoverAction::Reset);
-        let quiet = clock(None, None, 0);
-        assert_eq!(step_cover(1_180, 0, 2, quiet, 180, 60), CoverAction::Wait);
+    fn cover_min_is_one_to_ten() {
+        assert_eq!(normalize_cover_min(0).unwrap(), COVER_MIN_DEFAULT);
+        assert_eq!(normalize_cover_min(1).unwrap(), 1);
+        assert_eq!(normalize_cover_min(10).unwrap(), 10);
+        assert!(normalize_cover_min(11).is_err());
     }
 
     #[test]
@@ -1669,9 +1679,7 @@ mod tests {
             armed_at_unix: 10,
             armed_height: 20,
             cover_min: 3,
-            first_look_at: None,
-            delay_until: None,
-            next_look_at: 0,
+            send_after: None,
             own_ids: BTreeSet::new(),
             expired: false,
         };

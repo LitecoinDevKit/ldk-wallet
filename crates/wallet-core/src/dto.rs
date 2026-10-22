@@ -750,6 +750,15 @@ pub struct MwebUtxoRecord {
     /// Set while the live hop is signed and waiting to broadcast.
     #[serde(default)]
     pub churn_cover_hold: Option<CoverHold>,
+    /// Other MWEB mempool transactions the live hop waits for.
+    #[serde(default)]
+    pub churn_cover_min: Option<u32>,
+    /// What the last mempool check counted for the live hop.
+    #[serde(default)]
+    pub churn_cover_seen: Option<u64>,
+    /// The count was met and the opt-in spread is running.
+    #[serde(default)]
+    pub churn_spreading: Option<bool>,
 }
 
 /// One output in a split plan (change is flagged).
@@ -866,6 +875,12 @@ pub struct ChurnRequest {
     /// Non-solo blocks to count before the job stops. `0` or omitted means 1.
     #[serde(default)]
     pub target_depth: u32,
+    /// Other MWEB mempool transactions to wait for. `0` or omitted means 2.
+    #[serde(default)]
+    pub cover_min: u32,
+    /// Wait a random 1–3 minutes after that count is first met.
+    #[serde(default)]
+    pub spread_send: bool,
 }
 
 /// Dry-run of one self-spend hop, plus the fee if the target is more than one.
@@ -883,6 +898,8 @@ pub struct ChurnPreview {
     pub quiet_block_note: String,
     /// The loaded wallet has a non-empty Litecoin RPC URL, the same one the cover gate uses.
     pub has_litecoin_rpc: bool,
+    pub cover_min: u32,
+    pub spread_send: bool,
 }
 
 /// What the Coins screen needs while a job exists, including after it finishes.
@@ -903,6 +920,14 @@ pub struct ChurnStatus {
     /// Why a `waiting-for-cover` hop has not been sent. Absent after broadcast.
     #[serde(default)]
     pub cover_hold: Option<CoverHold>,
+    #[serde(default)]
+    pub cover_min: u32,
+    #[serde(default)]
+    pub spread_send: bool,
+    #[serde(default)]
+    pub last_cover_count: Option<u64>,
+    #[serde(default)]
+    pub spreading: bool,
 }
 
 /// Other kernels and outputs in one counted block.

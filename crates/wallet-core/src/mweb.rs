@@ -2250,6 +2250,9 @@ pub fn list_mweb_unspent(
                 churn_target: fields.churn_target,
                 churn_counted: fields.churn_counted,
                 churn_cover_hold: fields.churn_cover_hold,
+                churn_cover_min: fields.churn_cover_min,
+                churn_cover_seen: fields.churn_cover_seen,
+                churn_spreading: fields.churn_spreading,
             }
         })
         .collect();
@@ -2273,6 +2276,9 @@ struct ChurnFields {
     churn_target: Option<u32>,
     churn_counted: Option<u32>,
     churn_cover_hold: Option<crate::dto::CoverHold>,
+    churn_cover_min: Option<u32>,
+    churn_cover_seen: Option<u64>,
+    churn_spreading: Option<bool>,
 }
 
 fn churn_fields(
@@ -2290,27 +2296,43 @@ fn churn_fields(
     } else {
         None
     };
-    let (churn_phase, churn_error, churn_target, churn_counted, churn_cover_hold) = match job {
-        Some(job) if job.current_output_id == output_id && job.phase.is_active() => (
+    let live = match job {
+        Some(job) if job.current_output_id == output_id && job.phase.is_active() => Some((
             Some(job.phase),
             job.last_error.clone(),
             Some(job.target_depth),
             Some(job.effective_depth),
             job.cover_hold,
-        ),
+            Some(job.cover_min),
+            job.last_cover_count,
+            Some(job.spreading),
+        )),
         Some(job)
             if job.current_output_id == output_id && job.phase == crate::dto::ChurnPhase::Done =>
         {
-            (
+            Some((
                 None,
                 None,
                 Some(job.target_depth),
                 Some(job.effective_depth),
                 None,
-            )
+                None,
+                None,
+                None,
+            ))
         }
-        _ => (None, None, None, None, None),
+        _ => None,
     };
+    let (
+        churn_phase,
+        churn_error,
+        churn_target,
+        churn_counted,
+        churn_cover_hold,
+        churn_cover_min,
+        churn_cover_seen,
+        churn_spreading,
+    ) = live.unwrap_or((None, None, None, None, None, None, None, None));
     ChurnFields {
         from_pegin,
         non_solo_blocks,
@@ -2322,6 +2344,9 @@ fn churn_fields(
         churn_target,
         churn_counted,
         churn_cover_hold,
+        churn_cover_min,
+        churn_cover_seen,
+        churn_spreading,
     }
 }
 
@@ -3266,7 +3291,7 @@ mod churn_field_tests {
     #[test]
     fn active_job_stamps_target_and_counted() {
         let id = output_id();
-        let mut job = churn::new_job(&id, true, 4, 50_000).unwrap();
+        let mut job = churn::new_job(&id, true, 4, 50_000, 2, false).unwrap();
         job.effective_depth = 2;
         job.phase = ChurnPhase::PausedSolo;
         let fields = churn_fields(&id, true, &BTreeMap::new(), Some(&job));
@@ -3279,7 +3304,7 @@ mod churn_field_tests {
     #[test]
     fn finished_job_does_not_stamp_progress() {
         let id = output_id();
-        let mut job = churn::new_job(&id, false, 1, 50_000).unwrap();
+        let mut job = churn::new_job(&id, false, 1, 50_000, 2, false).unwrap();
         job.phase = ChurnPhase::Done;
         job.effective_depth = 1;
         let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));

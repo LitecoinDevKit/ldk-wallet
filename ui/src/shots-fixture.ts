@@ -8,9 +8,9 @@
  * - self-spend: that list, plus one row after a scored hop (shared-block depth)
  * - recovery: no wallet yet, so boot stays on create / restore
  *
- * `cover=no-rpc` or `cover=waiting` marks one private coin as waiting for cover
- * so the live card can be checked without a node. `cover=solo` marks a quiet block.
- * `rpc=1` pretends a Litecoin RPC URL is saved.
+ * `cover=no-rpc`, `cover=waiting`, or `cover=spreading` marks one private coin as
+ * waiting for cover so the live card can be checked without a node. `cover=solo`
+ * marks a quiet block. `rpc=1` pretends a Litecoin RPC URL is saved.
  */
 
 type Scene = "balance" | "coins" | "self-spend" | "recovery";
@@ -111,6 +111,9 @@ type Coin = {
   hops?: { other_kernels: number; other_outputs: number }[];
   churn_phase?: string | null;
   churn_cover_hold?: "no-rpc" | "waiting" | null;
+  churn_cover_min?: number | null;
+  churn_cover_seen?: number | null;
+  churn_spreading?: boolean | null;
   churn_target?: number | null;
   churn_counted?: number | null;
 };
@@ -164,15 +167,23 @@ function privateCoins(): Coin[] {
     tied.churn_counted = 0;
     tied.locked = true;
   } else if (
-    (cover === "no-rpc" || cover === "waiting") &&
+    (cover === "no-rpc" || cover === "waiting" || cover === "spreading") &&
     current !== "recovery" &&
     current !== "balance"
   ) {
     tied.churn_phase = "waiting-for-cover";
-    tied.churn_cover_hold = cover;
+    tied.churn_cover_hold = cover === "no-rpc" ? "no-rpc" : "waiting";
     tied.churn_target = 3;
     tied.churn_counted = 1;
     tied.locked = true;
+    if (cover === "waiting") {
+      tied.churn_cover_min = 2;
+      tied.churn_cover_seen = 1;
+    } else if (cover === "spreading") {
+      tied.churn_cover_min = 2;
+      tied.churn_cover_seen = 3;
+      tied.churn_spreading = true;
+    }
   }
   if (current === "balance") {
     return [
@@ -350,7 +361,18 @@ function litvmHistory() {
   };
 }
 
-const COMMANDS: Record<string, () => unknown> = {
+type Args = Record<string, unknown> | undefined;
+
+/** The sheet's own request, so the preview echoes what the user picked. */
+function churnRequest(args: Args): { cover_min: number; spread_send: boolean } {
+  const req = (args?.req ?? {}) as { cover_min?: number; spread_send?: boolean };
+  return {
+    cover_min: req.cover_min && req.cover_min > 0 ? req.cover_min : 2,
+    spread_send: req.spread_send === true,
+  };
+}
+
+const COMMANDS: Record<string, (args?: Args) => unknown> = {
   wallet_exists: () => scene() !== "recovery",
   wallet_needs_migration: () => false,
   wallet_is_locked: () => false,
@@ -439,7 +461,7 @@ const COMMANDS: Record<string, () => unknown> = {
     },
   ],
   list_mweb_unspent: () => privateCoins(),
-  preview_churn: () => ({
+  preview_churn: (args) => ({
     input_sats: S.p75,
     hop_fee_sats: 50_000,
     resulting_sats: S.p75 - 50_000,
@@ -450,13 +472,14 @@ const COMMANDS: Record<string, () => unknown> = {
     quiet_block_note:
       "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.0005 LTC.",
     has_litecoin_rpc: new URLSearchParams(window.location.search).get("rpc") === "1",
+    ...churnRequest(args),
   }),
   pump_churn_broadcast: () => null,
   default_electrum_urls: () => ["ssl://electrum.example.com:50002"],
 };
 
-export async function shotsInvoke<T>(cmd: string): Promise<T> {
+export async function shotsInvoke<T>(cmd: string, args?: Args): Promise<T> {
   const build = COMMANDS[cmd];
   if (!build) throw new Error(`shots fixture missing command: ${cmd}`);
-  return build() as T;
+  return build(args) as T;
 }

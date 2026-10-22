@@ -1489,6 +1489,7 @@ impl WalletApp {
             job_active,
             target_depth: req.target_depth,
         })?;
+        let cover_min = churn::normalize_cover_min(req.cover_min)?;
         let _ = from_pegin;
         Ok(ChurnPreview {
             input_sats: info.amount,
@@ -1502,6 +1503,8 @@ impl WalletApp {
                 .litecoin_rpc_url
                 .as_deref()
                 .is_some_and(|url| !url.trim().is_empty()),
+            cover_min,
+            spread_send: req.spread_send,
         })
     }
 
@@ -1518,11 +1521,14 @@ impl WalletApp {
             job_active,
             target_depth: req.target_depth,
         })?;
+        let cover_min = churn::normalize_cover_min(req.cover_min)?;
         let mut job = churn::new_job(
             &req.output_id,
             from_pegin || info.is_pegin,
             target,
             DEFAULT_MWEB_FEE_SATS,
+            cover_min,
+            req.spread_send,
         )?;
         prepare_churn(state, &mut job)?;
         let _ = cover_gate(Some(state));
@@ -3428,10 +3434,8 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
         armed_index: 0,
         armed_at_unix: churn::unix_now(),
         armed_height: tip,
-        cover_min: churn::draw_cover_min(),
-        first_look_at: None,
-        delay_until: None,
-        next_look_at: 0,
+        cover_min: job.cover_min,
+        send_after: None,
         own_ids,
         expired: false,
     };
@@ -3452,9 +3456,7 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
     let fee = job.fee_sats;
     let from_pegin = job.from_pegin;
     let tip = state.wallet.latest_checkpoint().height();
-    let cover_min = churn::read_armed(&data_dir)?
-        .map(|record| record.cover_min)
-        .unwrap_or_else(churn::draw_cover_min);
+    let cover_min = job.cover_min;
     let mweb = state
         .mweb
         .as_mut()
@@ -3489,9 +3491,7 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
         armed_at_unix: churn::unix_now(),
         armed_height: tip,
         cover_min,
-        first_look_at: None,
-        delay_until: None,
-        next_look_at: 0,
+        send_after: None,
         own_ids,
         expired: false,
     };
@@ -3675,8 +3675,7 @@ fn send_armed_hop(
             }
             record.own_ids.insert(wtxid);
             record.own_ids.insert(txid);
-            record.first_look_at = None;
-            record.delay_until = None;
+            record.send_after = None;
             churn::write_job(data_dir, job)?;
             churn::write_armed(data_dir, record)?;
             if !local_applied {
@@ -3818,48 +3817,37 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
             return Ok(());
         }
     };
-    let gap = churn::random_look_gap();
-    let delay = churn::random_send_delay();
-    let action = churn::step_cover(
+    job.last_cover_count = Some(count);
+    let step = churn::cover_step(
         churn::unix_now(),
         count,
         record.cover_min,
-        churn::CoverClock {
-            first_look_at: record.first_look_at,
-            delay_until: record.delay_until,
-            next_look_at: record.next_look_at,
-        },
-        gap,
-        delay,
+        job.spread_send,
+        record.send_after,
+        churn::random_spread(),
     );
-    match action {
-        churn::CoverAction::Wait => {
+    match step {
+        churn::CoverStep::Below => {
+            record.send_after = None;
+            job.spreading = false;
             job.cover_hold = Some(CoverHold::Waiting);
             churn::write_job(data_dir, &job)?;
             churn::write_armed(data_dir, &record)?;
         }
-        churn::CoverAction::RecordFirst { next_look_at } => {
-            record.first_look_at = Some(churn::unix_now());
-            record.next_look_at = next_look_at;
+        churn::CoverStep::StartSpread { send_after } => {
+            record.send_after = Some(send_after);
+            job.spreading = true;
             job.cover_hold = Some(CoverHold::Waiting);
             churn::write_job(data_dir, &job)?;
             churn::write_armed(data_dir, &record)?;
         }
-        churn::CoverAction::RecordDelay { delay_until } => {
-            record.delay_until = Some(delay_until);
+        churn::CoverStep::Spreading => {
+            job.spreading = true;
             job.cover_hold = Some(CoverHold::Waiting);
             churn::write_job(data_dir, &job)?;
-            churn::write_armed(data_dir, &record)?;
         }
-        churn::CoverAction::Reset => {
-            record.first_look_at = None;
-            record.delay_until = None;
-            record.next_look_at = 0;
-            job.cover_hold = Some(CoverHold::Waiting);
-            churn::write_job(data_dir, &job)?;
-            churn::write_armed(data_dir, &record)?;
-        }
-        churn::CoverAction::Send => {
+        churn::CoverStep::Send => {
+            job.spreading = false;
             let height = tip.unwrap_or(record.armed_height);
             let _ = send_armed_hop(
                 state,

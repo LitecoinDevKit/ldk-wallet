@@ -8,7 +8,7 @@ type InvokeArgs = Record<string, unknown> | undefined;
 export async function invoke<T>(cmd: string, args?: InvokeArgs): Promise<T> {
   if (shotsRequested() && !inTauri()) {
     const { shotsInvoke } = await import("./shots-fixture");
-    return shotsInvoke<T>(cmd);
+    return shotsInvoke<T>(cmd, args);
   }
   const { invoke: tauriInvoke } = await import("@tauri-apps/api/core");
   return tauriInvoke<T>(cmd, args);

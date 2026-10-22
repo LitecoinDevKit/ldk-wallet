@@ -194,10 +194,7 @@ fn migrate_localhost_only_peers(meta: &mut WalletMeta) -> bool {
         return false;
     }
     let peer = meta.mweb_peers[0].trim();
-    let is_loopback_default = matches!(
-        peer,
-        "127.0.0.1:9333" | "localhost:9333" | "[::1]:9333"
-    );
+    let is_loopback_default = matches!(peer, "127.0.0.1:9333" | "localhost:9333" | "[::1]:9333");
     if !is_loopback_default {
         return false;
     }
@@ -250,6 +247,7 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
         data_dir.join(MWEB_FROZEN_FILE),
         data_dir.join(CHURN_JOB_FILE),
         data_dir.join(CHURN_DEPTH_FILE),
+        data_dir.join(crate::churn::CHURN_ARMED_FILE),
         data_dir.join(CONTACTS_FILE),
         // Legacy Insights LLM key file (feature removed; delete on wipe if present).
         data_dir.join("insights_llm_key.enc"),

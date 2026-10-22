@@ -4,18 +4,43 @@
 //! `app` / `mweb`. A hop counts only when the inclusion block's kernel and
 //! output MMR sizes did not each grow by exactly one.
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{ChurnDepthRecord, ChurnHop, ChurnPhase, ChurnStatus, CHURN_MAX_TARGET};
+use crate::dto::{
+    ChurnDepthRecord, ChurnHop, ChurnPhase, ChurnStatus, CoverHold, CHURN_MAX_TARGET,
+};
 use crate::error::WalletError;
 use crate::mweb_frozen;
 
 pub const CHURN_JOB_FILE: &str = "churn_job.json";
 pub const CHURN_DEPTH_FILE: &str = "churn_depth.json";
+/// Signed hops the broadcaster can send without the seed. Mode `0600`.
+pub const CHURN_ARMED_FILE: &str = "churn_armed.json";
+
+/// A hop may be broadcast for this long after it becomes the armed hop.
+pub const ARMED_EXPIRY_SECS: u64 = 24 * 60 * 60;
+/// Or this many blocks, whichever comes first. About a day of Litecoin blocks.
+pub const ARMED_EXPIRY_BLOCKS: u32 = 576;
+
+/// Inclusive range for the per-job cover minimum.
+pub const COVER_MIN_LOW: u32 = 2;
+pub const COVER_MIN_HIGH: u32 = 5;
+
+const LOOK_GAP_SECS: u64 = 180;
+const LOOK_JITTER_SECS: u64 = 45;
+const SEND_DELAY_MIN_SECS: u64 = 60;
+const SEND_DELAY_MAX_SECS: u64 = 240;
+
+pub const EXPIRED_SPEND: &str = "This signed self-spend expired. Try again to prepare a new one.";
+pub const FOREIGN_SPEND: &str = "This coin was spent by another transaction.";
 
 /// Sizes from one MWEB header.
 ///
@@ -103,6 +128,12 @@ pub struct ChurnJob {
     /// reads some headers and then loses its peer keeps them for the next one.
     #[serde(default)]
     pub header_cache: BTreeMap<u32, MmrSizes>,
+    /// The armed hop must be signed again before it can be broadcast.
+    #[serde(default)]
+    pub needs_resign: bool,
+    /// Why a signed hop is still on disk.
+    #[serde(default)]
+    pub cover_hold: Option<CoverHold>,
 }
 
 fn default_version() -> u32 {
@@ -292,7 +323,7 @@ pub fn check_start(check: &StartCheck) -> Result<u32, WalletError> {
             "This coin is not spendable yet.".into(),
         ));
     }
-    if check.amount_sats <= check.fee_sats {
+    if check.amount_sats <= check.fee_sats.saturating_mul(u64::from(target)) {
         return Err(WalletError::BuildTx(
             "This coin is too small to pay the fee.".into(),
         ));
@@ -324,6 +355,8 @@ pub fn new_job(
         broadcast_height: None,
         last_check: None,
         header_cache: BTreeMap::new(),
+        needs_resign: false,
+        cover_hold: None,
     })
 }
 
@@ -334,8 +367,10 @@ pub const SCORE_WINDOW_CAP: u32 = 576;
 /// treated as not included. One block is the first chance to land.
 pub const INCLUSION_GRACE_BLOCKS: u32 = 6;
 
+/// The hop is signed and the cover gate may look at the mempool.
+/// A resign or a saved error keeps it held.
 pub fn ready_to_broadcast(job: &ChurnJob) -> bool {
-    job.phase == ChurnPhase::WaitingToBroadcast && job.last_error.is_none()
+    job.phase == ChurnPhase::WaitingForCover && job.last_error.is_none() && !job.needs_resign
 }
 
 pub fn grace_elapsed(broadcast_height: u32, tip_height: u32) -> bool {
@@ -350,7 +385,10 @@ pub fn note_broadcast(
     new_output_id: &str,
     broadcast_height: u32,
 ) -> Result<(), WalletError> {
-    if job.phase != ChurnPhase::WaitingToBroadcast {
+    if !matches!(
+        job.phase,
+        ChurnPhase::WaitingForCover | ChurnPhase::WaitingToBroadcast
+    ) {
         return Err(WalletError::BuildTx(
             "This self-spend is not ready to broadcast.".into(),
         ));
@@ -364,6 +402,8 @@ pub fn note_broadcast(
     job.broadcast_height = Some(broadcast_height);
     job.last_check = None;
     job.header_cache.clear();
+    job.cover_hold = None;
+    job.needs_resign = false;
     Ok(())
 }
 
@@ -617,6 +657,7 @@ pub fn note_not_included(job: &mut ChurnJob, restored_output_id: &str) -> Result
     job.broadcast_height = None;
     job.header_cache.clear();
     job.last_error = Some("This spend was not included in a block.".into());
+    job.needs_resign = true;
     job.phase = ChurnPhase::WaitingToBroadcast;
     Ok(())
 }
@@ -679,7 +720,7 @@ pub fn apply_score(job: &mut ChurnJob, score: HopScore) -> Result<(), WalletErro
             job.phase = if job.effective_depth >= job.target_depth {
                 ChurnPhase::Done
             } else {
-                ChurnPhase::WaitingToBroadcast
+                ChurnPhase::WaitingForCover
             };
         }
     }
@@ -729,9 +770,18 @@ pub fn request_retry(job: &mut ChurnJob) -> Result<(), WalletError> {
             job.last_error = None;
             Ok(())
         }
-        ChurnPhase::PausedSolo | ChurnPhase::WaitingToBroadcast => {
-            job.phase = ChurnPhase::WaitingToBroadcast;
+        ChurnPhase::PausedSolo => {
+            // The prepared chain is used up. The next hop is a new signature.
+            job.needs_resign = true;
+            job.phase = ChurnPhase::WaitingForCover;
             job.last_error = None;
+            job.cover_hold = None;
+            Ok(())
+        }
+        ChurnPhase::WaitingToBroadcast | ChurnPhase::WaitingForCover => {
+            job.last_error = None;
+            job.cover_hold = None;
+            job.phase = ChurnPhase::WaitingForCover;
             Ok(())
         }
         _ => Err(WalletError::BuildTx(
@@ -751,8 +801,7 @@ pub fn request_cancel(job: &mut ChurnJob) -> Result<(), WalletError> {
     // not-included recovery path instead.
     if job.phase == ChurnPhase::WaitingConfirm {
         return Err(WalletError::BuildTx(
-            "This self-spend is already on the network. Wait for the next block."
-                .into(),
+            "This self-spend is already on the network. Wait for the next block.".into(),
         ));
     }
     job.phase = ChurnPhase::Cancelled;
@@ -770,6 +819,7 @@ pub fn status_view(job: &ChurnJob) -> ChurnStatus {
         last_other_kernels: job.last_other_kernels,
         last_other_outputs: job.last_other_outputs,
         last_error: job.last_error.clone(),
+        cover_hold: job.cover_hold,
     }
 }
 
@@ -784,9 +834,283 @@ pub fn annotations(
     Ok((map, read_job(data_dir)?))
 }
 
+/// What to do after a hop is scored, given whether another signed hop is on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreFollow {
+    /// Leave the phase `apply_score` chose.
+    Stay,
+    /// A quiet or mixed block still has a prepared hop. Arm it.
+    ArmNext,
+    /// The prepared chain is used up before the target count.
+    FinishShort,
+}
+
+/// A mixed hop below the target asks for another broadcast. A solo hop pauses
+/// unless a signed hop is already waiting. Neither path signs a replacement.
+pub fn follow_score(phase: ChurnPhase, hops_remaining: bool) -> ScoreFollow {
+    match (phase, hops_remaining) {
+        (ChurnPhase::WaitingForCover, true) | (ChurnPhase::PausedSolo, true) => {
+            ScoreFollow::ArmNext
+        }
+        (ChurnPhase::WaitingForCover, false) => ScoreFollow::FinishShort,
+        _ => ScoreFollow::Stay,
+    }
+}
+
+/// Clear the in-flight hop so the next signed spend can be scored on its own.
+pub fn mark_waiting_for_cover(job: &mut ChurnJob) {
+    job.phase = ChurnPhase::WaitingForCover;
+    job.pending_wtxid = None;
+    job.broadcast_height = None;
+    job.last_check = None;
+    job.last_error = None;
+    job.cover_hold = None;
+    job.needs_resign = false;
+    job.header_cache.clear();
+}
+
+pub fn finish_chain(job: &mut ChurnJob) {
+    job.phase = ChurnPhase::Done;
+    job.cover_hold = None;
+    job.needs_resign = false;
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub fn draw_cover_min() -> u32 {
+    rand::thread_rng().gen_range(COVER_MIN_LOW..=COVER_MIN_HIGH)
+}
+
+pub fn random_look_gap() -> u64 {
+    let jitter: i64 =
+        rand::thread_rng().gen_range(-(LOOK_JITTER_SECS as i64)..=LOOK_JITTER_SECS as i64);
+    (LOOK_GAP_SECS as i64 + jitter) as u64
+}
+
+pub fn random_send_delay() -> u64 {
+    rand::thread_rng().gen_range(SEND_DELAY_MIN_SECS..=SEND_DELAY_MAX_SECS)
+}
+
+pub fn armed_expired(armed_at: u64, armed_height: u32, now: u64, tip: Option<u32>) -> bool {
+    if now.saturating_sub(armed_at) >= ARMED_EXPIRY_SECS {
+        return true;
+    }
+    match tip {
+        Some(tip) => tip.saturating_sub(armed_height) >= ARMED_EXPIRY_BLOCKS,
+        None => false,
+    }
+}
+
+/// One signed self-spend. Raw transaction bytes live only in this file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArmedHop {
+    pub raw_hex: String,
+    pub txid: String,
+    pub wtxid: String,
+    pub spent_output_id: String,
+    pub created_output_id: String,
+    pub receive_index: u32,
+    pub fee_sats: u64,
+    #[serde(default)]
+    pub local_applied: bool,
+    #[serde(default)]
+    pub broadcast: bool,
+    /// Spend secrets for the created output, inserted into the coin db at broadcast.
+    #[serde(default)]
+    pub created_coin: Option<serde_json::Value>,
+}
+
+/// The chain prepared while the wallet was unlocked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArmedRecord {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub hops: Vec<ArmedHop>,
+    pub armed_index: u32,
+    pub armed_at_unix: u64,
+    pub armed_height: u32,
+    pub cover_min: u32,
+    #[serde(default)]
+    pub first_look_at: Option<u64>,
+    #[serde(default)]
+    pub delay_until: Option<u64>,
+    #[serde(default)]
+    pub next_look_at: u64,
+    #[serde(default)]
+    pub own_ids: BTreeSet<String>,
+    /// Raw transactions were deleted. Unlock still needs the wtxid to undo a local mark.
+    #[serde(default)]
+    pub expired: bool,
+}
+
+impl ArmedRecord {
+    pub fn current(&self) -> Option<&ArmedHop> {
+        self.hops.get(self.armed_index as usize)
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut ArmedHop> {
+        self.hops.get_mut(self.armed_index as usize)
+    }
+
+    /// Another signed hop exists after the one in flight.
+    pub fn hops_remaining(&self) -> bool {
+        let next = self.armed_index.saturating_add(1) as usize;
+        self.hops
+            .get(next)
+            .is_some_and(|hop| !hop.broadcast && !hop.raw_hex.is_empty())
+    }
+}
+
+/// Drop the raw transaction and the created-coin secrets from this hop onward.
+pub fn wipe_raw_tail(record: &mut ArmedRecord) {
+    let start = record.armed_index as usize;
+    for hop in record.hops.iter_mut().skip(start) {
+        if hop.broadcast {
+            continue;
+        }
+        hop.raw_hex.clear();
+        hop.created_coin = None;
+    }
+    record.expired = true;
+    record.first_look_at = None;
+    record.delay_until = None;
+}
+
+pub fn arm_next(record: &mut ArmedRecord, now: u64, height: u32) -> bool {
+    if !record.hops_remaining() {
+        return false;
+    }
+    record.armed_index = record.armed_index.saturating_add(1);
+    record.armed_at_unix = now;
+    record.armed_height = height;
+    record.first_look_at = None;
+    record.delay_until = None;
+    record.next_look_at = 0;
+    record.expired = false;
+    true
+}
+
+/// Ids this wallet must not count as cover: unconfirmed history plus every hop.
+pub fn snapshot_own_ids(
+    unconfirmed: impl IntoIterator<Item = String>,
+    hops: &[ArmedHop],
+) -> BTreeSet<String> {
+    let mut ids: BTreeSet<String> = unconfirmed.into_iter().collect();
+    for hop in hops {
+        if !hop.txid.is_empty() {
+            ids.insert(hop.txid.clone());
+        }
+        if !hop.wtxid.is_empty() {
+            ids.insert(hop.wtxid.clone());
+        }
+    }
+    ids
+}
+
+pub fn is_foreign_id(txid: &str, wtxid: &str, own: &BTreeSet<String>) -> bool {
+    !own.contains(txid) && !own.contains(wtxid)
+}
+
+/// Two-look clock stored on the armed record.
+#[derive(Debug, Clone, Copy)]
+pub struct CoverClock {
+    pub first_look_at: Option<u64>,
+    pub delay_until: Option<u64>,
+    pub next_look_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverAction {
+    Wait,
+    RecordFirst { next_look_at: u64 },
+    RecordDelay { delay_until: u64 },
+    Send,
+    Reset,
+}
+
+/// Advance the mempool gate. `gap_secs` and `delay_secs` are chosen by the caller
+/// so a test can pin them. A count below the minimum clears a streak in progress.
+pub fn step_cover(
+    now: u64,
+    count: u64,
+    minimum: u32,
+    clock: CoverClock,
+    gap_secs: u64,
+    delay_secs: u64,
+) -> CoverAction {
+    if count < u64::from(minimum) {
+        return if clock.first_look_at.is_some() || clock.delay_until.is_some() {
+            CoverAction::Reset
+        } else {
+            CoverAction::Wait
+        };
+    }
+    if clock.first_look_at.is_none() {
+        return CoverAction::RecordFirst {
+            next_look_at: now.saturating_add(gap_secs),
+        };
+    }
+    if now < clock.next_look_at {
+        return CoverAction::Wait;
+    }
+    match clock.delay_until {
+        None => CoverAction::RecordDelay {
+            delay_until: now.saturating_add(delay_secs),
+        },
+        Some(until) if now < until => CoverAction::Wait,
+        Some(_) => CoverAction::Send,
+    }
+}
+
+pub fn armed_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CHURN_ARMED_FILE)
+}
+
+pub fn read_armed(data_dir: &Path) -> Result<Option<ArmedRecord>, WalletError> {
+    let path = armed_path(data_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read_to_string(&path).map_err(WalletError::Io)?;
+    serde_json::from_str(&bytes).map_err(|e| WalletError::Meta(e.to_string()))
+}
+
+pub fn write_armed(data_dir: &Path, record: &ArmedRecord) -> Result<(), WalletError> {
+    fs::create_dir_all(data_dir)?;
+    let json =
+        serde_json::to_string_pretty(record).map_err(|e| WalletError::Meta(e.to_string()))?;
+    let path = armed_path(data_dir);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(WalletError::Io)?;
+    file.write_all(json.as_bytes()).map_err(WalletError::Io)?;
+    let mut perms = file.metadata().map_err(WalletError::Io)?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+    fs::set_permissions(&path, perms).map_err(WalletError::Io)?;
+    Ok(())
+}
+
+pub fn remove_armed(data_dir: &Path) -> Result<(), WalletError> {
+    match fs::remove_file(armed_path(data_dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(WalletError::Io(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn sizes(kernel: u64, output: u64) -> MmrSizes {
@@ -876,7 +1200,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(job.phase, ChurnPhase::WaitingToBroadcast);
+        assert_eq!(job.phase, ChurnPhase::WaitingForCover);
         assert_eq!(job.effective_depth, 1);
         assert!(ready_to_broadcast(&job));
         assert_eq!(job.last_other_kernels, Some(1));
@@ -1233,6 +1557,149 @@ mod tests {
         assert!(job.pending_wtxid.is_none());
         assert!(!ready_to_broadcast(&job));
         request_retry(&mut job).unwrap();
-        assert!(ready_to_broadcast(&job));
+        assert!(job.needs_resign);
+        assert!(!ready_to_broadcast(&job));
+    }
+
+    fn clock(first: Option<u64>, delay: Option<u64>, next: u64) -> CoverClock {
+        CoverClock {
+            first_look_at: first,
+            delay_until: delay,
+            next_look_at: next,
+        }
+    }
+
+    #[test]
+    fn cover_gate_needs_two_looks_and_a_delay() {
+        let open = clock(None, None, 0);
+        assert_eq!(
+            step_cover(1_000, 3, 2, open, 180, 60),
+            CoverAction::RecordFirst {
+                next_look_at: 1_180
+            }
+        );
+        let held = clock(Some(1_000), None, 1_180);
+        assert_eq!(step_cover(1_100, 3, 2, held, 180, 60), CoverAction::Wait);
+        assert_eq!(
+            step_cover(1_180, 3, 2, held, 180, 60),
+            CoverAction::RecordDelay { delay_until: 1_240 }
+        );
+        let delaying = clock(Some(1_000), Some(1_240), 1_180);
+        assert_eq!(
+            step_cover(1_200, 3, 2, delaying, 180, 60),
+            CoverAction::Wait
+        );
+        assert_eq!(
+            step_cover(1_240, 3, 2, delaying, 180, 60),
+            CoverAction::Send
+        );
+    }
+
+    #[test]
+    fn cover_gate_resets_when_the_count_drops() {
+        let held = clock(Some(1_000), None, 1_180);
+        assert_eq!(step_cover(1_180, 1, 2, held, 180, 60), CoverAction::Reset);
+        let quiet = clock(None, None, 0);
+        assert_eq!(step_cover(1_180, 0, 2, quiet, 180, 60), CoverAction::Wait);
+    }
+
+    #[test]
+    fn own_ids_are_not_foreign_cover() {
+        let mut own = BTreeSet::new();
+        own.insert("txid".into());
+        own.insert("wtxid".into());
+        assert!(!is_foreign_id("txid", "other", &own));
+        assert!(!is_foreign_id("other", "wtxid", &own));
+        assert!(is_foreign_id("someone", "else", &own));
+    }
+
+    #[test]
+    fn expiry_is_a_day_or_576_blocks() {
+        assert!(!armed_expired(0, 100, ARMED_EXPIRY_SECS - 1, Some(100)));
+        assert!(armed_expired(0, 100, ARMED_EXPIRY_SECS, None));
+        assert!(armed_expired(0, 100, 10, Some(100 + ARMED_EXPIRY_BLOCKS)));
+        assert!(!armed_expired(
+            0,
+            100,
+            10,
+            Some(100 + ARMED_EXPIRY_BLOCKS - 1)
+        ));
+    }
+
+    #[test]
+    fn solo_with_another_signed_hop_arms_it() {
+        assert_eq!(
+            follow_score(ChurnPhase::PausedSolo, true),
+            ScoreFollow::ArmNext
+        );
+        assert_eq!(
+            follow_score(ChurnPhase::PausedSolo, false),
+            ScoreFollow::Stay
+        );
+        assert_eq!(
+            follow_score(ChurnPhase::WaitingForCover, true),
+            ScoreFollow::ArmNext
+        );
+        assert_eq!(
+            follow_score(ChurnPhase::WaitingForCover, false),
+            ScoreFollow::FinishShort
+        );
+        assert_eq!(follow_score(ChurnPhase::Done, true), ScoreFollow::Stay);
+    }
+
+    #[test]
+    fn armed_file_is_owner_readable_only() {
+        let dir = tempdir().unwrap();
+        let hop = ArmedHop {
+            raw_hex: "aa".into(),
+            txid: "txid".into(),
+            wtxid: "wtxid".into(),
+            spent_output_id: "ab".repeat(32),
+            created_output_id: "cd".repeat(32),
+            receive_index: 4,
+            fee_sats: 50_000,
+            local_applied: false,
+            broadcast: false,
+            created_coin: None,
+        };
+        let mut record = ArmedRecord {
+            version: 1,
+            hops: vec![hop],
+            armed_index: 0,
+            armed_at_unix: 10,
+            armed_height: 20,
+            cover_min: 3,
+            first_look_at: None,
+            delay_until: None,
+            next_look_at: 0,
+            own_ids: BTreeSet::new(),
+            expired: false,
+        };
+        write_armed(dir.path(), &record).unwrap();
+        let mode = fs::metadata(armed_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        record.hops.push(ArmedHop {
+            raw_hex: "bb".into(),
+            txid: "t2".into(),
+            wtxid: "w2".into(),
+            spent_output_id: "cd".repeat(32),
+            created_output_id: "ef".repeat(32),
+            receive_index: 5,
+            fee_sats: 50_000,
+            local_applied: false,
+            broadcast: false,
+            created_coin: None,
+        });
+        assert!(record.hops_remaining());
+        assert!(arm_next(&mut record, 99, 30));
+        assert_eq!(record.armed_index, 1);
+        assert_eq!(record.armed_at_unix, 99);
+        wipe_raw_tail(&mut record);
+        assert!(record.expired);
+        assert!(record.hops[1].raw_hex.is_empty());
+        assert!(!record.hops[1].broadcast);
     }
 }

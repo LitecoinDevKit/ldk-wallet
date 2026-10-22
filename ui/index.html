@@ -1441,8 +1441,10 @@
                   placeholder="http://127.0.0.1:9332"
                 />
                 <span class="hint">
-                  Optional for transparent sends. Required fallback for pure MWEB broadcast when
-                  P2P peers cannot accept the transaction.
+                  A self-spend reads the mempool through this URL and will not be sent without it.
+                  Use a litecoind you can log into: this Mac, or another machine with the RPC
+                  username and password in the URL. Ordinary sends do not need it. Pure MWEB
+                  sends use it when peers cannot take the transaction.
                 </span>
               </label>
               <label class="field">

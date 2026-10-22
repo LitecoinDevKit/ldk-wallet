@@ -747,6 +747,9 @@ pub struct MwebUtxoRecord {
     /// Non-solo blocks this job has already counted.
     #[serde(default)]
     pub churn_counted: Option<u32>,
+    /// Set while the live hop is signed and waiting to broadcast.
+    #[serde(default)]
+    pub churn_cover_hold: Option<CoverHold>,
 }
 
 /// One output in a split plan (change is flagged).
@@ -804,14 +807,38 @@ pub const CHURN_MAX_TARGET: u32 = 10;
 /// Confirm-sheet sentence: depth does not hide the implied amount.
 pub const CHURN_AMOUNT_NOTE: &str = "This subtracts the public fee. The resulting amount is still determined by where this coin started.";
 
-/// Confirm-sheet sentence: a quiet block pauses and does not retry.
-pub const CHURN_QUIET_NOTE: &str = "A block that only contains this spend does not count, and this wallet will not try again by itself.";
+/// Confirm-sheet sentence for one hop: a quiet block pauses, and retrying signs a new hop.
+pub const CHURN_QUIET_NOTE: &str = "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.0005 LTC.";
+
+/// Confirm-sheet sentence when more than one hop is prepared.
+pub const CHURN_QUIET_CHAIN_NOTE: &str = "A block that only contains this spend does not count. The next prepared spend waits until other private transactions are available.";
+
+/// One hop pauses for a click. A longer run keeps the next prepared spend armed.
+pub fn quiet_block_note(target_depth: u32) -> &'static str {
+    if target_depth <= 1 {
+        CHURN_QUIET_NOTE
+    } else {
+        CHURN_QUIET_CHAIN_NOTE
+    }
+}
+
+/// Why a signed self-spend is still on disk.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoverHold {
+    /// No Litecoin RPC URL, so the mempool cannot be read.
+    NoRpc,
+    /// The node is configured. The hop is waiting for other MWEB transactions.
+    Waiting,
+}
 
 /// Live self-spend job phase.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChurnPhase {
     WaitingToBroadcast,
+    /// Signed, not yet broadcast. The mempool gate decides when it goes out.
+    WaitingForCover,
     WaitingConfirm,
     PausedSolo,
     PausedUnscored,
@@ -824,6 +851,7 @@ impl ChurnPhase {
         matches!(
             self,
             Self::WaitingToBroadcast
+                | Self::WaitingForCover
                 | Self::WaitingConfirm
                 | Self::PausedSolo
                 | Self::PausedUnscored
@@ -853,6 +881,8 @@ pub struct ChurnPreview {
     pub total_fee_sats: u64,
     pub amount_note: String,
     pub quiet_block_note: String,
+    /// The loaded wallet has a non-empty Litecoin RPC URL, the same one the cover gate uses.
+    pub has_litecoin_rpc: bool,
 }
 
 /// What the Coins screen needs while a job exists, including after it finishes.
@@ -870,6 +900,9 @@ pub struct ChurnStatus {
     pub last_other_outputs: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Why a `waiting-for-cover` hop has not been sent. Absent after broadcast.
+    #[serde(default)]
+    pub cover_hold: Option<CoverHold>,
 }
 
 /// Other kernels and outputs in one counted block.

@@ -27,6 +27,28 @@ pub fn get_raw_transaction_hex(rpc_url: &str, txid: &str) -> Result<String, Wall
         .ok_or_else(|| WalletError::Rpc("missing result from getrawtransaction".into()))
 }
 
+/// Transaction ids currently in the node mempool.
+pub fn get_raw_mempool(rpc_url: &str) -> Result<Vec<String>, WalletError> {
+    let value = rpc_call(rpc_url, "getrawmempool", json!([false]))?;
+    value
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|id| id.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .ok_or_else(|| WalletError::Rpc("missing result from getrawmempool".into()))
+}
+
+/// Current chain tip height from litecoind `getblockcount`.
+pub fn get_block_count(rpc_url: &str) -> Result<u32, WalletError> {
+    let value = rpc_call(rpc_url, "getblockcount", json!([]))?;
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| WalletError::Rpc("missing result from getblockcount".into()))
+}
+
 fn rpc_call(
     rpc_url: &str,
     method: &str,

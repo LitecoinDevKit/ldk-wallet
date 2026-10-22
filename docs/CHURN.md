@@ -8,9 +8,15 @@ Cut-through does not hide a same-block intermediate. LIP-0004 §6 keeps the spen
 
 One coin, one job. Each hop is a 1-in-1 spend to a fresh address of this wallet. The fee is the public kernel fee (0.0005 LTC). The coin stays frozen until the job is cancelled or finished, so Send, Swap, and Split cannot take it.
 
-The default is one hop. A collapsed control can ask for up to 10 non-solo blocks. A quiet block pauses the job. It does not retry by itself.
+The default is one hop. A collapsed control can ask for up to 10 non-solo blocks. While the wallet is unlocked the wallet signs that many hops and reserves a receive index for each one. It does not rewind those indexes if the job is cancelled or the signature expires. Only the first hop is applied to the coin list. The rest stay in `churn_armed.json` (mode `0600`) until each previous hop is scored. That file is not part of the metadata export.
 
-Cancel is only offered after a quiet-block / unscored pause, or when the hop could not be sent. It is not offered while Sending or Waiting: once broadcast, the hop is on the network and cannot be unbroadcast. An unconfirmed self-spend output shows as Pending (not Maturing — that label is for peg-in maturity).
+A hop is broadcast only when a Litecoin RPC URL is set and the node's mempool has enough other MWEB transactions. The minimum is drawn once per job from 2 to 5. The count has to hold on two looks about three minutes apart, with up to 45 seconds of jitter, and then for another 1–4 minutes. Transactions this wallet already has unconfirmed, including earlier hops in this chain, are not cover. Without an RPC URL the card says it is waiting for a Litecoin node, a smaller line says to save a Litecoin RPC URL in Settings → Connection, and Open Settings focuses that field. Nothing is sent. With a node, the card says it is waiting for other private transactions.
+
+The signed hop can be broadcast while the wallet is locked. Scoring still waits until the next unlock. A hop expires 24 hours or 576 blocks after it becomes the armed hop, whichever comes first. The raw transaction is then deleted. On the next unlock the wallet checks that the input is still unspent, or spent only by this job's own mark.
+
+A quiet block does not count. If another signed hop remains, it is armed and waits for cover again. The wallet does not sign a replacement, so the fee stays within `target_depth` times the hop fee. If quiet blocks use up the chain before the target count, the job finishes and says how many blocks counted. A one-hop job still pauses. Try again signs one new hop and spends another fee, and only while the wallet is unlocked.
+
+Cancel is offered while a hop is waiting for cover, after a quiet-block or unscored pause, or when the hop could not be sent. It is not offered while the hop is already on the network. An unconfirmed self-spend output shows as Pending (not Maturing — that label is for peg-in maturity).
 
 A hop counts when the inclusion block was not ours alone. For this 1-in-1, that is when the inclusion header's `kernel_mmr_size` is more than 1 or `output_mmr_size` grew by more than 1 from the parent header. The kernel field is the block's own kernel count; litecoind rebuilds the kernel MMR every block, so it is never compared with the parent. Header sizes cannot tell a peg-in from a private spend. The row says how many other kernels and outputs were in the block, and that peg-ins and peg-outs in that count publish an amount.
 
@@ -23,9 +29,11 @@ Depth is local. Spent outputs leave the UTXO set, so a restore cannot reconstruc
 ## Copy
 
 - Button: "Spend to self." History: "self-spend." The amount on that row is the fee.
-- Confirm sheet order: what the spend does, the fee for this hop, the amount line, then the quiet-block sentence. Do not lead with a stepper.
-- After a hop, the main line is "This block only contained your spend." or "This block also had N other kernels and M other outputs." The count of blocks is the smaller line.
-- A quiet block stays on the row. A block the wallet could not read yet stays waiting there too. They are not error toasts.
+- Confirm sheet order: what the spend does, then the wait, the fee for this hop, the amount line, the quiet-block sentence, then "A chain of self-spends is still a recognizable 1-in-1 pattern. It does not create a larger anonymity set." With a saved Litecoin RPC URL the wait says the hop will not be sent until other private transactions appear in the mempool, and that can take a long time. With no URL it says the hop will be signed now and will not be sent until a Litecoin RPC URL is saved in Settings → Connection, then it waits for other private transactions. Do not lead with a stepper.
+- A one-hop quiet-block sentence also says pressing Try again later signs a new hop and spends another 0.0005 LTC. A longer run still says the next prepared spend waits for other private transactions.
+- After a hop, the main line is "This block only contained your spend." or "This block also had N other kernels and M other outputs." A quiet block adds "Signing a new hop spends another 0.0005 LTC." The count of blocks is the smaller line.
+- A quiet block stays on the row when no signed hop remains. When one does, the card waits for other private transactions instead. A block the wallet could not read yet stays waiting there too. They are not error toasts.
+- While a signed hop is waiting, the card says "Waiting for a Litecoin node." or "Waiting for other private transactions." With no URL, a smaller line says "Save a Litecoin RPC URL in Settings → Connection." and Open Settings focuses that field. Cancel stays. "Waiting for the next block." is only after the hop has been broadcast.
 - Balance shows one dismissible line when a spendable peg-in coin has never shared a block. It opens Coins. It is not a second maturity warning.
 
 No privacy meter, no automatic start after peg-in, and no "safe to peg out" state.

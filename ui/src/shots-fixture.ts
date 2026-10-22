@@ -7,6 +7,10 @@
  * - coins: Private list with frozen, labeled, maturing, and peg-in-tied rows
  * - self-spend: that list, plus one row after a scored hop (shared-block depth)
  * - recovery: no wallet yet, so boot stays on create / restore
+ *
+ * `cover=no-rpc` or `cover=waiting` marks one private coin as waiting for cover
+ * so the live card can be checked without a node. `cover=solo` marks a quiet block.
+ * `rpc=1` pretends a Litecoin RPC URL is saved.
  */
 
 type Scene = "balance" | "coins" | "self-spend" | "recovery";
@@ -106,6 +110,9 @@ type Coin = {
   last_other_outputs?: number | null;
   hops?: { other_kernels: number; other_outputs: number }[];
   churn_phase?: string | null;
+  churn_cover_hold?: "no-rpc" | "waiting" | null;
+  churn_target?: number | null;
+  churn_counted?: number | null;
 };
 
 function quietCoin(partial: Coin): Coin {
@@ -150,6 +157,23 @@ function privateCoins(): Coin[] {
     label: "From peg-in",
   };
   const current = scene();
+  const cover = new URLSearchParams(window.location.search).get("cover");
+  if (cover === "solo" && current !== "recovery" && current !== "balance") {
+    tied.churn_phase = "paused-solo";
+    tied.churn_target = 1;
+    tied.churn_counted = 0;
+    tied.locked = true;
+  } else if (
+    (cover === "no-rpc" || cover === "waiting") &&
+    current !== "recovery" &&
+    current !== "balance"
+  ) {
+    tied.churn_phase = "waiting-for-cover";
+    tied.churn_cover_hold = cover;
+    tied.churn_target = 3;
+    tied.churn_counted = 1;
+    tied.locked = true;
+  }
   if (current === "balance") {
     return [
       quietCoin({
@@ -223,7 +247,9 @@ function settings() {
     electrum_use_public_fallback: true,
     auto_lock_minutes: 15,
     electrum_active_url: "ssl://electrum.example.com:50002",
-    litecoin_rpc_url: null,
+    litecoin_rpc_url: new URLSearchParams(window.location.search).get("rpc") === "1"
+      ? "http://127.0.0.1:9332"
+      : null,
     mweb_peers: ["peer.example.com:9333"],
     mweb_scheme: "litecoin-core",
     explorer_base_url: "https://litview.space",
@@ -413,6 +439,19 @@ const COMMANDS: Record<string, () => unknown> = {
     },
   ],
   list_mweb_unspent: () => privateCoins(),
+  preview_churn: () => ({
+    input_sats: S.p75,
+    hop_fee_sats: 50_000,
+    resulting_sats: S.p75 - 50_000,
+    target_depth: 1,
+    total_fee_sats: 50_000,
+    amount_note:
+      "This subtracts the public fee. The resulting amount is still determined by where this coin started.",
+    quiet_block_note:
+      "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.0005 LTC.",
+    has_litecoin_rpc: new URLSearchParams(window.location.search).get("rpc") === "1",
+  }),
+  pump_churn_broadcast: () => null,
   default_electrum_urls: () => ["ssl://electrum.example.com:50002"],
 };
 

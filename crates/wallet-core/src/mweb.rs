@@ -21,9 +21,9 @@ use bdk_mweb::pmmr::verify_leafset;
 use bdk_mweb::tx_builder::CHANGE_ADDRESS_INDEX;
 use bdk_mweb::MwebCoinDatabase;
 use bdk_mweb::{AddressBook, BanReason, ChangeSet, SealContext, MWEB_PEGIN_MATURITY};
-use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
+use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bdk_wallet::bitcoin::key::Secp256k1;
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use bdk_wallet::chain::Merge;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{
@@ -2055,7 +2055,9 @@ fn broadcast_mweb_tx(
     };
     match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
         Ok(_) => {
-            crate::diag::log(format!("MWEB broadcast: fell back to litecoind RPC ({p2p_err})"));
+            crate::diag::log(format!(
+                "MWEB broadcast: fell back to litecoind RPC ({p2p_err})"
+            ));
             Ok(())
         }
         Err(rpc_err) => Err(WalletError::Mweb(format!(
@@ -2083,9 +2085,7 @@ fn broadcast_via_p2p(
         match TcpMwebPeer::connect(addr, bdk_net) {
             Ok(mut peer) => match peer.broadcast_tx(tx) {
                 Ok(BroadcastAck::Confirmed) => {
-                    crate::diag::log(format!(
-                        "MWEB broadcast: {addr} accepted the transaction"
-                    ));
+                    crate::diag::log(format!("MWEB broadcast: {addr} accepted the transaction"));
                     return Ok(());
                 }
                 Ok(BroadcastAck::Sent) => {
@@ -2249,6 +2249,7 @@ pub fn list_mweb_unspent(
                 churn_error: fields.churn_error,
                 churn_target: fields.churn_target,
                 churn_counted: fields.churn_counted,
+                churn_cover_hold: fields.churn_cover_hold,
             }
         })
         .collect();
@@ -2271,6 +2272,7 @@ struct ChurnFields {
     churn_error: Option<String>,
     churn_target: Option<u32>,
     churn_counted: Option<u32>,
+    churn_cover_hold: Option<crate::dto::CoverHold>,
 }
 
 fn churn_fields(
@@ -2288,14 +2290,26 @@ fn churn_fields(
     } else {
         None
     };
-    let (churn_phase, churn_error, churn_target, churn_counted) = match job {
+    let (churn_phase, churn_error, churn_target, churn_counted, churn_cover_hold) = match job {
         Some(job) if job.current_output_id == output_id && job.phase.is_active() => (
             Some(job.phase),
             job.last_error.clone(),
             Some(job.target_depth),
             Some(job.effective_depth),
+            job.cover_hold,
         ),
-        _ => (None, None, None, None),
+        Some(job)
+            if job.current_output_id == output_id && job.phase == crate::dto::ChurnPhase::Done =>
+        {
+            (
+                None,
+                None,
+                Some(job.target_depth),
+                Some(job.effective_depth),
+                None,
+            )
+        }
+        _ => (None, None, None, None, None),
     };
     ChurnFields {
         from_pegin,
@@ -2307,6 +2321,7 @@ fn churn_fields(
         churn_error,
         churn_target,
         churn_counted,
+        churn_cover_hold,
     }
 }
 
@@ -2836,93 +2851,217 @@ pub fn mweb_split(
     })
 }
 
-/// 1-in-1 self-spend of one coin, including when the churn job has frozen it.
-pub struct SelfSpendResult {
+/// One signed 1-in-1 self-spend, not yet broadcast.
+#[derive(Clone)]
+pub struct PreparedHop {
+    pub raw_hex: String,
+    pub txid: String,
     pub wtxid: String,
-    pub output_id: String,
+    pub spent_output_id: String,
+    pub created_output_id: String,
+    pub receive_index: u32,
+    pub fee_sats: u64,
+    pub created: bdk_mweb::MwebCoin,
 }
 
-pub fn mweb_self_spend(
+/// Sign `hops` dependent self-spends. The receive index advances and is persisted
+/// before the function returns, including when a later hop fails to build.
+pub fn sign_self_spend_hops(
     wallet: &PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
     data_dir: &Path,
-    rpc_url: Option<&str>,
-    peers: &[String],
-    output_id_hex: &str,
+    mut coin: bdk_mweb::MwebCoin,
+    hops: u32,
     fee_sats: u64,
     network: WalletNetwork,
-) -> Result<SelfSpendResult, WalletError> {
-    let tip = wallet.latest_checkpoint().height();
-    let mut frozen = mweb_frozen::read_ids(data_dir)?.ids;
-    if let Ok(id) = mweb_frozen::normalize_output_id(output_id_hex) {
-        frozen.remove(&id);
-    }
-    let coin = select_mweb_coin(
-        runtime.store.db(),
-        output_id_hex,
-        tip,
-        &frozen,
-        "spending to self",
-    )?;
-    if coin.amount <= fee_sats {
+) -> Result<Vec<PreparedHop>, WalletError> {
+    if hops == 0 {
         return Err(WalletError::BuildTx(
-            "This coin is too small to pay the fee.".into(),
+            "Choose at least one self-spend.".into(),
         ));
     }
-    let amount = coin.amount - fee_sats;
     let kind = match network {
         WalletNetwork::Mainnet => NetworkKind::Main,
         WalletNetwork::Testnet => NetworkKind::Test,
     };
-    let index = runtime.receive_index;
-    let addr = runtime
-        .keys
-        .address(index, kind, &runtime.secp)
-        .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    runtime.receive_index = index.saturating_add(1);
+    let start = runtime.receive_index;
+    runtime.receive_index = start.saturating_add(hops);
     runtime.persist(data_dir)?;
 
-    let mut funded = bdk_mweb::fund_mweb_spend(
-        vec![coin],
-        vec![(addr, amount)],
-        vec![],
-        fee_sats,
-        &runtime.keys,
-        CHANGE_ADDRESS_INDEX,
-        kind,
-        &runtime.secp,
-    )
-    .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    if funded.spent_coins.len() != 1 || funded.staged_outputs.len() != 1 {
-        return Err(WalletError::BuildTx(
-            "A self-spend must spend one coin and create one output.".into(),
-        ));
-    }
-    let spent_ids: Vec<_> = funded.spent_coins.iter().map(|c| c.output_id).collect();
-    let (tx, _change) = wallet
-        .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
+    let mut prepared = Vec::with_capacity(hops as usize);
+    for offset in 0..hops {
+        if coin.amount <= fee_sats {
+            return Err(WalletError::BuildTx(
+                "This coin is too small to pay the fee.".into(),
+            ));
+        }
+        let index = start.saturating_add(offset);
+        let amount = coin.amount - fee_sats;
+        let spent_output_id = hex::encode(coin.output_id);
+        let addr = runtime
+            .keys
+            .address(index, kind, &runtime.secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        let mut funded = bdk_mweb::fund_mweb_spend(
+            vec![coin],
+            vec![(addr, amount)],
+            vec![],
+            fee_sats,
+            &runtime.keys,
+            CHANGE_ADDRESS_INDEX,
+            kind,
+            &runtime.secp,
+        )
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
-    let wtxid = tx.compute_wtxid().to_string();
-    for id in &spent_ids {
-        let _ = runtime.store.db_mut().mark_spent(id);
+        if funded.spent_coins.len() != 1 || funded.staged_outputs.len() != 1 {
+            return Err(WalletError::BuildTx(
+                "A self-spend must spend one coin and create one output.".into(),
+            ));
+        }
+        let (tx, _change) = wallet
+            .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        let staged = &funded.staged_outputs[0];
+        let mut owned = owned_coin_from_staged(staged, index, &runtime.keys, &runtime.secp)?;
+        owned.block_height = None;
+        let created_output_id = hex::encode(owned.output_id);
+        prepared.push(PreparedHop {
+            raw_hex: serialize_hex(&tx),
+            txid: tx.compute_txid().to_string(),
+            wtxid: tx.compute_wtxid().to_string(),
+            spent_output_id,
+            created_output_id,
+            receive_index: index,
+            fee_sats,
+            created: owned.clone(),
+        });
+        coin = owned;
     }
-    let staged = &funded.staged_outputs[0];
-    let mut owned = owned_coin_from_staged(staged, index, &runtime.keys, &runtime.secp)?;
-    owned.block_height = None;
-    let output_id = hex::encode(owned.output_id);
-    runtime.store.db_mut().insert(owned);
-    runtime.history.record(MwebHistoryEntry {
-        id: wtxid.clone(),
-        kind: TxKind::MwebChurn,
-        net_sats: -(fee_sats as i64),
-        fee_sats: Some(fee_sats),
-        timestamp: now_ts(),
-        output_ids: vec![output_id.clone()],
-        input_ids: spent_ids.iter().map(hex::encode).collect(),
-        confirmed_height: None,
-    });
-    Ok(SelfSpendResult { wtxid, output_id })
+    Ok(prepared)
+}
+
+/// Mark the spent coin and remember the created output. Does not broadcast.
+pub fn apply_prepared_output(
+    runtime: &mut MwebRuntime,
+    wtxid: &str,
+    spent_output_id: &str,
+    created: bdk_mweb::MwebCoin,
+    fee_sats: u64,
+) -> Result<(), WalletError> {
+    let spent = decode_output_id(spent_output_id).ok_or_else(|| {
+        WalletError::BuildTx(format!(
+            "invalid MWEB output id '{spent_output_id}' (expected 32-byte hex)"
+        ))
+    })?;
+    let _ = runtime.store.db_mut().mark_spent(&spent);
+    let output_id = hex::encode(created.output_id);
+    runtime.store.db_mut().insert(created);
+    if !runtime
+        .history
+        .entries
+        .iter()
+        .any(|entry| entry.id == wtxid)
+    {
+        runtime.history.record(MwebHistoryEntry {
+            id: wtxid.to_string(),
+            kind: TxKind::MwebChurn,
+            net_sats: -(fee_sats as i64),
+            fee_sats: Some(fee_sats),
+            timestamp: now_ts(),
+            output_ids: vec![output_id],
+            input_ids: vec![spent_output_id.to_string()],
+            confirmed_height: None,
+        });
+    }
+    Ok(())
+}
+
+/// Broadcast a transaction that was signed earlier.
+pub fn broadcast_prepared_raw(
+    raw_hex: &str,
+    rpc_url: Option<&str>,
+    peers: &[String],
+    network: WalletNetwork,
+) -> Result<(), WalletError> {
+    let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    broadcast_mweb_tx(&tx, rpc_url, peers, network)
+}
+
+/// Other people's MWEB transactions in the node mempool.
+///
+/// A transaction counts when it carries an MWEB payload or is a HogEx integration.
+/// Ids in `own` (txid or wtxid) are skipped, including this wallet's other spends.
+pub fn count_foreign_mweb_mempool(
+    rpc_url: &str,
+    own: &BTreeSet<String>,
+) -> Result<u64, WalletError> {
+    let ids = crate::rpc::get_raw_mempool(rpc_url)?;
+    let mut count = 0u64;
+    for txid in ids {
+        let hex_tx = match crate::rpc::get_raw_transaction_hex(rpc_url, &txid) {
+            Ok(hex_tx) => hex_tx,
+            Err(_) => continue,
+        };
+        let Ok(bytes) = hex::decode(&hex_tx) else {
+            continue;
+        };
+        let Ok(tx) = deserialize::<Transaction>(&bytes) else {
+            continue;
+        };
+        if tx.mw_tx.is_none() && !tx.is_hog_ex {
+            continue;
+        }
+        let id = tx.compute_txid().to_string();
+        let wtxid = tx.compute_wtxid().to_string();
+        if crate::churn::is_foreign_id(&id, &wtxid, own) {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+/// The armed hop still spends a coin this wallet can send.
+///
+/// A local mark (spent in the coin db, still in the leafset) counts as ours.
+/// A leaf that has left the leafset before we broadcast means someone else spent it.
+pub fn prepared_input_ok(
+    runtime: &MwebRuntime,
+    spent_output_id: &str,
+    broadcast: bool,
+    wtxid: &str,
+) -> bool {
+    if broadcast {
+        return churn_inputs_still_unspent(runtime, wtxid) != Some(false);
+    }
+    let Some(id) = decode_output_id(spent_output_id) else {
+        return false;
+    };
+    if runtime.store.db().get(&id).is_some() {
+        return true;
+    }
+    let Some(coin) = runtime.store.db().get_spent(&id) else {
+        return false;
+    };
+    let Some(leaf) = coin.leaf_index else {
+        return true;
+    };
+    if runtime.sync_state.leafset.is_empty() {
+        return true;
+    }
+    leafset_has_leaf(&runtime.sync_state.leafset, leaf)
+}
+
+/// Forget a created output that was never broadcast after the input was spent elsewhere.
+pub fn drop_unbroadcast_output(runtime: &mut MwebRuntime, wtxid: &str, created_output_id: &str) {
+    if let Some(id) = decode_output_id(created_output_id) {
+        let _ = runtime.store.db_mut().mark_spent(&id);
+    }
+    runtime.history.forget_ids(&[wtxid.to_string()]);
+}
+
+pub fn coin_from_value(value: &serde_json::Value) -> Result<bdk_mweb::MwebCoin, WalletError> {
+    serde_json::from_value(value.clone()).map_err(|e| WalletError::Mweb(e.to_string()))
 }
 
 pub fn pegout(
@@ -3145,7 +3284,8 @@ mod churn_field_tests {
         job.effective_depth = 1;
         let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
         assert!(fields.churn_phase.is_none());
-        assert!(fields.churn_target.is_none());
-        assert!(fields.churn_counted.is_none());
+        assert!(fields.churn_error.is_none());
+        assert_eq!(fields.churn_target, Some(1));
+        assert_eq!(fields.churn_counted, Some(1));
     }
 }

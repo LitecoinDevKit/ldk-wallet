@@ -214,10 +214,12 @@ type MwebUtxoRecord = {
   churn_error?: string | null;
   churn_target?: number | null;
   churn_counted?: number | null;
+  churn_cover_hold?: "no-rpc" | "waiting" | null;
 };
 
 type ChurnPhase =
   | "waiting-to-broadcast"
+  | "waiting-for-cover"
   | "waiting-confirm"
   | "paused-solo"
   | "paused-unscored"
@@ -232,6 +234,7 @@ type ChurnPreview = {
   total_fee_sats: number;
   amount_note: string;
   quiet_block_note: string;
+  has_litecoin_rpc: boolean;
 };
 
 type SplitOutput = {
@@ -1633,6 +1636,8 @@ function setPhase(next: Phase) {
     stopInsightsPulse();
     stopStatusStripClock();
   }
+  if (next === "unlock" || next === "ready") startCoverPump();
+  else stopCoverPump();
   if (next !== "mnemonic") showMnemonicStep("show");
   updateBackupBanner();
   updateMaturityBanner(0);
@@ -4201,6 +4206,49 @@ function stopAutoSync() {
   }
 }
 
+/** Mempool looks for a signed self-spend. Keeps running on the unlock screen. */
+let coverPumpTimer: number | null = null;
+let coverPumpOn = false;
+
+function coverPumpDelayMs(): number {
+  const jitter = Math.floor(Math.random() * 91) - 45;
+  return (180 + jitter) * 1000;
+}
+
+function scheduleCoverPump() {
+  if (!coverPumpOn) return;
+  if (coverPumpTimer != null) window.clearTimeout(coverPumpTimer);
+  coverPumpTimer = window.setTimeout(() => {
+    coverPumpTimer = null;
+    void pumpCover();
+  }, coverPumpDelayMs());
+}
+
+async function pumpCover() {
+  if (!coverPumpOn || (currentPhase !== "unlock" && currentPhase !== "ready")) return;
+  try {
+    await invoke("pump_churn_broadcast");
+    if (currentPhase === "ready") await refreshUtxos();
+  } catch {
+    /* Nothing to send, or the wallet files are not ready yet. */
+  }
+  if (coverPumpOn && (currentPhase === "unlock" || currentPhase === "ready")) scheduleCoverPump();
+}
+
+function startCoverPump() {
+  if (coverPumpOn) return;
+  coverPumpOn = true;
+  void pumpCover();
+}
+
+function stopCoverPump() {
+  coverPumpOn = false;
+  if (coverPumpTimer != null) {
+    window.clearTimeout(coverPumpTimer);
+    coverPumpTimer = null;
+  }
+}
+
 /* ---------------------------------------------------------------------------
    Auto-lock: drop the decrypted key material after a period without user
    input. The backend clears it on lock_wallet; this timer only decides when.
@@ -5307,6 +5355,8 @@ let churnSuppressFinish = false;
 /** Coin the user just confirmed, until start_churn settles and the real job is visible. */
 let churnStartingId: string | null = null;
 let churnStartingTarget = 1;
+/** Cover hold to paint before start_churn returns. Comes from the confirm preview. */
+let churnStartingCoverHold: "no-rpc" | "waiting" = "waiting";
 /** Output id of the active self-spend on the last successful coin list. */
 let churnWatchId: string | null = null;
 /** Output id to keep marked after that job leaves the active phases. */
@@ -5316,18 +5366,20 @@ let churnSettledNeedsScroll = false;
 function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
   return (
     phase === "waiting-to-broadcast" ||
+    phase === "waiting-for-cover" ||
     phase === "waiting-confirm" ||
     phase === "paused-solo" ||
     phase === "paused-unscored"
   );
 }
 
-/** Show Sending on the confirmed coin before the broadcast returns. */
+/** Show the wait on the confirmed coin before start_churn returns. */
 function stampChurnStarting() {
   if (!churnStartingId) return;
   const coin = mwebUtxoCache.find((row) => row.output_id === churnStartingId);
   if (!coin || churnPhaseActive(coin.churn_phase)) return;
-  coin.churn_phase = "waiting-to-broadcast";
+  coin.churn_phase = "waiting-for-cover";
+  coin.churn_cover_hold = churnStartingCoverHold;
   coin.locked = true;
   coin.churn_target = churnStartingTarget;
   coin.churn_counted = 0;
@@ -5337,10 +5389,22 @@ function activeChurnCoin(): MwebUtxoRecord | undefined {
   return mwebUtxoCache.find((coin) => churnPhaseActive(coin.churn_phase));
 }
 
+function coverWaitSentence(coin: MwebUtxoRecord): string {
+  return coin.churn_cover_hold === "no-rpc"
+    ? "Waiting for a Litecoin node."
+    : "Waiting for other private transactions.";
+}
+
 function churnCompanySentence(coin: MwebUtxoRecord): string | null {
   const phase = coin.churn_phase;
-  if (phase === "waiting-to-broadcast" && (coin.churn_error || churnActionError)) {
+  if (
+    (phase === "waiting-to-broadcast" || phase === "waiting-for-cover") &&
+    (coin.churn_error || churnActionError)
+  ) {
     return "The spend can be sent again.";
+  }
+  if (phase === "waiting-for-cover") {
+    return coverWaitSentence(coin);
   }
   if (phase === "waiting-to-broadcast") {
     return "Waiting for the next block.";
@@ -5348,7 +5412,9 @@ function churnCompanySentence(coin: MwebUtxoRecord): string | null {
   if (phase === "waiting-confirm") {
     return "Already on the network — waiting for the next block. This hop cannot be cancelled.";
   }
-  if (phase === "paused-solo") return "This block only contained your spend.";
+  if (phase === "paused-solo") {
+    return "This block only contained your spend. Signing a new hop spends another 0.0005 LTC.";
+  }
   if (phase === "paused-unscored") return "Couldn't read that block yet.";
   if (coin.from_pegin && coin.non_solo_blocks === 0) {
     return "Tied to its peg-in until it is spent in a block with other private activity.";
@@ -5389,9 +5455,13 @@ function churnPill(coin: MwebUtxoRecord): { label: string; kind: ChurnPillKind }
   if (!churnPhaseActive(coin.churn_phase)) return null;
   if (churnPending === "cancel") return { label: "Cancelling", kind: "pending" };
   if (churnPending === "retry") return { label: "Trying again", kind: "pending" };
-  if (coin.churn_phase === "waiting-to-broadcast" && (coin.churn_error || churnActionError)) {
+  if (
+    (coin.churn_phase === "waiting-to-broadcast" || coin.churn_phase === "waiting-for-cover") &&
+    (coin.churn_error || churnActionError)
+  ) {
     return { label: "Couldn't send", kind: "error" };
   }
+  if (coin.churn_phase === "waiting-for-cover") return { label: "Waiting", kind: "accent" };
   if (coin.churn_phase === "waiting-to-broadcast") return { label: "Sending", kind: "accent" };
   if (coin.churn_phase === "waiting-confirm") return { label: "Waiting", kind: "accent" };
   if (coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored") {
@@ -5416,14 +5486,19 @@ function churnNeedsAttention(coin: MwebUtxoRecord): boolean {
   return (
     coin.churn_phase === "paused-solo" ||
     coin.churn_phase === "paused-unscored" ||
-    (coin.churn_phase === "waiting-to-broadcast" && !!coin.churn_error)
+    ((coin.churn_phase === "waiting-to-broadcast" || coin.churn_phase === "waiting-for-cover") &&
+      !!coin.churn_error)
   );
 }
 
 function churnJobNotice(coin: MwebUtxoRecord): string {
-  if (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error) {
+  if (
+    (coin.churn_phase === "waiting-to-broadcast" || coin.churn_phase === "waiting-for-cover") &&
+    coin.churn_error
+  ) {
     return "A self-spend could not be sent.";
   }
+  if (coin.churn_phase === "waiting-for-cover") return coverWaitSentence(coin);
   if (coin.churn_phase === "paused-solo") return "This block only contained your spend.";
   if (coin.churn_phase === "paused-unscored") return "Couldn't read that block yet.";
   return "A self-spend is waiting for the next block.";
@@ -5433,7 +5508,12 @@ function churnSummaryToken(coin: MwebUtxoRecord): string {
   if (coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored") {
     return "self-spend paused";
   }
-  if (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error) return "couldn't send";
+  if (
+    (coin.churn_phase === "waiting-to-broadcast" || coin.churn_phase === "waiting-for-cover") &&
+    coin.churn_error
+  ) {
+    return "couldn't send";
+  }
   return "self-spend waiting";
 }
 
@@ -5712,7 +5792,9 @@ function renderChurnStatus() {
   }
   card.hidden = false;
   const tone =
-    churnVisibleError(coin) || (coin.churn_phase === "waiting-to-broadcast" && coin.churn_error)
+    churnVisibleError(coin) ||
+    ((coin.churn_phase === "waiting-to-broadcast" || coin.churn_phase === "waiting-for-cover") &&
+      coin.churn_error)
       ? "error"
       : coin.churn_phase === "paused-solo" || coin.churn_phase === "paused-unscored"
         ? "paused"
@@ -5745,6 +5827,13 @@ function renderChurnStatus() {
   main.textContent = churnRowMain(coin) ?? "Waiting for the next block.";
   card.append(head, main);
 
+  if (coin.churn_cover_hold === "no-rpc") {
+    const node = document.createElement("p");
+    node.className = "churn-status-sub";
+    node.textContent = "Save a Litecoin RPC URL in Settings → Connection.";
+    card.append(node);
+  }
+
   const smaller = churnSmallerLine(coin);
   if (smaller) {
     const sub = document.createElement("p");
@@ -5766,7 +5855,8 @@ function renderChurnStatus() {
   const canRetry =
     phase === "paused-solo" ||
     phase === "paused-unscored" ||
-    (phase === "waiting-to-broadcast" && !!(coin.churn_error || churnActionError));
+    ((phase === "waiting-to-broadcast" || phase === "waiting-for-cover") &&
+      !!(coin.churn_error || churnActionError));
   if (canRetry) {
     const again = document.createElement("button");
     again.type = "button";
@@ -5776,9 +5866,21 @@ function renderChurnStatus() {
     again.addEventListener("click", () => void retryChurn());
     actions.append(again);
   }
-  // Do not offer Cancel while Sending: broadcast may already be in flight, and a
-  // successful hop cannot be unbroadcast. Cancel is for Couldn't send / pauses.
+  if (coin.churn_cover_hold === "no-rpc") {
+    const settings = document.createElement("button");
+    settings.type = "button";
+    settings.className = "btn btn-primary btn-sm";
+    settings.textContent = "Open Settings";
+    settings.disabled = churnPending != null;
+    settings.addEventListener("click", () => {
+      setView("settings");
+      el.settingsRpc.focus();
+    });
+    actions.append(settings);
+  }
+  // Cancel is available before the hop is broadcast, and after a pause or a failed send.
   const canCancel =
+    phase === "waiting-for-cover" ||
     (phase === "waiting-to-broadcast" && !!(coin.churn_error || churnActionError)) ||
     phase === "paused-solo" ||
     phase === "paused-unscored";
@@ -6072,6 +6174,7 @@ async function cancelChurn() {
 async function openChurnModal(coin: MwebUtxoRecord) {
   let targetDepth = 1;
   let previewOk = false;
+  let previewHasRpc = true;
   const choice = await openModal({
     title: "Spend to self",
     build(body) {
@@ -6082,11 +6185,17 @@ async function openChurnModal(coin: MwebUtxoRecord) {
         "Spend this coin to an address of this wallet. It mixes only if that block also has other private activity.",
         "hint",
       );
+      const wait = document.createElement("p");
+      wait.className = "hint";
       const feeBox = document.createElement("div");
       const amount = document.createElement("p");
       amount.className = "hint";
       const quiet = document.createElement("p");
       quiet.className = "hint";
+      const pattern = document.createElement("p");
+      pattern.className = "hint";
+      pattern.textContent =
+        "A chain of self-spends is still a recognizable 1-in-1 pattern. It does not create a larger anonymity set.";
       const err = document.createElement("p");
       err.className = "error";
       err.hidden = true;
@@ -6107,19 +6216,24 @@ async function openChurnModal(coin: MwebUtxoRecord) {
       input.value = "2";
       field.append(caption, input);
       details.append(summary, field);
-      sheet.append(feeBox, amount, quiet, err, details);
+      sheet.append(wait, feeBox, amount, quiet, pattern, err, details);
       body.append(sheet);
 
       let seq = 0;
       const paint = (preview: ChurnPreview | null, message: string | null) => {
         previewOk = preview != null;
         feeBox.replaceChildren();
+        wait.hidden = preview == null;
         if (preview) {
           const rows: DetailRow[] = [["Fee for this hop", formatAmount(preview.hop_fee_sats)]];
           if (preview.target_depth > 1) {
             rows.push(["Fees if every block counts", formatAmount(preview.total_fee_sats)]);
           }
           feeBox.append(buildDetailList(rows));
+          previewHasRpc = preview.has_litecoin_rpc;
+          wait.textContent = preview.has_litecoin_rpc
+            ? "This hop will not be sent until other private transactions appear in the mempool. That can take a long time."
+            : "This hop will be signed now. It will not be sent until a Litecoin RPC URL is saved in Settings → Connection. It will then wait for other private transactions.";
           amount.textContent = preview.amount_note;
           quiet.textContent = preview.quiet_block_note;
         }
@@ -6165,6 +6279,7 @@ async function openChurnModal(coin: MwebUtxoRecord) {
   if (choice !== "start" || !previewOk) return;
   churnStartingId = coin.output_id;
   churnStartingTarget = targetDepth;
+  churnStartingCoverHold = previewHasRpc ? "waiting" : "no-rpc";
   churnSettledId = null;
   churnSettledNeedsScroll = false;
   stampChurnStarting();
@@ -6340,7 +6455,18 @@ function noteChurnFinished() {
     if (settled) {
       churnSettledId = settled.output_id;
       churnSettledNeedsScroll = true;
-      setStatus(`Self-spend finished. ${formatAmount(settled.amount_sats)}.`, "info");
+      const counted = settled.churn_counted;
+      const target = settled.churn_target;
+      const short =
+        counted != null && target != null && target > counted
+          ? ` ${counted.toLocaleString("en-US")} of ${target.toLocaleString("en-US")} non-solo blocks.`
+          : "";
+      setStatus(
+        short
+          ? `Self-spend finished.${short}`
+          : `Self-spend finished. ${formatAmount(settled.amount_sats)}.`,
+        "info",
+      );
     } else {
       setStatus("Self-spend finished.", "info");
     }

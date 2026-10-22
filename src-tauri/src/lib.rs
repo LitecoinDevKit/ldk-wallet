@@ -389,6 +389,20 @@ async fn start_churn(
 }
 
 #[tauri::command]
+async fn pump_churn_broadcast(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<(), String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        wallet.pump_churn_broadcast(&dir).map_err(map_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn churn_status(
     state: State<'_, Arc<WalletApp>>,
 ) -> Result<Option<ChurnStatus>, String> {
@@ -876,6 +890,7 @@ pub fn run() {
             split_coin,
             preview_churn,
             start_churn,
+            pump_churn_broadcast,
             churn_status,
             retry_churn,
             cancel_churn,

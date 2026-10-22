@@ -51,11 +51,11 @@ Library-level loops live in the sibling BDK repo ([`LITECOIN_E2E.md`](../../bdk/
 - [ ] Action column is one line tall (Spend to self + More side by side when spendable; More only when not); More menu overlays and does not grow the row
 - [ ] Known depth on collapsed rows is at most “Shared N blocks”; expand does not restate that line
 - [ ] Peg-in-tied mature coin: “Tied to peg-in” chip, primary Spend to self, Balance banner still opens Coins
-- [ ] Spend to self confirm: what it does, fee, amount, quiet-block note; broadcast succeeds
-- [ ] Live `#churn-status` card tracks Sending / Waiting / Paused / Couldn't send; Try again / Cancel only on pause or Couldn't send (not while Sending/Waiting)
+- [ ] Spend to self confirm: what it does, the wait, fee, amount, quiet-block note (one hop says Try again costs another 0.0005 LTC), and the 1-in-1 pattern sentence. With an RPC URL the wait is for other private transactions and can take a long time. With no URL the hop will be signed now and will not be sent until a Litecoin RPC URL is saved in Settings → Connection. The no-RPC card says it is waiting for a Litecoin node, says to save that URL, and Open Settings focuses the field. Nothing is sent until the URL is saved
+- [ ] A quiet block on a one-hop job pauses the card and says signing a new hop spends another 0.0005 LTC. Try again stays the button label. A longer run arms the next signed hop and waits for cover again. It does not sign a replacement hop
+- [ ] Live `#churn-status` card tracks Waiting for cover / Waiting for the block / Paused / Couldn't send. With no RPC URL the card offers Open Settings ahead of Cancel. Try again is only on a one-hop quiet block, an unscored pause, or Couldn't send. Cancel is available before broadcast
 - [ ] Unconfirmed self-spend outputs show Pending (not Maturing); Maturing is for peg-in countdown only
 - [ ] After a scored hop: settled card + Just spent highlight; More → Details shows labeled Privacy / Last block / Technical sections
-- [ ] Quiet (solo) block pauses the job on the card (not a toast); retry after more mempool/block activity
 - [ ] Frozen / maturing coins: Spend and Split blocked; Frozen is a visible chip + left-edge accent
 - [ ] Empty Private list offers Move to private → Swap peg-in
 

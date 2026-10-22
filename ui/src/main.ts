@@ -738,6 +738,9 @@ const el = {
   coinsMwebList: document.querySelector<HTMLUListElement>("#coins-mweb-list")!,
   coinsMwebEmpty: document.querySelector<HTMLElement>("#coins-mweb-empty")!,
   coinsMwebSum: document.querySelector<HTMLElement>("#coins-mweb-sum")!,
+  coinsHintPublic: document.querySelector<HTMLElement>("#coins-hint-public")!,
+  coinsHintPrivate: document.querySelector<HTMLElement>("#coins-hint-private")!,
+  btnCoinsPegin: document.querySelector<HTMLButtonElement>("#btn-coins-pegin")!,
   coinsSegPublic: document.querySelector<HTMLButtonElement>("#coins-seg-public")!,
   coinsSegPrivate: document.querySelector<HTMLButtonElement>("#coins-seg-private")!,
   coinsPublic: document.querySelector<HTMLElement>("#coins-public")!,
@@ -1806,6 +1809,8 @@ function applySegModes() {
     el.coinsPrivate,
     coinsMode === "public",
   );
+  el.coinsHintPublic.hidden = coinsMode !== "public";
+  el.coinsHintPrivate.hidden = coinsMode !== "private";
 }
 
 el.sendSegPublic.addEventListener("click", () => {
@@ -1832,6 +1837,16 @@ el.coinsSegPrivate.addEventListener("click", () => {
   coinsMode = "private";
   applySegModes();
   void refreshUtxos();
+});
+
+document.addEventListener("pointerdown", (event) => {
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  for (const list of [el.coinsMwebList, el.coinsUtxoList]) {
+    for (const open of list.querySelectorAll<HTMLDetailsElement>("details.utxo-more[open]")) {
+      if (!open.contains(target)) open.open = false;
+    }
+  }
 });
 el.swapSegIn.addEventListener("click", () => {
   swapDirection = "in";
@@ -4733,6 +4748,12 @@ el.btnChurnBannerDismiss.addEventListener("click", () => {
   dismissChurnBanner();
 });
 
+el.btnCoinsPegin.addEventListener("click", () => {
+  swapDirection = "in";
+  applySegModes();
+  setCard("swap");
+});
+
 el.btnFundReceive.addEventListener("click", () => openPublicReceive());
 el.btnFundReceiveHistory.addEventListener("click", () => openPublicReceive());
 
@@ -5089,67 +5110,181 @@ async function persistUtxoLabel(outpoint: string, label: string) {
   }
 }
 
+/** Session-only: which public coin rows show expanded detail. */
+const publicCoinExpanded = new Set<string>();
+
 function renderCoinsList() {
   el.coinsUtxoList.textContent = "";
   el.coinsUtxoEmpty.hidden = utxoCache.length > 0;
   let frozen = 0;
   for (const utxo of utxoCache) {
     if (utxo.locked) frozen += 1;
+    const expanded = publicCoinExpanded.has(utxo.outpoint);
     const li = document.createElement("li");
-    li.className = utxo.locked ? "utxo-row is-locked" : "utxo-row";
+    li.dataset.outpoint = utxo.outpoint;
+    const rowClass = ["utxo-row"];
+    if (utxo.locked) rowClass.push("is-frozen");
+    li.className = rowClass.join(" ");
+
     const main = document.createElement("div");
     main.className = "utxo-main";
+    const amtRow = document.createElement("div");
+    amtRow.className = "utxo-amt";
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(utxo.amount_sats);
-    const meta = document.createElement("span");
-    meta.className = "utxo-meta";
+    amtRow.append(amt);
+    if (utxo.locked) {
+      const pill = document.createElement("span");
+      pill.className = "pill pill-frozen";
+      pill.textContent = "Frozen";
+      amtRow.append(pill);
+    }
+
     const kind = utxo.keychain === "internal" ? "change" : "receive";
     const conf =
       utxo.confirmations === 0
         ? "pending"
         : `${utxo.confirmations.toLocaleString("en-US")} conf`;
-    meta.textContent = `${kind} · ${conf}${utxo.locked ? " · frozen" : ""}`;
-    const id = document.createElement("span");
-    id.className = "utxo-id";
-    id.textContent = utxo.outpoint;
-    const labelInput = document.createElement("input");
-    labelInput.type = "text";
-    labelInput.className = "utxo-label-input";
-    labelInput.placeholder = "Label (optional)";
-    labelInput.maxLength = MAX_TX_LABEL_CHARS;
-    labelInput.value = utxo.label ?? "";
-    labelInput.addEventListener("change", () => {
-      void persistUtxoLabel(utxo.outpoint, labelInput.value);
-    });
-    main.append(amt, meta, id, labelInput);
+    const status = document.createElement("span");
+    status.className = "utxo-status";
+    status.textContent = `${kind} · ${conf}`;
+    main.append(amtRow, status);
+    li.append(main);
+
     const actions = document.createElement("div");
-    actions.className = "split-actions";
+    actions.className = "split-actions split-actions-private";
+    const more = document.createElement("details");
+    more.className = "utxo-more";
+    const moreSummary = document.createElement("summary");
+    moreSummary.className = "btn btn-ghost btn-sm";
+    moreSummary.textContent = "More";
+    const moreMenu = document.createElement("div");
+    moreMenu.className = "utxo-more-menu";
+    moreMenu.setAttribute("role", "menu");
+
+    more.addEventListener("toggle", () => {
+      if (!more.open) return;
+      for (const other of el.coinsUtxoList.querySelectorAll<HTMLDetailsElement>(
+        "details.utxo-more[open]",
+      )) {
+        if (other !== more) other.open = false;
+      }
+    });
+
+    const detailsBtn = document.createElement("button");
+    detailsBtn.type = "button";
+    detailsBtn.className = "btn btn-ghost btn-sm";
+    detailsBtn.setAttribute("role", "menuitem");
+    detailsBtn.textContent = expanded ? "Hide details" : "Details";
+    detailsBtn.setAttribute("aria-expanded", String(expanded));
+    detailsBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      more.open = false;
+      if (expanded) publicCoinExpanded.delete(utxo.outpoint);
+      else publicCoinExpanded.add(utxo.outpoint);
+      renderCoinsList();
+    });
+
     const freeze = document.createElement("button");
     freeze.type = "button";
     freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+    freeze.setAttribute("role", "menuitem");
     freeze.textContent = utxo.locked ? "Unfreeze" : "Freeze";
-    freeze.addEventListener("click", () => void toggleUtxoLocked(utxo));
+    freeze.addEventListener("click", (event) => {
+      event.stopPropagation();
+      more.open = false;
+      void toggleUtxoLocked(utxo);
+    });
+
     const split = document.createElement("button");
     split.type = "button";
     split.className = "btn btn-ghost btn-sm";
+    split.setAttribute("role", "menuitem");
     split.textContent = "Split";
-    const splitBlocked =
-      utxo.locked || utxo.confirmations === 0;
+    const splitBlocked = utxo.locked || utxo.confirmations === 0;
     split.disabled = splitBlocked;
     split.title = utxo.locked
       ? "Unfreeze to split."
       : utxo.confirmations === 0
         ? "Split is disabled until the coin is confirmed."
         : "Split this coin into multiple outputs";
-    split.addEventListener("click", () => {
+    split.addEventListener("click", (event) => {
+      event.stopPropagation();
+      more.open = false;
       void openSplitModal({
         chain: "public",
         id: utxo.outpoint,
         amount_sats: utxo.amount_sats,
       });
     });
-    actions.append(freeze, split);
-    li.append(main, actions);
+
+    moreMenu.append(detailsBtn, freeze, split);
+    more.append(moreSummary, moreMenu);
+    actions.append(more);
+    li.append(actions);
+
+    if (expanded) {
+      const details = document.createElement("div");
+      details.className = "utxo-details";
+
+      const techKids: Node[] = [];
+      const meta = document.createElement("div");
+      meta.className = "utxo-detail-meta";
+      const confMeta = document.createElement("span");
+      confMeta.className = "utxo-meta";
+      confMeta.textContent = conf;
+      const id = document.createElement("span");
+      id.className = "utxo-id";
+      id.textContent = truncateOutputId(utxo.txid);
+      id.title = utxo.txid;
+      meta.append(confMeta, id);
+      techKids.push(meta);
+
+      const txActions = document.createElement("div");
+      txActions.className = "utxo-detail-actions";
+      const copyTx = document.createElement("button");
+      copyTx.type = "button";
+      copyTx.className = "btn btn-ghost btn-sm";
+      copyTx.textContent = "Copy txid";
+      copyTx.addEventListener("click", () => {
+        void copyText(utxo.txid, "Transaction id copied.");
+      });
+      const litview = document.createElement("button");
+      litview.type = "button";
+      litview.className = "btn btn-ghost btn-sm";
+      litview.textContent = "View on litview";
+      litview.disabled = !isChainTxid(utxo.txid);
+      litview.title = isChainTxid(utxo.txid)
+        ? "Open this transaction on litview"
+        : "Not a chain transaction id";
+      litview.addEventListener("click", () => {
+        void openExplorerForTxid(utxo.txid);
+      });
+      txActions.append(copyTx, litview);
+      techKids.push(txActions);
+
+      const outpointLine = document.createElement("span");
+      outpointLine.className = "utxo-detail-tech-note";
+      outpointLine.textContent = `Outpoint ${truncateOutputId(utxo.outpoint)}`;
+      outpointLine.title = utxo.outpoint;
+      techKids.push(outpointLine);
+
+      const labelInput = document.createElement("input");
+      labelInput.type = "text";
+      labelInput.className = "utxo-label-input";
+      labelInput.placeholder = "Label (optional)";
+      labelInput.maxLength = MAX_TX_LABEL_CHARS;
+      labelInput.value = utxo.label ?? "";
+      labelInput.addEventListener("change", () => {
+        void persistUtxoLabel(utxo.outpoint, labelInput.value);
+      });
+      techKids.push(labelInput);
+
+      appendDetailSection(details, "Technical", ...techKids);
+      li.append(details);
+    }
+
     el.coinsUtxoList.appendChild(li);
   }
   if (utxoCache.length === 0) {
@@ -5207,8 +5342,11 @@ function churnCompanySentence(coin: MwebUtxoRecord): string | null {
   if (phase === "waiting-to-broadcast" && (coin.churn_error || churnActionError)) {
     return "The spend can be sent again.";
   }
-  if (phase === "waiting-to-broadcast" || phase === "waiting-confirm") {
+  if (phase === "waiting-to-broadcast") {
     return "Waiting for the next block.";
+  }
+  if (phase === "waiting-confirm") {
+    return "Already on the network — waiting for the next block. This hop cannot be cancelled.";
   }
   if (phase === "paused-solo") return "This block only contained your spend.";
   if (phase === "paused-unscored") return "Couldn't read that block yet.";
@@ -5299,6 +5437,7 @@ function churnSummaryToken(coin: MwebUtxoRecord): string {
   return "self-spend waiting";
 }
 
+/** Smaller line on #churn-status — keep CHURN.md “non-solo blocks” wording. */
 function churnDepthSentence(coin: MwebUtxoRecord): string | null {
   if (coin.non_solo_blocks == null) {
     if (!coin.mature || churnPhaseActive(coin.churn_phase)) return null;
@@ -5309,6 +5448,13 @@ function churnDepthSentence(coin: MwebUtxoRecord): string | null {
     return `${count.toLocaleString("en-US")} non-solo block${count === 1 ? "" : "s"} so far`;
   }
   return null;
+}
+
+/** Default Private-list depth line — short, and silent when unknown or zero. */
+function mwebListDepthSentence(coin: MwebUtxoRecord): string | null {
+  if (coin.non_solo_blocks == null || coin.non_solo_blocks === 0) return null;
+  const count = coin.non_solo_blocks;
+  return `Shared ${count.toLocaleString("en-US")} block${count === 1 ? "" : "s"}`;
 }
 
 function churnHopLine(kernels: number, outputs: number): string {
@@ -5333,6 +5479,116 @@ function pegInStillTied(coin: MwebUtxoRecord): boolean {
     coin.non_solo_blocks === 0 &&
     !churnPhaseActive(coin.churn_phase)
   );
+}
+
+/** Session-only: which private coin rows show expanded technical detail. */
+const mwebCoinExpanded = new Set<string>();
+
+function userFrozen(coin: MwebUtxoRecord): boolean {
+  return !!coin.locked && !churnPhaseActive(coin.churn_phase);
+}
+
+function truncateOutputId(id: string): string {
+  if (id.length <= 20) return id;
+  return `${id.slice(0, 10)}…${id.slice(-8)}`;
+}
+
+type RowChip = { label: string; className: string };
+
+/** Exactly one status chip for the default Private row, or none when clean mature. */
+function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
+  const pill = churnPill(coin);
+  if (pill) return { label: pill.label, className: churnPillClass(pill.kind) };
+  if (justSpent) return { label: "Just spent", className: "pill churn-pill-accent" };
+  // Unconfirmed self-spends are pending, not peg-in maturity.
+  if (!coin.mature && coin.confirmations === 0) {
+    return { label: "Pending", className: "pill pending" };
+  }
+  if (!coin.mature) return { label: "Maturing", className: "pill pill-maturing" };
+  if (userFrozen(coin)) return { label: "Frozen", className: "pill pill-frozen" };
+  if (pegInStillTied(coin)) return { label: "Tied to peg-in", className: "pill pill-tied" };
+  return null;
+}
+
+/** Single default-row status sentence. Active jobs stay lean — truth is on #churn-status. */
+function mwebRowStatusLine(coin: MwebUtxoRecord): string | null {
+  if (churnPhaseActive(coin.churn_phase)) return null;
+  if (!coin.mature) {
+    const left = coin.maturity_blocks_left ?? 0;
+    return coin.confirmations === 0
+      ? "Pending · not yet spendable"
+      : `Maturing · ${left} block${left === 1 ? "" : "s"} left`;
+  }
+  if (pegInStillTied(coin)) {
+    return "Still linked to its peg-in";
+  }
+  return mwebListDepthSentence(coin);
+}
+
+/**
+ * Privacy section body — only when it adds info beyond the default status line.
+ * Known depth already shows “Shared N blocks” on the row, so return null then.
+ */
+function mwebExpandPrivacy(coin: MwebUtxoRecord): string | null {
+  if (pegInStillTied(coin)) {
+    return "Tied to its peg-in until it is spent in a block with other private activity.";
+  }
+  if (coin.non_solo_blocks == null) {
+    if (!coin.mature || churnPhaseActive(coin.churn_phase)) return null;
+    return "No shared-block history available.";
+  }
+  if (coin.non_solo_blocks === 0) return "No shared blocks yet";
+  return null;
+}
+
+function mwebCompanionPlain(): string {
+  return "This block also had other private activity.";
+}
+
+function mwebCompanionExact(coin: MwebUtxoRecord): string | null {
+  if (coin.last_other_kernels == null || coin.last_other_outputs == null) return null;
+  const kernels = coin.last_other_kernels;
+  const outputs = coin.last_other_outputs;
+  return `${kernels.toLocaleString("en-US")} other kernel${
+    kernels === 1 ? "" : "s"
+  } and ${outputs.toLocaleString("en-US")} other output${
+    outputs === 1 ? "" : "s"
+  }. Peg-ins and peg-outs in that count publish their amounts.`;
+}
+
+function appendDetailSection(
+  parent: HTMLElement,
+  title: string,
+  ...nodes: (Node | null | undefined)[]
+) {
+  const kids = nodes.filter((n): n is Node => n != null);
+  if (kids.length === 0) return;
+  const section = document.createElement("div");
+  section.className = "utxo-detail-section";
+  const label = document.createElement("span");
+  label.className = "utxo-detail-section-label";
+  label.textContent = title;
+  const body = document.createElement("div");
+  body.className = "utxo-detail-section-body";
+  body.append(...kids);
+  section.append(label, body);
+  parent.append(section);
+}
+
+function sortMwebCoins(coins: MwebUtxoRecord[]): MwebUtxoRecord[] {
+  const rank = (coin: MwebUtxoRecord): number => {
+    if (churnNeedsAttention(coin)) return 0;
+    if (churnPhaseActive(coin.churn_phase)) return 1;
+    if (pegInStillTied(coin)) return 2;
+    if (!coin.mature) return 3;
+    return 4;
+  };
+  return [...coins].sort((a, b) => {
+    const byRank = rank(a) - rank(b);
+    if (byRank !== 0) return byRank;
+    if (a.amount_sats !== b.amount_sats) return b.amount_sats - a.amount_sats;
+    return a.output_id.localeCompare(b.output_id);
+  });
 }
 
 function dismissedChurnIds(): Set<string> {
@@ -5520,8 +5776,12 @@ function renderChurnStatus() {
     again.addEventListener("click", () => void retryChurn());
     actions.append(again);
   }
-  // Waiting means the hop is already broadcast. Cancel would only drop the local job.
-  const canCancel = phase !== "waiting-confirm";
+  // Do not offer Cancel while Sending: broadcast may already be in flight, and a
+  // successful hop cannot be unbroadcast. Cancel is for Couldn't send / pauses.
+  const canCancel =
+    (phase === "waiting-to-broadcast" && !!(coin.churn_error || churnActionError)) ||
+    phase === "paused-solo" ||
+    phase === "paused-unscored";
   if (canCancel) {
     const cancel = document.createElement("button");
     cancel.type = "button";
@@ -5539,113 +5799,122 @@ function renderMwebCoinsList() {
   el.coinsMwebList.textContent = "";
   el.coinsMwebEmpty.hidden = mwebUtxoCache.length > 0;
   let immature = 0;
-  for (const coin of mwebUtxoCache) {
+  let frozenCount = 0;
+  let attentionCount = 0;
+  const sorted = sortMwebCoins(mwebUtxoCache);
+  for (const coin of sorted) {
     if (!coin.mature) immature += 1;
+    if (userFrozen(coin)) frozenCount += 1;
+    if (churnNeedsAttention(coin)) attentionCount += 1;
     const jobHolds = churnPhaseActive(coin.churn_phase);
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
+    const tied = pegInStillTied(coin);
+    const expanded = mwebCoinExpanded.has(coin.output_id);
+    const left = coin.maturity_blocks_left ?? 0;
     const li = document.createElement("li");
     li.dataset.outputId = coin.output_id;
     const rowClass = ["utxo-row"];
-    if (!coin.mature || (coin.locked && !jobHolds)) rowClass.push("is-locked");
+    if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
+    else if (!coin.mature) rowClass.push("is-pending");
+    else if (userFrozen(coin)) rowClass.push("is-frozen");
+    else if (tied) rowClass.push("is-tied");
     if (justSpent) rowClass.push("is-just-spent");
     li.className = rowClass.join(" ");
+
     const main = document.createElement("div");
     main.className = "utxo-main";
+
     const amtRow = document.createElement("div");
     amtRow.className = "utxo-amt";
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(coin.amount_sats);
     amtRow.append(amt);
-    const pillInfo = churnPill(coin);
-    if (pillInfo) {
+    const chip = mwebRowChip(coin, justSpent);
+    if (chip) {
       const pill = document.createElement("span");
-      pill.className = churnPillClass(pillInfo.kind);
-      pill.textContent = pillInfo.label;
-      amtRow.append(pill);
-    } else if (justSpent) {
-      const pill = document.createElement("span");
-      pill.className = "pill churn-pill-accent";
-      pill.textContent = "Just spent";
+      pill.className = chip.className;
+      pill.textContent = chip.label;
       amtRow.append(pill);
     }
-    const meta = document.createElement("span");
-    meta.className = "utxo-meta";
-    const left = coin.maturity_blocks_left ?? 0;
-    const conf =
-      coin.confirmations === 0
-        ? "pending"
-        : `${coin.confirmations.toLocaleString("en-US")} conf`;
-    const labelBit = coin.label ? ` · ${coin.label}` : "";
-    meta.textContent = coin.mature
-      ? `${conf}${coin.locked && !jobHolds ? " · frozen" : ""}${labelBit}`
-      : coin.confirmations === 0
-        ? "pending · not yet spendable"
-        : `maturing · ${left} block${left === 1 ? "" : "s"} left`;
-    const company = churnRowMain(coin);
-    const companyLine = document.createElement("span");
-    companyLine.className = "utxo-meta";
-    companyLine.hidden = !company;
-    companyLine.textContent = company ?? "";
+
+    const statusLine = mwebRowStatusLine(coin);
+    const status = document.createElement("span");
+    status.className = "utxo-status";
+    status.hidden = !statusLine;
+    status.textContent = statusLine ?? "";
+
     const errorText = churnVisibleError(coin);
     const errorLine = document.createElement("span");
     errorLine.className = "churn-status-error";
     errorLine.hidden = !errorText;
     errorLine.textContent = errorText ?? "";
-    const depth = churnSmallerLine(coin);
-    const depthLine = document.createElement("span");
-    depthLine.className = "utxo-depth";
-    depthLine.hidden = !depth;
-    depthLine.textContent = depth ?? "";
-    const hopLines = document.createElement("div");
-    hopLines.className = "utxo-hops";
-    for (const line of churnHopLines(coin)) {
-      const hop = document.createElement("span");
-      hop.className = "utxo-depth";
-      hop.textContent = line;
-      hopLines.append(hop);
-    }
-    hopLines.hidden = hopLines.childElementCount === 0;
-    const id = document.createElement("span");
-    id.className = "utxo-id";
-    id.textContent = coin.output_id;
-    const labelInput = document.createElement("input");
-    labelInput.type = "text";
-    labelInput.className = "utxo-label-input";
-    labelInput.placeholder = "Label (optional)";
-    labelInput.maxLength = MAX_TX_LABEL_CHARS;
-    labelInput.value = coin.label ?? "";
-    labelInput.addEventListener("change", () => {
-      void persistUtxoLabel(coin.output_id, labelInput.value);
-    });
-    main.append(amtRow, meta, companyLine, errorLine, depthLine, hopLines, id, labelInput);
+
+    main.append(amtRow, status, errorLine);
     li.append(main);
+
     if (!jobHolds) {
       const actions = document.createElement("div");
-      actions.className = "split-actions";
-      const spend = document.createElement("button");
-      spend.type = "button";
-      const tied =
-        !!coin.from_pegin && coin.non_solo_blocks === 0 && coin.mature && !coin.locked;
-      spend.className = tied ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm";
-      spend.textContent = "Spend to self";
-      spend.disabled = !coin.mature || !!coin.locked;
-      spend.title = coin.locked
-        ? "Unfreeze to spend to self."
-        : coin.mature
-          ? "Spend this coin to an address of this wallet"
-          : left > 0
-            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
-            : "Cannot spend privately until confirmed.";
-      spend.addEventListener("click", () => void openChurnModal(coin));
+      actions.className = "split-actions split-actions-private";
+      const spendable = !!coin.mature && !coin.locked;
+      if (spendable) {
+        const spend = document.createElement("button");
+        spend.type = "button";
+        spend.className = tied ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm";
+        spend.textContent = "Spend to self";
+        spend.title = "Spend this coin to an address of this wallet";
+        spend.addEventListener("click", () => void openChurnModal(coin));
+        actions.append(spend);
+      }
+
+      const more = document.createElement("details");
+      more.className = "utxo-more";
+      const moreSummary = document.createElement("summary");
+      moreSummary.className = "btn btn-ghost btn-sm";
+      moreSummary.textContent = "More";
+      const moreMenu = document.createElement("div");
+      moreMenu.className = "utxo-more-menu";
+      moreMenu.setAttribute("role", "menu");
+
+      more.addEventListener("toggle", () => {
+        if (!more.open) return;
+        for (const other of el.coinsMwebList.querySelectorAll<HTMLDetailsElement>(
+          "details.utxo-more[open]",
+        )) {
+          if (other !== more) other.open = false;
+        }
+      });
+
+      const detailsBtn = document.createElement("button");
+      detailsBtn.type = "button";
+      detailsBtn.className = "btn btn-ghost btn-sm";
+      detailsBtn.setAttribute("role", "menuitem");
+      detailsBtn.textContent = expanded ? "Hide details" : "Details";
+      detailsBtn.setAttribute("aria-expanded", String(expanded));
+      detailsBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        more.open = false;
+        if (expanded) mwebCoinExpanded.delete(coin.output_id);
+        else mwebCoinExpanded.add(coin.output_id);
+        renderMwebCoinsList();
+      });
+
       const freeze = document.createElement("button");
       freeze.type = "button";
       freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+      freeze.setAttribute("role", "menuitem");
       freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
       freeze.disabled = !coin.mature && !coin.locked;
-      freeze.addEventListener("click", () => void toggleMwebLocked(coin));
+      freeze.addEventListener("click", (event) => {
+        event.stopPropagation();
+        more.open = false;
+        void toggleMwebLocked(coin);
+      });
+
       const split = document.createElement("button");
       split.type = "button";
       split.className = "btn btn-ghost btn-sm";
+      split.setAttribute("role", "menuitem");
       split.textContent = "Split";
       const splitBlocked = !!coin.locked || !coin.mature;
       split.disabled = splitBlocked;
@@ -5656,31 +5925,110 @@ function renderMwebCoinsList() {
           : left > 0
             ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
             : "Cannot spend privately until confirmed.";
-      split.addEventListener("click", () => {
+      split.addEventListener("click", (event) => {
+        event.stopPropagation();
+        more.open = false;
         void openSplitModal({
           chain: "private",
           id: coin.output_id,
           amount_sats: coin.amount_sats,
         });
       });
-      actions.append(spend, freeze, split);
+
+      moreMenu.append(detailsBtn, freeze, split);
+      more.append(moreSummary, moreMenu);
+      actions.append(more);
       li.append(actions);
     }
+
+    if (expanded && !jobHolds) {
+      const details = document.createElement("div");
+      details.className = "utxo-details";
+
+      const privacyText = mwebExpandPrivacy(coin);
+      if (privacyText) {
+        const privacyBody = document.createElement("span");
+        privacyBody.textContent = privacyText;
+        appendDetailSection(details, "Privacy", privacyBody);
+      }
+
+      const companionExact = mwebCompanionExact(coin);
+      if (companionExact) {
+        const plain = document.createElement("span");
+        plain.className = "utxo-detail-companions-plain";
+        plain.textContent = mwebCompanionPlain();
+        const exact = document.createElement("span");
+        exact.className = "utxo-detail-companions-exact";
+        exact.textContent = companionExact;
+        appendDetailSection(details, "Last block", plain, exact);
+      }
+
+      const techKids: Node[] = [];
+      const meta = document.createElement("div");
+      meta.className = "utxo-detail-meta";
+      const confMeta = document.createElement("span");
+      confMeta.className = "utxo-meta";
+      confMeta.textContent =
+        coin.confirmations === 0
+          ? "pending"
+          : `${coin.confirmations.toLocaleString("en-US")} conf`;
+      const id = document.createElement("span");
+      id.className = "utxo-id";
+      id.textContent = truncateOutputId(coin.output_id);
+      id.title = coin.output_id;
+      meta.append(confMeta, id);
+      techKids.push(meta);
+
+      if (coin.non_solo_blocks != null && coin.non_solo_blocks > 0) {
+        const depthNote = document.createElement("span");
+        depthNote.className = "utxo-detail-tech-note";
+        depthNote.textContent = "Depth is not an anonymity-set size.";
+        techKids.push(depthNote);
+      }
+      for (const line of churnHopLines(coin)) {
+        const hop = document.createElement("span");
+        hop.className = "utxo-detail-tech-note";
+        hop.textContent = line;
+        techKids.push(hop);
+      }
+
+      const labelInput = document.createElement("input");
+      labelInput.type = "text";
+      labelInput.className = "utxo-label-input";
+      labelInput.placeholder = "Label (optional)";
+      labelInput.maxLength = MAX_TX_LABEL_CHARS;
+      labelInput.value = coin.label ?? "";
+      labelInput.addEventListener("change", () => {
+        void persistUtxoLabel(coin.output_id, labelInput.value);
+      });
+      techKids.push(labelInput);
+
+      appendDetailSection(details, "Technical", ...techKids);
+      li.append(details);
+    }
+
     el.coinsMwebList.appendChild(li);
   }
+
   if (mwebUtxoCache.length === 0) {
     el.coinsMwebSum.hidden = true;
     el.coinsMwebSum.textContent = "";
   } else {
     el.coinsMwebSum.hidden = false;
-    const bits = [`${mwebUtxoCache.length} coin${mwebUtxoCache.length === 1 ? "" : "s"}`];
+    const bits: string[] = [];
+    if (attentionCount) {
+      bits.push(
+        `${attentionCount} need${attentionCount === 1 ? "s" : ""} attention`,
+      );
+    }
+    bits.push(`${mwebUtxoCache.length} coin${mwebUtxoCache.length === 1 ? "" : "s"}`);
     if (immature) bits.push(`${immature} maturing`);
-    const userFrozen = mwebUtxoCache.filter(
-      (coin) => !!coin.locked && !churnPhaseActive(coin.churn_phase),
-    ).length;
-    if (userFrozen) bits.push(`${userFrozen} frozen`);
+    if (frozenCount) bits.push(`${frozenCount} frozen`);
     const active = activeChurnCoin();
-    if (active) bits.push(churnSummaryToken(active));
+    if (active && !churnNeedsAttention(active)) bits.push(churnSummaryToken(active));
+    else if (active && churnNeedsAttention(active) && !attentionCount) {
+      bits.push(churnSummaryToken(active));
+    }
     el.coinsMwebSum.textContent = bits.join(" · ");
   }
   updateChurnBanner();

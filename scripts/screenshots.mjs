@@ -81,13 +81,40 @@ async function capture(page, theme) {
     await prepare(page, "coins", theme);
     await page.locator("#nav-coins").click();
     await page.locator("#coins-seg-private").click();
-    await page.getByText("maturing · 4 blocks left").waitFor();
+    await page.getByText("Maturing · 4 blocks left").waitFor();
+    await page.locator("#coins-mweb-list").getByText("Frozen").waitFor();
+    await page.locator("#coins-mweb-list").getByText("Tied to peg-in").waitFor();
+    // Labels live behind More → Details — expand until Savings is visible.
+    for (let i = 0; i < 6; i++) {
+      const found = await page.evaluate(() =>
+        [...document.querySelectorAll("#coins-mweb-list input")].some(
+          (input) => input instanceof HTMLInputElement && input.value === "Savings",
+        ),
+      );
+      if (found) break;
+      const opened = await page.evaluate(() => {
+        for (const row of document.querySelectorAll("#coins-mweb-list li")) {
+          if (row.querySelector(".utxo-details")) continue;
+          const more = row.querySelector("details.utxo-more");
+          if (!(more instanceof HTMLDetailsElement)) continue;
+          more.open = true;
+          const btn = [...more.querySelectorAll("button")].find(
+            (el) => el.textContent === "Details",
+          );
+          if (btn instanceof HTMLButtonElement) {
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!opened) break;
+    }
     await page.waitForFunction(() =>
       [...document.querySelectorAll("#coins-mweb-list input")].some(
         (input) => input instanceof HTMLInputElement && input.value === "Savings",
       ),
     );
-    await page.locator("#coins-mweb-list").getByText("frozen").waitFor();
     await page.locator(".content").screenshot({ path: out("coins.png") });
 
     await page.locator("#nav-send").click();
@@ -103,7 +130,7 @@ async function capture(page, theme) {
     await prepare(page, "self-spend", theme);
     await page.locator("#nav-coins").click();
     await page.locator("#coins-seg-private").click();
-    await page.getByText("This block also had 4 other kernels and 7 other outputs.").waitFor();
+    await page.locator("#coins-mweb-list").getByText("Shared 1 block").waitFor();
     await page.locator(".content").screenshot({ path: out("self-spend.png") });
 
     await prepare(page, "balance", theme);

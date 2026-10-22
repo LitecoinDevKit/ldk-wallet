@@ -45,13 +45,27 @@ Library-level loops live in the sibling BDK repo ([`LITECOIN_E2E.md`](../../bdk/
 - [ ] Transparent balance increases after HogEx credit visible to Electrum sync
 - [ ] History labels peg-out correctly
 
-### 5. Failure recovery (must pass)
+### 5. Spend to self (Coins → Private)
+
+- [ ] Coins → Private list is scannable: amount + attention chip + short status only; no unknown-depth line, hop dump, or full output id on collapsed rows
+- [ ] Action column is one line tall (Spend to self + More side by side when spendable; More only when not); More menu overlays and does not grow the row
+- [ ] Known depth on collapsed rows is at most “Shared N blocks”; expand does not restate that line
+- [ ] Peg-in-tied mature coin: “Tied to peg-in” chip, primary Spend to self, Balance banner still opens Coins
+- [ ] Spend to self confirm: what it does, fee, amount, quiet-block note; broadcast succeeds
+- [ ] Live `#churn-status` card tracks Sending / Waiting / Paused / Couldn't send; Try again / Cancel only on pause or Couldn't send (not while Sending/Waiting)
+- [ ] Unconfirmed self-spend outputs show Pending (not Maturing); Maturing is for peg-in countdown only
+- [ ] After a scored hop: settled card + Just spent highlight; More → Details shows labeled Privacy / Last block / Technical sections
+- [ ] Quiet (solo) block pauses the job on the card (not a toast); retry after more mempool/block activity
+- [ ] Frozen / maturing coins: Spend and Split blocked; Frozen is a visible chip + left-edge accent
+- [ ] Empty Private list offers Move to private → Swap peg-in
+
+### 6. Failure recovery (must pass)
 
 - [ ] With RPC cleared and peers unreachable: private send/peg-out failure opens recovery modal → Settings Connection
 - [ ] Mempool conflict / already-known messages point to Sync + History Pending (no RBF UI)
 - [ ] After fixing RPC/peers, retry succeeds
 
-### 6. Record the run
+### 7. Record the run
 
 Fill in when green:
 

@@ -2138,22 +2138,43 @@ textarea {
 }
 
 .utxo-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.55rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 0.55rem;
+  row-gap: 0;
   padding: 0.4rem 0.5rem;
   border-radius: var(--radius-sm);
   background: var(--surface-2, rgba(0, 0, 0, 0.04));
   font-size: 0.8rem;
+  position: relative;
+  overflow: visible;
 }
 
 .utxo-row.is-locked {
   opacity: 0.72;
 }
 
+.utxo-row.is-maturing,
+.utxo-row.is-pending {
+  opacity: 0.78;
+}
+
+.utxo-row.is-frozen {
+  opacity: 1;
+  background: color-mix(in srgb, var(--text-3) 8%, var(--surface-2));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--text-3) 55%, transparent);
+}
+
+.utxo-row.is-tied {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+  outline: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+}
+
 .utxo-row.is-just-spent {
   opacity: 1;
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-2));
   outline: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
 }
 
@@ -2170,6 +2191,151 @@ textarea {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.utxo-status {
+  color: var(--text-2);
+  font-size: 0.72rem;
+}
+
+.utxo-details {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-top: 0.35rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+
+.utxo-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.utxo-detail-section-label {
+  color: var(--text-3);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.utxo-detail-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  color: var(--text-1);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.utxo-detail-companions-plain {
+  color: var(--text-2);
+  font-size: 0.72rem;
+}
+
+.utxo-detail-companions-exact {
+  color: var(--text-3);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.utxo-detail-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.utxo-detail-meta .utxo-id {
+  flex: 1;
+  min-width: 6rem;
+}
+
+.utxo-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.utxo-detail-tech-note {
+  color: var(--text-3);
+  font-size: 0.66rem;
+  line-height: 1.35;
+}
+
+.utxo-more {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.utxo-more > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.utxo-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.utxo-more-menu {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 8.75rem;
+  padding: 0.35rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  /* --surface is undefined; use an opaque panel so row text cannot show through. */
+  background: var(--surface-2);
+  box-shadow: var(--shadow-2);
+}
+
+.utxo-more-menu .btn {
+  justify-content: flex-start;
+  width: 100%;
+  background: transparent;
+}
+
+.utxo-more-menu .btn:hover {
+  background: var(--surface-3);
+}
+
+.coins-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+}
+
+.coins-empty[hidden] {
+  display: none;
+}
+
+.pill-maturing {
+  background: color-mix(in srgb, var(--warning) 14%, var(--surface));
+  color: var(--warning);
+}
+
+.pill-frozen {
+  background: color-mix(in srgb, var(--text-3) 22%, var(--surface));
+  color: var(--text-1);
+  border: 1px solid color-mix(in srgb, var(--text-3) 40%, var(--border));
+  font-weight: 600;
+}
+
+.pill-tied {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .churn-status {
@@ -2288,6 +2454,14 @@ textarea {
   flex-direction: column;
   gap: 0.25rem;
   flex-shrink: 0;
+}
+
+/* After .split-actions so row wins over the default column stack. */
+.split-actions.split-actions-private {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 0.3rem;
 }
 
 .split-mode-row {

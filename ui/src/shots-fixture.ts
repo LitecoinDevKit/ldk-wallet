@@ -4,8 +4,8 @@
  *
  * Scenes (`?shots=1&scene=`):
  * - balance (default): two balances, a quiet sheet, status strip with an age
- * - coins: Private list with frozen, labeled, and maturing rows
- * - self-spend: that list, plus one row after a scored hop
+ * - coins: Private list with frozen, labeled, maturing, and peg-in-tied rows
+ * - self-spend: that list, plus one row after a scored hop (shared-block depth)
  * - recovery: no wallet yet, so boot stays on create / restore
  */
 
@@ -140,6 +140,15 @@ function privateCoins(): Coin[] {
     from_pegin: false,
     non_solo_blocks: 0,
   };
+  const tied: Coin = {
+    output_id: id("t7"),
+    amount_sats: S.p75,
+    confirmations: 30,
+    mature: true,
+    from_pegin: true,
+    non_solo_blocks: 0,
+    label: "From peg-in",
+  };
   const current = scene();
   if (current === "balance") {
     return [
@@ -170,13 +179,13 @@ function privateCoins(): Coin[] {
     churn_phase: "done",
   });
   const ordinary = quietCoin({
-    output_id: id("f6"),
+    output_id: id("g8"),
     amount_sats: S.p75,
     confirmations: 30,
     mature: true,
   });
-  if (current === "self-spend") return [scored, frozen, labeled, maturing];
-  return [frozen, labeled, maturing, ordinary];
+  if (current === "self-spend") return [scored, tied, frozen, labeled, maturing];
+  return [tied, frozen, labeled, maturing, ordinary];
 }
 
 function transactions() {

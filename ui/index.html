@@ -1032,9 +1032,13 @@
                 <h3>Coins</h3>
                 <button type="button" id="btn-refresh-coins" class="btn btn-ghost btn-sm">Refresh</button>
               </div>
-              <p class="hint">
-                Freeze public coins so automatic sends skip them. Split a coin into equal pieces or
-                common denominations — an advanced self-transfer, not a payment.
+              <p class="hint" id="coins-hint-public">
+                Freeze public coins so automatic sends skip them. Split is an advanced self-transfer,
+                not a payment. Open Details to copy a txid or view it on litview.
+              </p>
+              <p class="hint" id="coins-hint-private" hidden>
+                Spend to self mixes a coin into other MWEB activity in a block. Freeze keeps Send and
+                Swap from using it. Split is an advanced self-transfer, not a payment.
               </p>
               <div class="seg-toggle" id="coins-toggle" role="tablist" aria-label="Coin type">
                 <button
@@ -1069,7 +1073,15 @@
                 <div id="churn-status" class="churn-status" hidden></div>
                 <p class="hint mono" id="coins-mweb-sum" hidden></p>
                 <ul class="utxo-list coins-utxo-list" id="coins-mweb-list"></ul>
-                <p class="hint" id="coins-mweb-empty">No private coins yet.</p>
+                <div class="coins-empty" id="coins-mweb-empty">
+                  <p class="hint">No private coins yet.</p>
+                  <p class="hint">
+                    Peg in via Swap, or receive to a private address.
+                  </p>
+                  <button type="button" id="btn-coins-pegin" class="btn btn-primary btn-sm">
+                    Move to private
+                  </button>
+                </div>
               </div>
             </div>
           </section>

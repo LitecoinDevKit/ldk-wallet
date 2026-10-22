@@ -746,6 +746,15 @@ pub fn request_cancel(job: &mut ChurnJob) -> Result<(), WalletError> {
             "There is no self-spend to cancel.".into(),
         ));
     }
+    // Once broadcast, the hop is on the network. Cancel would only drop local
+    // tracking; it cannot unbroadcast. Wait for inclusion, solo pause, or a
+    // not-included recovery path instead.
+    if job.phase == ChurnPhase::WaitingConfirm {
+        return Err(WalletError::BuildTx(
+            "This self-spend is already on the network. Wait for the next block."
+                .into(),
+        ));
+    }
     job.phase = ChurnPhase::Cancelled;
     Ok(())
 }
@@ -956,6 +965,14 @@ mod tests {
         request_cancel(&mut job).unwrap();
         write_job(dir.path(), &job).unwrap();
         assert!(!held_by_active_job(dir.path(), &id).unwrap());
+    }
+
+    #[test]
+    fn cancel_rejected_while_waiting_for_confirm() {
+        let mut job = job_waiting_confirm();
+        let err = request_cancel(&mut job).unwrap_err().to_string();
+        assert!(err.contains("already on the network"));
+        assert_eq!(job.phase, ChurnPhase::WaitingConfirm);
     }
 
     #[test]

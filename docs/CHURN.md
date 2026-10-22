@@ -10,6 +10,8 @@ One coin, one job. Each hop is a 1-in-1 spend to a fresh address of this wallet.
 
 The default is one hop. A collapsed control can ask for up to 10 non-solo blocks. A quiet block pauses the job. It does not retry by itself.
 
+Cancel is only offered after a quiet-block / unscored pause, or when the hop could not be sent. It is not offered while Sending or Waiting: once broadcast, the hop is on the network and cannot be unbroadcast. An unconfirmed self-spend output shows as Pending (not Maturing — that label is for peg-in maturity).
+
 A hop counts when the inclusion block was not ours alone. For this 1-in-1, that is when the inclusion header's `kernel_mmr_size` is more than 1 or `output_mmr_size` grew by more than 1 from the parent header. The kernel field is the block's own kernel count; litecoind rebuilds the kernel MMR every block, so it is never compared with the parent. Header sizes cannot tell a peg-in from a private spend. The row says how many other kernels and outputs were in the block, and that peg-ins and peg-outs in that count publish an amount.
 
 This sync stores one tip leafset. Scoring does not diff that leafset. The hop is in a block after the tip at broadcast. The wallet finds the new output's leaf and scores the block whose output MMR crosses it, through the current tip. A header it cannot read yet leaves the hop waiting for a later sync. If several blocks pass and that output is still not on chain, the spend is marked not included and the original coin can be sent again.
@@ -27,3 +29,9 @@ Depth is local. Spent outputs leave the UTXO set, so a restore cannot reconstruc
 - Balance shows one dismissible line when a spendable peg-in coin has never shared a block. It opens Coins. It is not a second maturity warning.
 
 No privacy meter, no automatic start after peg-in, and no "safe to peg out" state.
+
+## Coins list presentation
+
+Coins → Private default row is a decision surface: amount, an attention chip when needed (Maturing / Frozen / Tied to peg-in / churn / Just spent), one short status line when useful, and a one-line action column — Spend to self (when spendable; primary only when peg-in-tied) beside More. Freeze, Split, and Details live in the More overlay so opening it does not change row height. Frozen uses a chip plus a muted left-edge accent.
+
+Default-row depth is at most "Shared N blocks". Unknown or zero depth shows nothing on the collapsed row. Expand never restates that depth line. Expanded detail uses labeled sections: Privacy (only when it adds info — tied sentence, no shared blocks yet, or "No shared-block history available."), Last block (companions), Technical (confirmations, truncated output id, hops, anonymity-set disclaimer, label). The live `#churn-status` card and confirm sheet keep the copy above (kernels/outputs, non-solo block counts, fee-first confirm).

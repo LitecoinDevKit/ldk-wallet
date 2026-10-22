@@ -6,7 +6,7 @@ Copy/paste as needed (do **not** request or quote any seed):
 
 ## Recovery spinning / logs
 
-Hey — restore creates the wallet in a few seconds; the long part is the **first sync** after that (Electrum full address scan + full MWEB UTXO download). On a decent connection that’s often **a couple of minutes**; **10–30+** on a slow link or a throttled MWEB peer is still normal. Watch the Sync control for **“Syncing…”** and later **Downloading MWEB outputs: N / M** (v0.4.7+ keeps a labeled overlay through the first restore sync).
+Hey — restore creates the wallet in a few seconds, then opens the main wallet UI; the long part is the **first sync** after that (Electrum full address scan + full MWEB UTXO download). On a decent connection that’s often **a couple of minutes**; **10–30+** on a slow link or a throttled MWEB peer is still normal. Watch the Sync control for **“Syncing…”**, the status strip (block height / MWEB), and later **Downloading MWEB outputs: N / M** on the MWEB card.
 
 If it never finishes until you **quit and reopen**, older builds defaulted MWEB peers to `127.0.0.1:9333`. With no local litecoind, first sync could stall. **v0.4.7+** leaves peers empty (auto-discovery), migrates the bare localhost default away, and skips unreachable peers in ~2s. Workaround on older builds: Settings → clear **MWEB P2P peers** → Save → Sync.
 

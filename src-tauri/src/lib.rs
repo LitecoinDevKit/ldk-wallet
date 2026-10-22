@@ -71,7 +71,7 @@ async fn lock_wallet(
     let wallet = Arc::clone(&state);
     wallet.lock();
     #[cfg(feature = "litvm")]
-    litvm::drop_from_app(&app);
+    litvm::drop_from_app(&app).await;
     let _ = app;
     Ok(())
 }
@@ -115,7 +115,7 @@ async fn create_wallet(
     if result.is_ok() {
         #[cfg(feature = "litvm")]
         {
-            let _ = litvm::attach_from_app(&app, &state);
+            let _ = litvm::attach_from_app(&app, &state).await;
         }
     }
     result
@@ -138,7 +138,7 @@ async fn restore_wallet(
     if result.is_ok() {
         #[cfg(feature = "litvm")]
         {
-            let _ = litvm::attach_from_app(&app, &state);
+            let _ = litvm::attach_from_app(&app, &state).await;
         }
     }
     result
@@ -157,7 +157,7 @@ async fn load_wallet(
     if result.is_ok() {
         #[cfg(feature = "litvm")]
         {
-            let _ = litvm::attach_from_app(&app, &state);
+            let _ = litvm::attach_from_app(&app, &state).await;
         }
     }
     result
@@ -826,7 +826,7 @@ async fn wipe_wallet(
     let wallet = Arc::clone(&state);
     #[cfg(feature = "litvm")]
     {
-        litvm::drop_from_app(&app);
+        litvm::drop_from_app(&app).await;
         litvm::wipe_sidecar(&dir);
     }
     tauri::async_runtime::spawn_blocking(move || wallet.wipe(&dir).map_err(map_err))

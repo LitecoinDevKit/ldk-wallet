@@ -4329,12 +4329,14 @@ async function boot() {
   }
 }
 
-async function enterReady(opts?: { sync?: boolean }) {
+async function enterReady(opts?: { sync?: boolean; summary?: WalletSummary }) {
   const shouldSync = opts?.sync !== false;
   displayUnit = readDisplayUnit();
   hideBalances = readHideBalances();
   syncAmountFieldLabels();
-  const s = await invoke<WalletSummary>("load_wallet");
+  // Restore already loaded the wallet in memory; reuse that summary so we can
+  // flip to ready before any further IPC (avoids a second load_wallet gate).
+  const s = opts?.summary ?? (await invoke<WalletSummary>("load_wallet"));
   renderSummary(s);
   // Legacy installs that already hold funds skip the first-receive modal.
   if (lastTotalSats > 0 && !isFirstReceiveSeen()) setFirstReceiveSeen(true);
@@ -4641,7 +4643,7 @@ el.btnRestore.addEventListener("click", async () => {
   try {
     const passphrase = el.restorePassphrase.value;
     const aezeedPass = el.restoreAezeedPass.value;
-    await invoke<WalletSummary>("restore_wallet", {
+    const summary = await invoke<WalletSummary>("restore_wallet", {
       req: {
         mnemonic,
         network: "mainnet",
@@ -4660,9 +4662,10 @@ el.btnRestore.addEventListener("click", async () => {
     syncPassMeters();
     syncing = false;
     updateBusyUi();
-    await enterReady({ sync: false });
-    setLoadingLabel("Scanning transparent addresses…");
-    await runSync({ quiet: false });
+    // Drop the create overlay and open the balance UI before refreshes/sync so
+    // first-sync progress shows on the Sync control and status strip.
+    hideLoading();
+    await enterReady({ summary });
   } catch (e) {
     setError(String(e));
     syncing = false;

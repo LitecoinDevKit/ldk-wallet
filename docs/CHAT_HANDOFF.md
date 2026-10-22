@@ -1,4 +1,4 @@
-# Chat handoff — Litecoin Mac wallet (v0.4.7)
+# Chat handoff — Litecoin Mac wallet (v0.4.8)
 
 Paste or `@`-reference this file when starting a new Cursor chat in this repo.
 

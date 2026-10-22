@@ -135,7 +135,7 @@ fn peer_services(addr: SocketAddr, network: WalletNetwork) -> Option<u64> {
         receiver: Address::new(&addr, ServiceFlags::NONE),
         sender: Address::new(&([0, 0, 0, 0], 0).into(), ours),
         nonce: 0,
-        user_agent: "/ltc-wallet:0.4.8/".into(),
+        user_agent: "/ltc-wallet:0.4.9/".into(),
         start_height: 0,
         relay: false,
     };

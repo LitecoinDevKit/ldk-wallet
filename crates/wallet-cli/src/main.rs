@@ -1,6 +1,5 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -496,7 +495,14 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
     lines.push(format!("E2E_MWEB_DEST={dest}"));
     lines.push(String::new());
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
+    opts.write(true).create(true).truncate(true);
+    // Scan/spend hex. Unix creates the file 0600; Windows leaves the
+    // per-user profile ACL in place (there is no mode bit to set).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     let mut f = opts
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
@@ -525,7 +531,6 @@ fn ensure_loaded(app: &WalletApp, data_dir: &Path, passphrase_opt: &Option<Strin
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn write_coinswapd_env_merges_without_clobbering_other_keys() {
@@ -549,8 +554,10 @@ mod tests {
         assert!(got.contains("E2E_MWEB_DEST=ltcmweb1qqtestaddress"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_coinswapd_env_mode_is_600() {
+        use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!(
             "mln-coinswapd-env-mode-{}-{}",
             std::process::id(),

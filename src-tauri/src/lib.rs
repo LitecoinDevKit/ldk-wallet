@@ -763,7 +763,19 @@ fn open_url_in_browser(url: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| e.to_string())?;
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // One argv, not `cmd /C`, so `&` in a URL is not a second command.
+        // CREATE_NO_WINDOW keeps a console from flashing beside the browser.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         return Err("opening URLs is not supported on this platform".into());
     }

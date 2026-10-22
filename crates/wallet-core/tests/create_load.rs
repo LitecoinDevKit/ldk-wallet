@@ -196,6 +196,9 @@ fn create_after_orphaned_db_wipes_and_succeeds() {
         app.load(dir.path()).unwrap_err(),
         WalletError::MissingMnemonic
     ));
+    // The first app still holds wallet.sqlite. Unix can unlink an open file;
+    // Windows cannot (os error 32). Drop it before the replacement create wipes.
+    drop(app);
 
     let app2 = with_secrets(secrets);
     let resp = app2

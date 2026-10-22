@@ -12,16 +12,23 @@ that built the artifacts. After downloading, compare:
 
 ```bash
 # macOS
-shasum -a 256 "LDK Wallet_0.4.9_aarch64.dmg"
+shasum -a 256 "LDK Wallet_0.4.10_aarch64.dmg"
 # Linux
-sha256sum "LDK Wallet_0.4.9_amd64.AppImage"
+sha256sum "LDK Wallet_0.4.10_amd64.AppImage"
 ```
 
-against the matching line in the sums file, or use the helper:
+```powershell
+# Windows
+Get-FileHash -Algorithm SHA256 ".\LDK Wallet_0.4.10_x64-setup.exe"
+```
+
+against the matching line in the sums file (`SHA256SUMS-windows-x86_64.txt` for the installer), or use the helper:
 
 ```bash
-scripts/verify-release.sh checksums "LDK Wallet_0.4.9_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
+scripts/verify-release.sh checksums "LDK Wallet_0.4.10_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
 ```
+
+Unsigned Windows installers trip SmartScreen ("Windows protected your PC"). That is expected. After the checksum matches, choose More info, then Run anyway.
 
 This proves your download was not corrupted or swapped after CI built it. It
 does not prove the source code is honest — for that, keep reading.
@@ -33,7 +40,7 @@ build time, cryptographically linking it to the exact commit and workflow run
 that produced it. With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify "LDK Wallet_0.4.9_aarch64.dmg" --repo LitecoinDevKit/ldk-wallet
+gh attestation verify "LDK Wallet_0.4.10_aarch64.dmg" --repo LitecoinDevKit/ldk-wallet
 ```
 
 A successful verification shows the source commit and the workflow file that
@@ -111,13 +118,16 @@ After creating a wallet:
 ```bash
 DATA_DIR="$HOME/Library/Application Support/com.indigonakamoto.ltc-wallet" # macOS
 # DATA_DIR="$HOME/.local/share/com.indigonakamoto.ltc-wallet"             # Linux
+# DATA_DIR="$env:APPDATA\com.indigonakamoto.ltc-wallet"                    # Windows (PowerShell)
 
 ls -l "$DATA_DIR"
 ```
 
-Expect: `wallet.mnemonic.enc` with mode `-rw-------` (0600), and **no**
+On macOS and Linux, expect `wallet.mnemonic.enc` with mode `-rw-------` (0600), and **no**
 plaintext `wallet.mnemonic` file (legacy plaintext files are migrated to
-encrypted storage on first unlock, then deleted). MWEB data is sealed too:
+encrypted storage on first unlock, then deleted). On Windows the same filenames
+live under `%APPDATA%\com.indigonakamoto.ltc-wallet`; that profile is private to
+the user, and there is no Unix mode to check. MWEB data is sealed too:
 after the first sync you should see `mweb_coins.enc`, `mweb_sync.enc`,
 `mweb_receive_index.enc` and `mweb_history.enc` instead of the older
 plaintext `mweb.sqlite` / `mweb_*.json` files.
@@ -135,7 +145,7 @@ This clones the repo at the tag plus the three pinned siblings, builds, and
 prints SHA-256 hashes of the produced bundles.
 
 **Honest caveat:** builds are not yet bit-for-bit reproducible. Container
-formats (`.dmg`, `.AppImage`) embed timestamps, and the binary depends on the
+formats (`.dmg`, `.AppImage`, the Windows `.exe`) embed timestamps, and the binary depends on the
 exact Rust toolchain (CI uses the version pinned in
 `.github/workflows/release.yml`). Matching hashes are strong evidence; a
 mismatch means "investigate" (start by comparing the app binary inside the

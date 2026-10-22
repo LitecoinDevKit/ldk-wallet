@@ -1,6 +1,6 @@
-# Build macOS (.app/.dmg) and Linux (.deb/.AppImage) artifacts and attach them
-# to a draft GitHub Release. Trigger via Actions → "Release" → Run workflow,
-# or by pushing to the `release` branch.
+# Build macOS (.app/.dmg), Linux (.deb/.AppImage), and Windows (NSIS .exe)
+# artifacts and attach them to a draft GitHub Release. Trigger via Actions →
+# "Release" → Run workflow, or by pushing to the `release` branch.
 #
 # Publishing that draft runs prune-releases.yml, which deletes every other
 # published release and leaves the git tags in place. The public Release list
@@ -48,6 +48,9 @@ jobs:
             args: ""
           - platform: ubuntu-22.04
             sums_suffix: linux-x86_64
+            args: ""
+          - platform: windows-latest
+            sums_suffix: windows-x86_64
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -116,6 +119,9 @@ jobs:
               **signed and notarized** (Developer ID). Verify with `spctl -a -vv` —
               see [`docs/VERIFYING.md`](https://github.com/${{ github.repository }}/blob/main/docs/VERIFYING.md) §3.
             - Linux: prefer the `.AppImage` (`chmod +x` then run), or install the `.deb`.
+            - Windows: run the `.exe` installer. It installs for the current user and does not
+              ask for an administrator. This build is **unsigned**, so SmartScreen says Windows
+              protected your PC — after the checksum matches, choose More info, then Run anyway.
 
             **Verify your download** — see [`docs/VERIFYING.md`](https://github.com/${{ github.repository }}/blob/main/docs/VERIFYING.md).
             Each platform attaches a `SHA256SUMS-<platform>.txt` with checksums of its artifacts.
@@ -144,6 +150,9 @@ jobs:
               macOS claims the app "is damaged" — it isn't. Clear the quarantine flag once with
               `xattr -cr "/Applications/LDK Wallet.app"`, then launch normally.
             - Linux: prefer the `.AppImage` (`chmod +x` then run), or install the `.deb`.
+            - Windows: run the `.exe` installer. It installs for the current user and does not
+              ask for an administrator. This build is **unsigned**, so SmartScreen says Windows
+              protected your PC — after the checksum matches, choose More info, then Run anyway.
 
             **Verify your download** — see [`docs/VERIFYING.md`](https://github.com/${{ github.repository }}/blob/main/docs/VERIFYING.md).
             Each platform attaches a `SHA256SUMS-<platform>.txt` with checksums of its artifacts.
@@ -158,31 +167,34 @@ jobs:
       - name: Generate and upload SHA256SUMS
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARTIFACT_PATHS: ${{ steps.build_signed.outputs.artifactPaths || steps.build_unsigned.outputs.artifactPaths }}
-          RELEASE_ID: ${{ steps.build_signed.outputs.releaseId || steps.build_unsigned.outputs.releaseId }}
           SUMS_FILE: SHA256SUMS-${{ matrix.sums_suffix }}.txt
+          TAG: v${{ steps.build_signed.outputs.appVersion || steps.build_unsigned.outputs.appVersion }}
         run: |
           set -euo pipefail
-          : > "$SUMS_FILE"
-          while IFS= read -r artifact; do
-            # .app bundles are directories; only hash real files (.dmg/.deb/.AppImage).
-            [ -f "$artifact" ] || continue
-            if command -v sha256sum >/dev/null 2>&1; then
-              (cd "$(dirname "$artifact")" && sha256sum "$(basename "$artifact")") >> "$SUMS_FILE"
-            else
-              (cd "$(dirname "$artifact")" && shasum -a 256 "$(basename "$artifact")") >> "$SUMS_FILE"
-            fi
-          done < <(printf '%s' "$ARTIFACT_PATHS" | jq -r '.[]')
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+          const artifacts = JSON.parse(process.env.ARTIFACT_PATHS || "[]");
+          const lines = [];
+          for (const artifact of artifacts) {
+            // .app bundles are directories; only hash real files.
+            if (!fs.existsSync(artifact) || !fs.statSync(artifact).isFile()) continue;
+            const hash = crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex");
+            lines.push(`${hash}  ${path.basename(artifact)}`);
+          }
+          if (lines.length === 0) {
+            console.error("no file artifacts to hash");
+            process.exit(1);
+          }
+          fs.writeFileSync(process.env.SUMS_FILE, lines.join("\n") + "\n");
+          NODE
           echo "Checksums:"
           cat "$SUMS_FILE"
-          curl -fsS -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: text/plain" \
-            --data-binary "@$SUMS_FILE" \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$SUMS_FILE" \
-            > /dev/null
-          echo "Uploaded $SUMS_FILE to release $RELEASE_ID"
+          gh release upload "$TAG" "$SUMS_FILE" --repo "${{ github.repository }}" --clobber
+          echo "Uploaded $SUMS_FILE to release $TAG"
 
       # Provenance: cryptographically links each artifact digest to this exact
       # workflow run, commit and builder. Verify with:
@@ -200,13 +212,24 @@ jobs:
         if: env.HAS_MINISIGN == 'true'
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          RELEASE_ID: ${{ steps.build_signed.outputs.releaseId || steps.build_unsigned.outputs.releaseId }}
           SUMS_FILE: SHA256SUMS-${{ matrix.sums_suffix }}.txt
+          TAG: v${{ steps.build_signed.outputs.appVersion || steps.build_unsigned.outputs.appVersion }}
         run: |
           set -euo pipefail
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            curl -fsSL -o minisign.zip "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip"
+            rm -rf minisign-bin
+            powershell.exe -NoProfile -Command "Expand-Archive -LiteralPath 'minisign.zip' -DestinationPath 'minisign-bin' -Force"
+            exe="$(find minisign-bin -type f -name 'minisign.exe' -print -quit)"
+            if [[ -z "$exe" ]]; then
+              echo "minisign.exe not found in archive" >&2
+              find minisign-bin -print >&2
+              exit 1
+            fi
+            export PATH="$(cd "$(dirname "$exe")" && pwd):$PATH"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
             brew install minisign
           else
             sudo apt-get update && sudo apt-get install -y minisign
@@ -216,10 +239,5 @@ jobs:
           minisign -S -s minisign.key -m "$SUMS_FILE" -x "$SUMS_FILE.minisig" \
             -t "ltc-wallet release $GITHUB_REF_NAME"
           rm -f minisign.key
-          curl -fsS -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary "@$SUMS_FILE.minisig" \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$SUMS_FILE.minisig" \
-            > /dev/null
-          echo "Uploaded $SUMS_FILE.minisig to release $RELEASE_ID"
+          gh release upload "$TAG" "$SUMS_FILE.minisig" --repo "${{ github.repository }}" --clobber
+          echo "Uploaded $SUMS_FILE.minisig to release $TAG"

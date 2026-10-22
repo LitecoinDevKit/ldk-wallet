@@ -88,6 +88,10 @@ vendored dependencies.
 - macOS releases are unsigned until Apple Developer credentials are set up
   (CI is already wired to sign + notarize automatically once the secrets exist;
   see [`docs/NOTARIZATION.md`](docs/NOTARIZATION.md)).
+- Windows releases are unsigned. SmartScreen warns on the installer. Check
+  `SHA256SUMS-windows-x86_64.txt` before running it
+  ([`docs/VERIFYING.md`](docs/VERIFYING.md)). Secret files sit in the per-user
+  roaming profile (`%APPDATA%`); Windows has no Unix `0600` mode.
 - The `wipe` escape hatch intentionally works without the passphrase — it is
   the only recovery path when a passphrase is lost. It deletes data only
   (funds are recoverable from a mnemonic backup) and requires a typed

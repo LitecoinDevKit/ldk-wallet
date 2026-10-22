@@ -44,7 +44,18 @@ cmd_checksums() {
 
   local name expected actual
   name="$(basename "$artifact")"
-  expected="$(awk -v n="$name" '$2 == n || $2 == "*"n {print $1}' "$sums")"
+  # The hash is field 1. The filename may contain spaces (the Windows installer does).
+  expected="$(awk -v n="$name" '
+    {
+      hash = $1
+      rest = $0
+      sub(/^[[:xdigit:]]+[ \t]+\*?/, "", rest)
+      if (rest == n) {
+        print hash
+        exit
+      }
+    }
+  ' "$sums")"
   if [ -z "$expected" ]; then
     echo "FAIL: $name not listed in $sums" >&2
     exit 1
@@ -87,7 +98,7 @@ cmd_source_build() {
   echo
   echo "SHA-256 of built bundles (compare against the release SHA256SUMS):"
   find "$workdir/ltc-wallet-mac" -path '*/release/bundle/*' \
-    \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) -type f \
+    \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.exe' \) -type f \
     -print0 | while IFS= read -r -d '' f; do
       sha256 "$f"
     done

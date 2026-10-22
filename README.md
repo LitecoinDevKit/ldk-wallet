@@ -1,6 +1,6 @@
 # LDK Wallet
 
-Native Litecoin wallet for macOS (Apple Silicon) and Linux (x86_64), built on the Litecoin BDK fork ([`LitecoinDevKit/bdk`](https://github.com/LitecoinDevKit/bdk) + [`bdk_wallet`](https://github.com/LitecoinDevKit/bdk_wallet)), with a Tauri 2 shell.
+Native Litecoin wallet for macOS (Apple Silicon), Linux (x86_64), and Windows (x64), built on the Litecoin BDK fork ([`LitecoinDevKit/bdk`](https://github.com/LitecoinDevKit/bdk) + [`bdk_wallet`](https://github.com/LitecoinDevKit/bdk_wallet)), with a Tauri 2 shell.
 
 **Rust product reference** for LitecoinDevKit integrators (maps-first MWEB via `wallet-core`, **not** UniFFI). Mobile bindings use a separate surface — see [ADOPTION.md](https://github.com/LitecoinDevKit/bdk/blob/litecoin/docs/ADOPTION.md).
 
@@ -8,9 +8,9 @@ Canonical MWEB shape in `wallet-core`: Electrum/RPC tip → `MwebStore` + LIP sy
 
 ## Status
 
-**v0.4.9** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. Spend a private coin to itself so it can share a later block. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
+**v0.4.10** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. Spend a private coin to itself so it can share a later block. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
 
-Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LDK Wallet.app"`) and **Linux x86_64** (`.deb` / `.AppImage`). No Intel Mac, ARM Linux, or Windows build.
+Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LDK Wallet.app"`), **Linux x86_64** (`.deb` / `.AppImage`), and **Windows x64** (unsigned per-user installer — SmartScreen may warn; More info → Run anyway). No Intel Mac or ARM Linux build.
 
 Read [`docs/CHAT_HANDOFF.md`](docs/CHAT_HANDOFF.md). Blueprint: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -49,6 +49,7 @@ Wallet data:
 | --- | --- |
 | macOS | `~/Library/Application Support/com.indigonakamoto.ltc-wallet/` |
 | Linux | `~/.local/share/com.indigonakamoto.ltc-wallet/` |
+| Windows | `%APPDATA%\com.indigonakamoto.ltc-wallet\` |
 
 Mnemonic is stored encrypted (`wallet.mnemonic.enc`). Existing plaintext `wallet.mnemonic` files are migrated on first unlock.
 
@@ -78,7 +79,7 @@ Lab-only: `mweb-coinswapd-env --out FILE` writes scan/spend hex to a chmod 600 f
 
 Icon source: `app-icon.png` (regenerate with `npx tauri icon app-icon.png`).
 
-Bundle targets: macOS `.app` + `.dmg`, Linux `.deb` + `.AppImage`.
+Bundle targets: macOS `.app` + `.dmg`, Linux `.deb` + `.AppImage`, Windows NSIS `.exe` (current user).
 
 ### Local macOS build
 
@@ -127,9 +128,22 @@ npm run tauri build
 
 Share the `.AppImage` (`chmod +x LTC\ Wallet_*.AppImage && ./LTC\ Wallet_*.AppImage`) or install the `.deb` (`sudo dpkg -i …`).
 
+### Local Windows build
+
+Build on Windows (not cross from macOS or Linux). Install the MSVC C++ build tools, the Rust MSVC toolchain, Node, and WebView2, then:
+
+```bash
+npm install
+npm run tauri build
+```
+
+The installer is `src-tauri\target\release\bundle\nsis\LDK Wallet_*_x64-setup.exe`. It installs for the current user and does not ask for an administrator. Unsigned builds trip SmartScreen ("Windows protected your PC"). After the checksum matches, choose More info, then Run anyway.
+
+Wallet files live in `%APPDATA%\com.indigonakamoto.ltc-wallet\`. That folder is already private to the user; Windows has no Unix `0600` mode to set.
+
 ### GitHub Releases (CI)
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) builds **macOS (Apple Silicon)** and **Linux x64** artifacts and attaches them to a **draft** GitHub Release.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds **macOS (Apple Silicon)**, **Linux x64**, and **Windows x64** artifacts and attaches them to a **draft** GitHub Release.
 
 1. Keep the fork revs in the Cargo manifests pointed at known-good commits.
 2. Push to the `release` branch, or run **Actions → Release → Run workflow**.

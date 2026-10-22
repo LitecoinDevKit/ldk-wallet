@@ -63,6 +63,26 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+  rust-windows:
+    name: Rust tests (Windows)
+    runs-on: windows-latest
+    if: github.event_name != 'schedule'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch snapshot
+        with:
+          toolchain: "1.97.1"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
   supply-chain:
     name: cargo audit + cargo deny
     runs-on: ubuntu-22.04

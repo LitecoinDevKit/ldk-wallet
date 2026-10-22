@@ -454,6 +454,11 @@ code {
   color: var(--text-glass-1);
 }
 
+/* Windows uses a native title bar, so the traffic-light inset is empty space. */
+:root[data-platform="windows"] .nav {
+  padding-top: 1.1rem;
+}
+
 .nav > .brand {
   padding: 0 0.4rem;
 }
@@ -2688,6 +2693,10 @@ textarea {
     padding: 0.5rem 0.75rem 0.5rem 4.5rem;
     border-right: 0;
     border-bottom: 1px solid var(--glass-hairline);
+  }
+
+  :root[data-platform="windows"] .nav {
+    padding: 0.5rem 0.75rem;
   }
 
   .nav-list {

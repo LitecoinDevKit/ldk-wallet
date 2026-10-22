@@ -466,7 +466,9 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), WalletError> 
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     // Create with 0600 atomically rather than chmod-after-create, so the file
-    // is never observable with default (umask) permissions.
+    // is never observable with default (umask) permissions. Windows has no
+    // mode bits; the wallet directory is the per-user roaming profile, which
+    // other users cannot read.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

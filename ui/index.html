@@ -18,6 +18,14 @@
         } catch (e) {
           /* localStorage unavailable */
         }
+        var ua = navigator.userAgent || "";
+        document.documentElement.dataset.platform = /Windows/.test(ua)
+          ? "windows"
+          : /Mac/.test(ua)
+            ? "macos"
+            : /Linux/.test(ua)
+              ? "linux"
+              : "other";
       })();
     </script>
     <link rel="stylesheet" href="/src/styles.css" />

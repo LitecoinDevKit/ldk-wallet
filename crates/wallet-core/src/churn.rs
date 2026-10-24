@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1153,17 +1152,22 @@ pub fn write_armed(data_dir: &Path, record: &ArmedRecord) -> Result<(), WalletEr
     let json =
         serde_json::to_string_pretty(record).map_err(|e| WalletError::Meta(e.to_string()))?;
     let path = armed_path(data_dir);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(WalletError::Io)?;
+    // Create with 0600 on Unix so the armed hop is never world-readable.
+    // Windows has no mode bits; the wallet directory is the per-user profile.
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(WalletError::Io)?;
     file.write_all(json.as_bytes()).map_err(WalletError::Io)?;
-    let mut perms = file.metadata().map_err(WalletError::Io)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
-    fs::set_permissions(&path, perms).map_err(WalletError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(WalletError::Io)?;
+    }
     Ok(())
 }
 
@@ -1178,7 +1182,6 @@ pub fn remove_armed(data_dir: &Path) -> Result<(), WalletError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn sizes(kernel: u64, output: u64) -> MmrSizes {
@@ -1800,11 +1803,15 @@ mod tests {
             expired: false,
         };
         write_armed(dir.path(), &record).unwrap();
-        let mode = fs::metadata(armed_path(dir.path()))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(armed_path(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         record.hops.push(ArmedHop {
             raw_hex: "bb".into(),
             txid: "t2".into(),

@@ -2156,6 +2156,15 @@ textarea {
   overflow: visible;
 }
 
+.utxo-row:has(> input[type="checkbox"]) {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.utxo-row > input[type="checkbox"] {
+  margin-top: 0.2rem;
+  flex-shrink: 0;
+}
+
 .utxo-row.is-locked {
   opacity: 0.72;
 }

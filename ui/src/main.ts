@@ -1857,7 +1857,14 @@ el.coinsSegPrivate.addEventListener("click", () => {
 document.addEventListener("pointerdown", (event) => {
   const target = event.target;
   if (!(target instanceof Node)) return;
-  for (const list of [el.coinsMwebList, el.coinsUtxoList]) {
+  for (const list of [
+    el.coinsMwebList,
+    el.coinsUtxoList,
+    el.utxoList,
+    el.peginUtxoList,
+    el.mwebSendUtxoList,
+    el.pegoutUtxoList,
+  ]) {
     for (const open of list.querySelectorAll<HTMLDetailsElement>("details.utxo-more[open]")) {
       if (!open.contains(target)) open.open = false;
     }
@@ -5090,17 +5097,25 @@ function updateCoinControlSum(panel: CoinControlPanel) {
   } · ${formatAmountPlain(sum)}`;
 }
 
+/** Session-only: which public coin rows show expanded detail. */
+const publicCoinExpanded = new Set<string>();
+
 function renderUtxoList(panel: CoinControlPanel) {
   panel.list.textContent = "";
   panel.empty.hidden = utxoCache.length > 0;
   for (const utxo of utxoCache) {
+    const expanded = publicCoinExpanded.has(utxo.outpoint);
     const li = document.createElement("li");
-    li.className = utxo.locked ? "utxo-row is-locked" : "utxo-row";
+    li.dataset.outpoint = utxo.outpoint;
+    const rowClass = ["utxo-row"];
+    if (utxo.locked) rowClass.push("is-frozen");
+    li.className = rowClass.join(" ");
 
     const check = document.createElement("input");
     check.type = "checkbox";
     check.disabled = utxo.locked;
     check.checked = panel.selected.has(utxo.outpoint);
+    check.title = utxo.locked ? "Unfreeze to spend." : "Include this coin";
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(utxo.outpoint);
       else panel.selected.delete(utxo.outpoint);
@@ -5117,38 +5132,112 @@ function renderUtxoList(panel: CoinControlPanel) {
 
     const main = document.createElement("div");
     main.className = "utxo-main";
+    const amtRow = document.createElement("div");
+    amtRow.className = "utxo-amt";
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(utxo.amount_sats);
-    const meta = document.createElement("span");
-    meta.className = "utxo-meta";
+    amtRow.append(amt);
+    if (utxo.locked) {
+      const pill = document.createElement("span");
+      pill.className = "pill pill-frozen";
+      pill.textContent = "Frozen";
+      amtRow.append(pill);
+    }
+
     const kind = utxo.keychain === "internal" ? "change" : "receive";
     const conf =
       utxo.confirmations === 0
         ? "pending"
         : `${utxo.confirmations.toLocaleString("en-US")} conf`;
-    const labelBit = utxo.label ? ` · ${utxo.label}` : "";
-    meta.textContent = `${kind} · ${conf}${utxo.locked ? " · frozen" : ""}${labelBit}`;
-    const id = document.createElement("span");
-    id.className = "utxo-id";
-    id.textContent = utxo.outpoint;
-    const labelInput = document.createElement("input");
-    labelInput.type = "text";
-    labelInput.className = "utxo-label-input";
-    labelInput.placeholder = "Label (optional)";
-    labelInput.maxLength = MAX_TX_LABEL_CHARS;
-    labelInput.value = utxo.label ?? "";
-    labelInput.addEventListener("change", () => {
-      void persistUtxoLabel(utxo.outpoint, labelInput.value);
+    const status = document.createElement("span");
+    status.className = "utxo-status";
+    status.textContent = `${kind} · ${conf}`;
+    main.append(amtRow, status);
+
+    const actions = document.createElement("div");
+    actions.className = "split-actions split-actions-private";
+    const more = document.createElement("details");
+    more.className = "utxo-more";
+    const moreSummary = document.createElement("summary");
+    moreSummary.className = "btn btn-ghost btn-sm";
+    moreSummary.textContent = "More";
+    const moreMenu = document.createElement("div");
+    moreMenu.className = "utxo-more-menu";
+    moreMenu.setAttribute("role", "menu");
+
+    more.addEventListener("toggle", () => {
+      if (!more.open) return;
+      for (const other of panel.list.querySelectorAll<HTMLDetailsElement>(
+        "details.utxo-more[open]",
+      )) {
+        if (other !== more) other.open = false;
+      }
     });
-    main.append(amt, meta, id, labelInput);
+
+    const detailsBtn = document.createElement("button");
+    detailsBtn.type = "button";
+    detailsBtn.className = "btn btn-ghost btn-sm";
+    detailsBtn.setAttribute("role", "menuitem");
+    detailsBtn.textContent = expanded ? "Hide details" : "Details";
+    detailsBtn.setAttribute("aria-expanded", String(expanded));
+    detailsBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      more.open = false;
+      if (expanded) publicCoinExpanded.delete(utxo.outpoint);
+      else publicCoinExpanded.add(utxo.outpoint);
+      renderUtxoList(panel);
+    });
 
     const freeze = document.createElement("button");
     freeze.type = "button";
     freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+    freeze.setAttribute("role", "menuitem");
     freeze.textContent = utxo.locked ? "Unfreeze" : "Freeze";
-    freeze.addEventListener("click", () => void toggleUtxoLocked(utxo));
+    freeze.addEventListener("click", (event) => {
+      event.stopPropagation();
+      more.open = false;
+      void toggleUtxoLocked(utxo);
+    });
 
-    li.append(check, main, freeze);
+    moreMenu.append(detailsBtn, freeze);
+    more.append(moreSummary, moreMenu);
+    actions.append(more);
+
+    li.append(check, main, actions);
+
+    if (expanded) {
+      const details = document.createElement("div");
+      details.className = "utxo-details";
+
+      const techKids: Node[] = [];
+      const meta = document.createElement("div");
+      meta.className = "utxo-detail-meta";
+      const confMeta = document.createElement("span");
+      confMeta.className = "utxo-meta";
+      confMeta.textContent = conf;
+      const id = document.createElement("span");
+      id.className = "utxo-id";
+      id.textContent = truncateOutputId(utxo.outpoint);
+      id.title = utxo.outpoint;
+      meta.append(confMeta, id);
+      techKids.push(meta);
+
+      const labelInput = document.createElement("input");
+      labelInput.type = "text";
+      labelInput.className = "utxo-label-input";
+      labelInput.placeholder = "Label (optional)";
+      labelInput.maxLength = MAX_TX_LABEL_CHARS;
+      labelInput.value = utxo.label ?? "";
+      labelInput.addEventListener("change", () => {
+        void persistUtxoLabel(utxo.outpoint, labelInput.value);
+      });
+      techKids.push(labelInput);
+
+      appendDetailSection(details, "Technical", ...techKids);
+      li.append(details);
+    }
+
     panel.list.appendChild(li);
   }
   updateCoinControlSum(panel);
@@ -5164,15 +5253,14 @@ async function persistUtxoLabel(outpoint: string, label: string) {
     if (priv) priv.label = note;
     renderCoinsList();
     renderMwebCoinsList();
+    renderUtxoList(sendCoinPanel);
+    renderUtxoList(peginCoinPanel);
     renderMwebControlList(mwebSendCoinPanel);
     renderMwebControlList(pegoutCoinPanel);
   } catch (e) {
     setStatus(String(e), "error");
   }
 }
-
-/** Session-only: which public coin rows show expanded detail. */
-const publicCoinExpanded = new Set<string>();
 
 function renderCoinsList() {
   el.coinsUtxoList.textContent = "";
@@ -6486,26 +6574,37 @@ function updateMwebControlSum(panel: CoinControlPanel) {
 function renderMwebControlList(panel: CoinControlPanel) {
   panel.list.textContent = "";
   panel.empty.hidden = mwebUtxoCache.length > 0;
-  for (const coin of mwebUtxoCache) {
-    const li = document.createElement("li");
+  const sorted = sortMwebCoins(mwebUtxoCache);
+  for (const coin of sorted) {
     const jobHolds = churnPhaseActive(coin.churn_phase);
+    const justSpent = !jobHolds && coin.output_id === churnSettledId;
+    const tied = pegInStillTied(coin);
     const blocked = !!coin.locked || !coin.mature;
-    li.className = blocked ? "utxo-row is-locked" : "utxo-row";
+    const expanded = mwebCoinExpanded.has(coin.output_id);
+    const left = coin.maturity_blocks_left ?? 0;
+    const li = document.createElement("li");
+    li.dataset.outputId = coin.output_id;
+    const rowClass = ["utxo-row"];
+    if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
+    else if (!coin.mature) rowClass.push("is-pending");
+    else if (userFrozen(coin)) rowClass.push("is-frozen");
+    else if (tied) rowClass.push("is-tied");
+    if (justSpent) rowClass.push("is-just-spent");
+    li.className = rowClass.join(" ");
 
     const check = document.createElement("input");
     check.type = "checkbox";
     check.disabled = blocked;
     check.checked = panel.selected.has(coin.output_id);
-    const left = coin.maturity_blocks_left ?? 0;
     check.title = jobHolds
       ? "A self-spend has this coin."
       : coin.locked
-      ? "Unfreeze to spend."
-      : !coin.mature
-        ? coin.confirmations === 0
-          ? "Cannot spend privately until confirmed."
-          : `Matures in ${left} block${left === 1 ? "" : "s"}.`
-        : "Include this coin";
+        ? "Unfreeze to spend."
+        : !coin.mature
+          ? coin.confirmations === 0
+            ? "Cannot spend privately until confirmed."
+            : `Matures in ${left} block${left === 1 ? "" : "s"}.`
+          : "Include this coin";
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(coin.output_id);
       else panel.selected.delete(coin.output_id);
@@ -6520,32 +6619,119 @@ function renderMwebControlList(panel: CoinControlPanel) {
 
     const main = document.createElement("div");
     main.className = "utxo-main";
+
+    const amtRow = document.createElement("div");
+    amtRow.className = "utxo-amt";
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(coin.amount_sats);
-    const meta = document.createElement("span");
-    meta.className = "utxo-meta";
-    const conf =
-      coin.confirmations === 0
-        ? "pending"
-        : `${coin.confirmations.toLocaleString("en-US")} conf`;
-    const labelBit = coin.label ? ` · ${coin.label}` : "";
-    meta.textContent = `${conf}${coin.locked ? " · frozen" : ""}${
-      coin.mature ? "" : " · not spendable"
-    }${labelBit}`;
-    const id = document.createElement("span");
-    id.className = "utxo-id";
-    id.textContent = coin.output_id;
-    main.append(amt, meta, id);
+    amtRow.append(amt);
+    const chip = mwebRowChip(coin, justSpent);
+    if (chip) {
+      const pill = document.createElement("span");
+      pill.className = chip.className;
+      pill.textContent = chip.label;
+      amtRow.append(pill);
+    }
 
-    const freeze = document.createElement("button");
-    freeze.type = "button";
-    freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-    freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
-    freeze.disabled = jobHolds;
-    freeze.title = jobHolds ? "A self-spend has this coin." : "";
-    freeze.addEventListener("click", () => void toggleMwebLocked(coin));
+    const statusLine = mwebRowStatusLine(coin);
+    const status = document.createElement("span");
+    status.className = "utxo-status";
+    status.hidden = !statusLine;
+    status.textContent = statusLine ?? "";
 
-    li.append(check, main, freeze);
+    main.append(amtRow, status);
+
+    li.append(check, main);
+
+    if (!jobHolds) {
+      const actions = document.createElement("div");
+      actions.className = "split-actions split-actions-private";
+      const more = document.createElement("details");
+      more.className = "utxo-more";
+      const moreSummary = document.createElement("summary");
+      moreSummary.className = "btn btn-ghost btn-sm";
+      moreSummary.textContent = "More";
+      const moreMenu = document.createElement("div");
+      moreMenu.className = "utxo-more-menu";
+      moreMenu.setAttribute("role", "menu");
+
+      more.addEventListener("toggle", () => {
+        if (!more.open) return;
+        for (const other of panel.list.querySelectorAll<HTMLDetailsElement>(
+          "details.utxo-more[open]",
+        )) {
+          if (other !== more) other.open = false;
+        }
+      });
+
+      const detailsBtn = document.createElement("button");
+      detailsBtn.type = "button";
+      detailsBtn.className = "btn btn-ghost btn-sm";
+      detailsBtn.setAttribute("role", "menuitem");
+      detailsBtn.textContent = expanded ? "Hide details" : "Details";
+      detailsBtn.setAttribute("aria-expanded", String(expanded));
+      detailsBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        more.open = false;
+        if (expanded) mwebCoinExpanded.delete(coin.output_id);
+        else mwebCoinExpanded.add(coin.output_id);
+        renderMwebControlList(panel);
+      });
+
+      const freeze = document.createElement("button");
+      freeze.type = "button";
+      freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+      freeze.setAttribute("role", "menuitem");
+      freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
+      freeze.disabled = !coin.mature && !coin.locked;
+      freeze.addEventListener("click", (event) => {
+        event.stopPropagation();
+        more.open = false;
+        void toggleMwebLocked(coin);
+      });
+
+      moreMenu.append(detailsBtn, freeze);
+      more.append(moreSummary, moreMenu);
+      actions.append(more);
+      li.append(actions);
+    }
+
+    if (expanded && !jobHolds) {
+      const details = document.createElement("div");
+      details.className = "utxo-details";
+
+      const techKids: Node[] = [];
+      const meta = document.createElement("div");
+      meta.className = "utxo-detail-meta";
+      const confMeta = document.createElement("span");
+      confMeta.className = "utxo-meta";
+      confMeta.textContent =
+        coin.confirmations === 0
+          ? "pending"
+          : `${coin.confirmations.toLocaleString("en-US")} conf`;
+      const id = document.createElement("span");
+      id.className = "utxo-id";
+      id.textContent = truncateOutputId(coin.output_id);
+      id.title = coin.output_id;
+      meta.append(confMeta, id);
+      techKids.push(meta);
+
+      const labelInput = document.createElement("input");
+      labelInput.type = "text";
+      labelInput.className = "utxo-label-input";
+      labelInput.placeholder = "Label (optional)";
+      labelInput.maxLength = MAX_TX_LABEL_CHARS;
+      labelInput.value = coin.label ?? "";
+      labelInput.addEventListener("change", () => {
+        void persistUtxoLabel(coin.output_id, labelInput.value);
+      });
+      techKids.push(labelInput);
+
+      appendDetailSection(details, "Technical", ...techKids);
+      li.append(details);
+    }
+
     panel.list.appendChild(li);
   }
   updateMwebControlSum(panel);

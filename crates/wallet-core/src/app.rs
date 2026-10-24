@@ -10,13 +10,14 @@ use bdk_mweb::mweb_sync::SyncProgress;
 use bdk_wallet::bitcoin::consensus::encode::deserialize;
 use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Txid};
 use bdk_wallet::chain::ChainPosition;
+use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
 use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions};
+use bdk_wallet::{KeychainKind, PersistedWallet};
 
 use crate::churn;
 use crate::contacts;
-use crate::descriptors::{self, create_params, load_params};
+use crate::descriptors::{self, create_params, load_params, sign_and_finalize, signer};
 use crate::diag;
 use crate::dto::{
     AddressReuseHint, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary,
@@ -47,6 +48,9 @@ use crate::{MNEMONIC_ENC_FILE, MNEMONIC_FILE};
 
 struct WalletState {
     wallet: PersistedWallet<Connection>,
+    /// Caller-owned transparent signing keys (see [`descriptors::signer`]); the wallet itself
+    /// holds no secrets. Lives and dies with this state, i.e. cleared on `lock()`.
+    signer: KeyMapWrapper,
     db: Connection,
     network: WalletNetwork,
     electrum_url: String,
@@ -463,6 +467,7 @@ impl WalletApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
+            signer: signer(&secret, meta.network)?,
             db,
             network: meta.network,
             electrum_url: meta.electrum_url,
@@ -1180,9 +1185,6 @@ impl WalletApp {
         })
     }
 
-    // Signing goes through Wallet::sign (deprecated upstream in bdk_wallet 3.2.0) because it
-    // understands the fork's PSBT MWEB maps; moving to caller-owned keys is deferred.
-    #[allow(deprecated)]
     pub fn send(&self, req: SendRequest) -> Result<SendResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
@@ -1190,13 +1192,7 @@ impl WalletApp {
 
         let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &req)?;
 
-        let finalized = state
-            .wallet
-            .sign(&mut psbt, SignOptions::default())
-            .map_err(|e| WalletError::Sign(e.to_string()))?;
-        if !finalized {
-            return Err(WalletError::Sign("transaction not fully signed".into()));
-        }
+        sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
 
         let fee_sats = psbt
             .fee_amount()
@@ -1261,6 +1257,7 @@ impl WalletApp {
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let result = mweb::pegin(
             &mut state.wallet,
+            &state.signer,
             mweb,
             rpc_url.as_deref(),
             &peers,
@@ -1409,8 +1406,6 @@ impl WalletApp {
         plan_split_request(state, &req)
     }
 
-    // See `send`: Wallet::sign stays the signing path for now.
-    #[allow(deprecated)]
     pub fn split_coin(&self, req: SplitRequest) -> Result<SplitResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
@@ -1420,13 +1415,7 @@ impl WalletApp {
             SplitChain::Public => {
                 let (psbt, fee_sats) = build_public_split_psbt(state, &req.input, &preview)?;
                 let mut psbt = psbt;
-                let finalized = state
-                    .wallet
-                    .sign(&mut psbt, SignOptions::default())
-                    .map_err(|e| WalletError::Sign(e.to_string()))?;
-                if !finalized {
-                    return Err(WalletError::Sign("transaction not fully signed".into()));
-                }
+                sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
                 let tx = psbt
                     .extract_tx()
                     .map_err(|e| WalletError::Sign(e.to_string()))?;
@@ -1675,6 +1664,7 @@ impl WalletApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
+            signer: signer(secret, network)?,
             db,
             network,
             electrum_url: meta.electrum_url,
@@ -1789,6 +1779,7 @@ impl MemoryBackedApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
+            signer: signer(&secret, meta.network)?,
             db,
             network: meta.network,
             electrum_url: meta.electrum_url,
@@ -2132,6 +2123,7 @@ impl MemoryBackedApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
+            signer: signer(secret, network)?,
             db,
             network,
             electrum_url: meta.electrum_url,

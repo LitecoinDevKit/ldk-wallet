@@ -1320,7 +1320,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bdk_chain"
 version = "0.23.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=014b0c70d661cc78fdf64845159e6b3725f896f1#014b0c70d661cc78fdf64845159e6b3725f896f1"
+source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=2deac37e989624e034620febb658b09811ed1d24#2deac37e989624e034620febb658b09811ed1d24"
 dependencies = [
  "bdk_core",
  "litecoin",
@@ -1332,7 +1332,7 @@ dependencies = [
 [[package]]
 name = "bdk_core"
 version = "0.6.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=014b0c70d661cc78fdf64845159e6b3725f896f1#014b0c70d661cc78fdf64845159e6b3725f896f1"
+source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=2deac37e989624e034620febb658b09811ed1d24#2deac37e989624e034620febb658b09811ed1d24"
 dependencies = [
  "hashbrown 0.14.5",
  "litecoin",
@@ -1342,7 +1342,7 @@ dependencies = [
 [[package]]
 name = "bdk_electrum"
 version = "0.23.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=014b0c70d661cc78fdf64845159e6b3725f896f1#014b0c70d661cc78fdf64845159e6b3725f896f1"
+source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=2deac37e989624e034620febb658b09811ed1d24#2deac37e989624e034620febb658b09811ed1d24"
 dependencies = [
  "bdk_core",
  "electrum-client",
@@ -1351,7 +1351,7 @@ dependencies = [
 [[package]]
 name = "bdk_mweb"
 version = "0.1.0"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=014b0c70d661cc78fdf64845159e6b3725f896f1#014b0c70d661cc78fdf64845159e6b3725f896f1"
+source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=2deac37e989624e034620febb658b09811ed1d24#2deac37e989624e034620febb658b09811ed1d24"
 dependencies = [
  "bdk_core",
  "blake3",
@@ -1369,7 +1369,7 @@ dependencies = [
 [[package]]
 name = "bdk_wallet"
 version = "3.1.0-litecoin.0"
-source = "git+https://github.com/LitecoinDevKit/bdk_wallet.git?rev=962b67ede5bdbbeaf4a12482c05cd537d03580ef#962b67ede5bdbbeaf4a12482c05cd537d03580ef"
+source = "git+https://github.com/LitecoinDevKit/bdk_wallet.git?rev=f13078271e5275942ab119323d2075bec5bf66e5#f13078271e5275942ab119323d2075bec5bf66e5"
 dependencies = [
  "anyhow",
  "bdk_chain",
@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "electrum-client"
 version = "0.24.1"
-source = "git+https://github.com/LitecoinDevKit/rust-electrum-client?rev=c1d8c0b368ee58b519bb371e62ef1c1067716e52#c1d8c0b368ee58b519bb371e62ef1c1067716e52"
+source = "git+https://github.com/LitecoinDevKit/rust-electrum-client?rev=6ffa5afa81bc712c9eff2130c7feadae608c62da#6ffa5afa81bc712c9eff2130c7feadae608c62da"
 dependencies = [
  "byteorder",
  "libc",
@@ -2653,7 +2653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4050,7 +4050,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "litecoin"
 version = "0.32.8-rc.2"
-source = "git+https://github.com/LitecoinDevKit/rust-litecoin.git?rev=0b3285337f3cc508a5549d245ce20d3b52418f3a#0b3285337f3cc508a5549d245ce20d3b52418f3a"
+source = "git+https://github.com/LitecoinDevKit/rust-litecoin.git?rev=5a0233712bdefc568fb45d71f42c028e196c4352#5a0233712bdefc568fb45d71f42c028e196c4352"
 dependencies = [
  "base58ck",
  "base64 0.21.7",
@@ -5093,7 +5093,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5540,7 +5540,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5599,7 +5599,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6634,10 +6634,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7672,7 +7672,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

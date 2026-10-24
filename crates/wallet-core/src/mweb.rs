@@ -25,11 +25,11 @@ use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use bdk_wallet::chain::Merge;
+use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::{
-    extract_prepared_mweb_pegin, select_mweb_coins, MwebStore, PersistedWallet, SignOptions,
-};
+use bdk_wallet::{extract_prepared_mweb_pegin, select_mweb_coins, MwebStore, PersistedWallet};
 
+use crate::descriptors::sign_and_finalize;
 use crate::dto::{
     CombinedSummary, MwebBroadcastResult, MwebSendRequest, MwebUtxoRecord, PeginRequest,
     PeginResult, PegoutRequest, SplitResult, TxKind, WalletSummary,
@@ -1908,11 +1908,9 @@ fn resolve_reachable_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>
     Ok(probe_reachable(resolve_peers(peers)?))
 }
 
-// Signing goes through Wallet::sign (deprecated upstream in bdk_wallet 3.2.0) because it
-// understands the fork's PSBT MWEB maps; moving to caller-owned keys is deferred.
-#[allow(deprecated)]
 pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
+    signer: &KeyMapWrapper,
     runtime: &mut MwebRuntime,
     rpc_url: Option<&str>,
     peers: &[String],
@@ -1949,12 +1947,10 @@ pub fn pegin(
             &runtime.secp,
         )
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    let signed = wallet
-        .sign(&mut prepared.psbt, SignOptions::default())
-        .map_err(|e| WalletError::Sign(e.to_string()))?;
-    if !signed {
-        return Err(WalletError::Sign("peg-in not fully signed".into()));
-    }
+    // MWEB components were signed inside prepare_mweb_pegin; the transparent inputs are
+    // signed here with the caller-owned keys.
+    sign_and_finalize(wallet, signer, &mut prepared.psbt)
+        .map_err(|e| WalletError::Sign(format!("peg-in: {e}")))?;
     let tx = extract_prepared_mweb_pegin(&prepared.psbt)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
     // A peg-in tx carries MWEB extension data that Electrum servers reject
@@ -2328,23 +2324,21 @@ fn churn_fields(
         None
     };
     let live = match job {
-        Some(job) if job.current_output_id == output_id && job.phase.is_active() => {
-            LiveJobFields {
-                phase: Some(job.phase),
-                error: job.last_error.clone(),
-                target: Some(job.target_depth),
-                counted: Some(job.effective_depth),
-                cover_hold: job.cover_hold,
-                cover_min: Some(job.cover_min),
-                cover_seen: job.last_cover_count,
-                cover_checked_at: job.last_cover_check_unix,
-                cover_total: job.last_cover_total,
-                cover_kernels: job.last_cover_kernels,
-                cover_outputs: job.last_cover_outputs,
-                cover_error: job.last_cover_error.clone(),
-                spreading: Some(job.spreading),
-            }
-        }
+        Some(job) if job.current_output_id == output_id && job.phase.is_active() => LiveJobFields {
+            phase: Some(job.phase),
+            error: job.last_error.clone(),
+            target: Some(job.target_depth),
+            counted: Some(job.effective_depth),
+            cover_hold: job.cover_hold,
+            cover_min: Some(job.cover_min),
+            cover_seen: job.last_cover_count,
+            cover_checked_at: job.last_cover_check_unix,
+            cover_total: job.last_cover_total,
+            cover_kernels: job.last_cover_kernels,
+            cover_outputs: job.last_cover_outputs,
+            cover_error: job.last_cover_error.clone(),
+            spreading: Some(job.spreading),
+        },
         Some(job)
             if job.current_output_id == output_id && job.phase == crate::dto::ChurnPhase::Done =>
         {
@@ -3331,13 +3325,27 @@ mod pegin_balance_tests {
     use bdk_mweb::keys::{MasterKeyScheme, MasterKeys};
     use bdk_wallet::bitcoin::hex::FromHex;
     use bdk_wallet::bitcoin::Network;
-    use bdk_wallet::test_utils::get_funded_wallet_wpkh;
-    use bdk_wallet::{extract_prepared_mweb_pegin, SignOptions};
+    use bdk_wallet::descriptor::IntoWalletDescriptor;
+    use bdk_wallet::extract_prepared_mweb_pegin;
+    use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
+    use bdk_wallet::test_utils::{get_funded_wallet_wpkh, get_test_wpkh_and_change_desc};
 
     const SEED_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
+    /// Caller-owned signer for the `get_funded_wallet_wpkh` test descriptors.
+    fn test_signer(wallet: &bdk_wallet::Wallet) -> KeyMapWrapper {
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let (_, mut keymap) = desc
+            .into_wallet_descriptor(wallet.secp_ctx(), wallet.network().into())
+            .expect("descriptor");
+        let (_, change_keymap) = change_desc
+            .into_wallet_descriptor(wallet.secp_ctx(), wallet.network().into())
+            .expect("change descriptor");
+        keymap.extend(change_keymap);
+        KeyMapWrapper::from(keymap)
+    }
+
     #[test]
-    #[allow(deprecated)]
     fn pegin_apply_does_not_double_count_balance() {
         let (mut wallet, _) = get_funded_wallet_wpkh();
         let prior_transparent = wallet.balance().total().to_sat();
@@ -3359,9 +3367,8 @@ mod pegin_balance_tests {
         let mut prepared = wallet
             .prepare_mweb_pegin(&keys, 2, pegin_amount, mweb_fee, transparent_fee, &secp)
             .expect("prepare_mweb_pegin");
-        assert!(wallet
-            .sign(&mut prepared.psbt, SignOptions::default())
-            .expect("sign"));
+        crate::descriptors::sign_and_finalize(&wallet, &test_signer(&wallet), &mut prepared.psbt)
+            .expect("sign");
         let tx = extract_prepared_mweb_pegin(&prepared.psbt).expect("extract");
 
         let mut db = MwebCoinDatabase::new();
@@ -3455,7 +3462,10 @@ mod churn_field_tests {
         churn::note_cover_error(&mut job, 1_700_000_060, "Connection Failed");
         let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
         assert_eq!(fields.churn_cover_checked_at, Some(1_700_000_060));
-        assert_eq!(fields.churn_cover_error.as_deref(), Some("Connection Failed"));
+        assert_eq!(
+            fields.churn_cover_error.as_deref(),
+            Some("Connection Failed")
+        );
         // The last good counts stay so the card does not go blank.
         assert_eq!(fields.churn_cover_total, Some(309));
 

@@ -1908,6 +1908,9 @@ fn resolve_reachable_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>
     Ok(probe_reachable(resolve_peers(peers)?))
 }
 
+// Signing goes through Wallet::sign (deprecated upstream in bdk_wallet 3.2.0) because it
+// understands the fork's PSBT MWEB maps; moving to caller-owned keys is deferred.
+#[allow(deprecated)]
 pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
@@ -3334,6 +3337,7 @@ mod pegin_balance_tests {
     const SEED_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     #[test]
+    #[allow(deprecated)]
     fn pegin_apply_does_not_double_count_balance() {
         let (mut wallet, _) = get_funded_wallet_wpkh();
         let prior_transparent = wallet.balance().total().to_sat();

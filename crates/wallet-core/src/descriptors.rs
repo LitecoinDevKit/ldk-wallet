@@ -31,6 +31,9 @@ pub fn create_params(
 }
 
 /// Build [`LoadParams`] that check BIP84 descriptors and extract signing keys.
+// `extract_keys` is deprecated upstream (bdk_wallet 3.2.0) along with wallet-owned signing;
+// the wallet still signs through `Wallet::sign`, so keep loading keys into it for now.
+#[allow(deprecated)]
 pub fn load_params(
     secret: &MasterSecret,
     network: WalletNetwork,

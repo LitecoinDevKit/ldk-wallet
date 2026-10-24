@@ -3808,18 +3808,21 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
         churn::write_armed(data_dir, &record)?;
         return Ok(());
     };
-    let count = match mweb::count_foreign_mweb_mempool(url, &record.own_ids) {
-        Ok(count) => count,
+    let read = match mweb::count_foreign_mweb_mempool(url, &record.own_ids) {
+        Ok(read) => read,
         Err(e) => {
-            diag::log(format!("self-spend: mempool read failed ({e})"));
+            let message = e.to_string();
+            diag::log(format!("self-spend: mempool read failed ({message})"));
+            churn::note_cover_error(&mut job, churn::unix_now(), &message);
             job.cover_hold = Some(CoverHold::Waiting);
             churn::write_job(data_dir, &job)?;
             return Ok(());
         }
     };
-    job.last_cover_count = Some(count);
+    churn::note_cover_read(&mut job, &read);
+    let count = read.foreign_txs;
     let step = churn::cover_step(
-        churn::unix_now(),
+        read.checked_at_unix,
         count,
         record.cover_min,
         job.spread_send,
@@ -4097,6 +4100,65 @@ mod tests {
         assert_eq!(records[0].fee_sats, Some(51_000));
         assert_eq!(records[0].height, Some(90));
         assert_eq!(records[0].confirmations, 11);
+    }
+
+    /// A node that cannot be reached must leave the reason and the time on
+    /// the job, not only in the diagnostic log.
+    #[test]
+    fn cover_gate_keeps_a_failed_mempool_read_on_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = meta::WalletMeta::new(WalletNetwork::Testnet, None);
+        // Nothing listens here; the connection is refused at once.
+        meta.litecoin_rpc_url = Some("http://127.0.0.1:9".into());
+        meta::write_meta(dir.path(), &meta).unwrap();
+
+        let output_id = "ab".repeat(32);
+        let mut job = churn::new_job(&output_id, false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::WaitingForCover;
+        churn::write_job(dir.path(), &job).unwrap();
+        let record = churn::ArmedRecord {
+            version: 1,
+            hops: vec![churn::ArmedHop {
+                raw_hex: "aa".into(),
+                txid: "txid".into(),
+                wtxid: "wtxid".into(),
+                spent_output_id: output_id.clone(),
+                created_output_id: "cd".repeat(32),
+                receive_index: 0,
+                fee_sats: 50_000,
+                local_applied: false,
+                broadcast: false,
+                created_coin: None,
+            }],
+            armed_index: 0,
+            armed_at_unix: churn::unix_now(),
+            armed_height: 100,
+            cover_min: 2,
+            send_after: None,
+            own_ids: std::collections::BTreeSet::new(),
+            expired: false,
+        };
+        churn::write_armed(dir.path(), &record).unwrap();
+
+        let before = churn::unix_now();
+        cover_gate_at(None, dir.path()).unwrap();
+
+        let job = churn::read_job(dir.path()).unwrap().unwrap();
+        assert_eq!(job.phase, ChurnPhase::WaitingForCover);
+        assert_eq!(job.cover_hold, Some(CoverHold::Waiting));
+        assert!(job.last_cover_check_unix.is_some_and(|t| t >= before));
+        assert!(
+            job.last_cover_error
+                .as_deref()
+                .is_some_and(|e| !e.is_empty()),
+            "error should be saved: {:?}",
+            job.last_cover_error
+        );
+        // No read worked, so there is no count to show.
+        assert!(job.last_cover_count.is_none());
+        // The hop was not sent.
+        let record = churn::read_armed(dir.path()).unwrap().unwrap();
+        assert!(!record.hops[0].broadcast);
     }
 }
 

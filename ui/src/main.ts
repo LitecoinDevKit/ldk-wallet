@@ -217,6 +217,11 @@ type MwebUtxoRecord = {
   churn_cover_hold?: "no-rpc" | "waiting" | null;
   churn_cover_min?: number | null;
   churn_cover_seen?: number | null;
+  churn_cover_checked_at?: number | null;
+  churn_cover_total?: number | null;
+  churn_cover_kernels?: number | null;
+  churn_cover_outputs?: number | null;
+  churn_cover_error?: string | null;
   churn_spreading?: boolean | null;
 };
 
@@ -4228,12 +4233,18 @@ function scheduleCoverPump() {
 
 async function pumpCover() {
   if (!coverPumpOn || (currentPhase !== "unlock" && currentPhase !== "ready")) return;
+  let refreshed = false;
   try {
     await invoke("pump_churn_broadcast");
-    if (currentPhase === "ready") await refreshUtxos();
+    if (currentPhase === "ready") {
+      await refreshUtxos();
+      refreshed = true;
+    }
   } catch {
     /* Nothing to send, or the wallet files are not ready yet. */
   }
+  // The "Checked N ago" sentence on the card moves even when no new read landed.
+  if (!refreshed && currentPhase === "ready") renderChurnStatus();
   if (coverPumpOn && (currentPhase === "unlock" || currentPhase === "ready")) scheduleCoverPump();
 }
 
@@ -5385,18 +5396,59 @@ function stampChurnStarting() {
   coin.churn_cover_hold = churnStartingCoverHold;
   coin.churn_cover_min = churnStartingCoverMin;
   coin.churn_cover_seen = null;
+  coin.churn_cover_checked_at = null;
+  coin.churn_cover_total = null;
+  coin.churn_cover_kernels = null;
+  coin.churn_cover_outputs = null;
+  coin.churn_cover_error = null;
   coin.churn_spreading = false;
   coin.locked = true;
   coin.churn_target = churnStartingTarget;
   coin.churn_counted = 0;
 }
 
-/** "Needs N other private transactions. Last check saw M." while a hop waits on the mempool. */
-function churnCoverLine(coin: MwebUtxoRecord): string | null {
+/** "40 s ago", "3 min ago", "2 h ago". Short because it sits inside a longer sentence. */
+function formatCheckedAgo(unixSeconds: number, nowMs = Date.now()): string {
+  const deltaSec = Math.max(0, Math.floor(nowMs / 1000) - unixSeconds);
+  if (deltaSec < 5) return "just now";
+  if (deltaSec < 60) return `${deltaSec} s ago`;
+  const minutes = Math.floor(deltaSec / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} h ago`;
+}
+
+function pluralCount(n: number, noun: string): string {
+  return `${n.toLocaleString("en-US")} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * Smaller line while a signed hop waits on the mempool. Says what the last
+ * check saw and when, in the same kernel/output words as the block score, so
+ * a reader can tell "the mempool really has none" from "nothing is checking".
+ */
+function churnCoverLine(coin: MwebUtxoRecord, nowMs = Date.now()): string | null {
   if (coin.churn_phase !== "waiting-for-cover" || coin.churn_cover_hold !== "waiting") return null;
   const need = coin.churn_cover_min ?? 2;
-  const parts = [`Needs ${need} other private transaction${need === 1 ? "" : "s"}.`];
-  if (coin.churn_cover_seen != null) parts.push(`Last check saw ${coin.churn_cover_seen}.`);
+  const parts = [`Needs ${pluralCount(need, "other private transaction")} in the node's mempool.`];
+  const checkedAt = coin.churn_cover_checked_at;
+  if (coin.churn_cover_error) {
+    const when = checkedAt != null ? ` ${formatCheckedAgo(checkedAt, nowMs)}` : "";
+    const reason = coin.churn_cover_error.replace(/\.+$/, "");
+    parts.push(`Could not read the mempool${when}: ${reason}.`);
+  } else if (coin.churn_cover_seen != null) {
+    const when = checkedAt != null ? `Checked ${formatCheckedAgo(checkedAt, nowMs)}` : "Last check";
+    const detail: string[] = [];
+    if (coin.churn_cover_total != null) {
+      detail.push(`${pluralCount(coin.churn_cover_total, "transaction")} in the mempool`);
+    }
+    let others = pluralCount(coin.churn_cover_seen, "other private transaction");
+    if (coin.churn_cover_kernels != null && coin.churn_cover_outputs != null) {
+      others += ` (${pluralCount(coin.churn_cover_kernels, "kernel")}, ${pluralCount(coin.churn_cover_outputs, "output")})`;
+    }
+    detail.push(others);
+    parts.push(`${when}: ${detail.join(", ")}.`);
+  }
   if (coin.churn_spreading) parts.push("Waiting to spread the send.");
   return parts.join(" ");
 }

@@ -753,9 +753,24 @@ pub struct MwebUtxoRecord {
     /// Other MWEB mempool transactions the live hop waits for.
     #[serde(default)]
     pub churn_cover_min: Option<u32>,
-    /// What the last mempool check counted for the live hop.
+    /// Other MWEB transactions the last successful mempool check counted for the live hop.
     #[serde(default)]
     pub churn_cover_seen: Option<u64>,
+    /// Unix seconds of the last mempool check, successful or not.
+    #[serde(default)]
+    pub churn_cover_checked_at: Option<u64>,
+    /// Every transaction in the mempool at the last successful check.
+    #[serde(default)]
+    pub churn_cover_total: Option<u64>,
+    /// MWEB kernels across the other transactions at the last successful check.
+    #[serde(default)]
+    pub churn_cover_kernels: Option<u64>,
+    /// MWEB outputs across the other transactions at the last successful check.
+    #[serde(default)]
+    pub churn_cover_outputs: Option<u64>,
+    /// Why the last mempool check failed. Absent after a check that worked.
+    #[serde(default)]
+    pub churn_cover_error: Option<String>,
     /// The count was met and the opt-in spread is running.
     #[serde(default)]
     pub churn_spreading: Option<bool>,
@@ -926,6 +941,16 @@ pub struct ChurnStatus {
     pub spread_send: bool,
     #[serde(default)]
     pub last_cover_count: Option<u64>,
+    #[serde(default)]
+    pub last_cover_check_unix: Option<u64>,
+    #[serde(default)]
+    pub last_cover_total: Option<u64>,
+    #[serde(default)]
+    pub last_cover_kernels: Option<u64>,
+    #[serde(default)]
+    pub last_cover_outputs: Option<u64>,
+    #[serde(default)]
+    pub last_cover_error: Option<String>,
     #[serde(default)]
     pub spreading: bool,
 }

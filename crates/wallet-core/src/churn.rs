@@ -139,9 +139,24 @@ pub struct ChurnJob {
     /// Wait a random 1–3 minutes after the count is first met.
     #[serde(default)]
     pub spread_send: bool,
-    /// What the last successful mempool read counted.
+    /// What the last successful mempool read counted as foreign MWEB transactions.
     #[serde(default)]
     pub last_cover_count: Option<u64>,
+    /// When the mempool was last asked, whether or not the read worked.
+    #[serde(default)]
+    pub last_cover_check_unix: Option<u64>,
+    /// Every transaction in the mempool at the last successful read.
+    #[serde(default)]
+    pub last_cover_total: Option<u64>,
+    /// MWEB kernels across the foreign transactions at the last successful read.
+    #[serde(default)]
+    pub last_cover_kernels: Option<u64>,
+    /// MWEB outputs across the foreign transactions at the last successful read.
+    #[serde(default)]
+    pub last_cover_outputs: Option<u64>,
+    /// Why the last mempool read failed. Cleared by the next read that works.
+    #[serde(default)]
+    pub last_cover_error: Option<String>,
     /// A spread deadline is running on the armed record.
     #[serde(default)]
     pub spreading: bool,
@@ -392,8 +407,40 @@ pub fn new_job(
         cover_min,
         spread_send,
         last_cover_count: None,
+        last_cover_check_unix: None,
+        last_cover_total: None,
+        last_cover_kernels: None,
+        last_cover_outputs: None,
+        last_cover_error: None,
         spreading: false,
     })
+}
+
+/// Save what one mempool read saw, or why it failed, on the job.
+pub fn note_cover_read(job: &mut ChurnJob, read: &crate::mweb::CoverRead) {
+    job.last_cover_count = Some(read.foreign_txs);
+    job.last_cover_check_unix = Some(read.checked_at_unix);
+    job.last_cover_total = Some(read.total_txs);
+    job.last_cover_kernels = Some(read.kernels);
+    job.last_cover_outputs = Some(read.outputs);
+    job.last_cover_error = None;
+}
+
+/// A failed read keeps the last good counts so the card does not go blank,
+/// but the timestamp and the error move.
+pub fn note_cover_error(job: &mut ChurnJob, now_unix: u64, error: &str) {
+    job.last_cover_check_unix = Some(now_unix);
+    job.last_cover_error = Some(error.to_string());
+}
+
+/// Forget every mempool observation. Used when a hop leaves the cover gate.
+pub fn clear_cover_read(job: &mut ChurnJob) {
+    job.last_cover_count = None;
+    job.last_cover_check_unix = None;
+    job.last_cover_total = None;
+    job.last_cover_kernels = None;
+    job.last_cover_outputs = None;
+    job.last_cover_error = None;
 }
 
 /// About a day of Litecoin blocks. The walk never looks further back than this.
@@ -440,7 +487,7 @@ pub fn note_broadcast(
     job.header_cache.clear();
     job.cover_hold = None;
     job.needs_resign = false;
-    job.last_cover_count = None;
+    clear_cover_read(job);
     job.spreading = false;
     Ok(())
 }
@@ -861,6 +908,11 @@ pub fn status_view(job: &ChurnJob) -> ChurnStatus {
         cover_min: job.cover_min,
         spread_send: job.spread_send,
         last_cover_count: job.last_cover_count,
+        last_cover_check_unix: job.last_cover_check_unix,
+        last_cover_total: job.last_cover_total,
+        last_cover_kernels: job.last_cover_kernels,
+        last_cover_outputs: job.last_cover_outputs,
+        last_cover_error: job.last_cover_error.clone(),
         spreading: job.spreading,
     }
 }
@@ -1603,6 +1655,70 @@ mod tests {
             cover_step(1_060, 1, 2, true, Some(1_090), 90),
             CoverStep::Below
         );
+    }
+
+    #[test]
+    fn mempool_read_is_saved_and_cleared_on_broadcast() {
+        let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::WaitingForCover;
+        assert!(job.last_cover_check_unix.is_none());
+
+        note_cover_error(&mut job, 100, "http status 401");
+        assert_eq!(job.last_cover_check_unix, Some(100));
+        assert_eq!(job.last_cover_error.as_deref(), Some("http status 401"));
+        assert!(job.last_cover_count.is_none());
+
+        note_cover_read(
+            &mut job,
+            &crate::mweb::CoverRead {
+                total_txs: 12,
+                mweb_txs: 3,
+                foreign_txs: 2,
+                kernels: 2,
+                outputs: 4,
+                unreadable_txs: 0,
+                checked_at_unix: 160,
+            },
+        );
+        assert_eq!(job.last_cover_count, Some(2));
+        assert_eq!(job.last_cover_check_unix, Some(160));
+        assert_eq!(job.last_cover_total, Some(12));
+        assert_eq!(job.last_cover_kernels, Some(2));
+        assert_eq!(job.last_cover_outputs, Some(4));
+        assert!(job.last_cover_error.is_none());
+
+        let view = status_view(&job);
+        assert_eq!(view.last_cover_count, Some(2));
+        assert_eq!(view.last_cover_check_unix, Some(160));
+        assert_eq!(view.last_cover_total, Some(12));
+        assert_eq!(view.last_cover_kernels, Some(2));
+        assert_eq!(view.last_cover_outputs, Some(4));
+        assert!(view.last_cover_error.is_none());
+
+        note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 200).unwrap();
+        assert!(job.last_cover_count.is_none());
+        assert!(job.last_cover_check_unix.is_none());
+        assert!(job.last_cover_total.is_none());
+        assert!(job.last_cover_kernels.is_none());
+        assert!(job.last_cover_outputs.is_none());
+        assert!(job.last_cover_error.is_none());
+    }
+
+    #[test]
+    fn older_job_files_read_without_the_mempool_fields() {
+        let json = serde_json::json!({
+            "phase": "waiting-for-cover",
+            "current_output_id": "ab".repeat(32),
+            "origin_output_id": "ab".repeat(32),
+            "target_depth": 1,
+            "effective_depth": 0,
+            "fee_sats": 50_000,
+            "last_cover_count": 0
+        });
+        let job: ChurnJob = serde_json::from_value(json).unwrap();
+        assert_eq!(job.last_cover_count, Some(0));
+        assert!(job.last_cover_check_unix.is_none());
+        assert!(job.last_cover_error.is_none());
     }
 
     #[test]

@@ -113,6 +113,11 @@ type Coin = {
   churn_cover_hold?: "no-rpc" | "waiting" | null;
   churn_cover_min?: number | null;
   churn_cover_seen?: number | null;
+  churn_cover_checked_at?: number | null;
+  churn_cover_total?: number | null;
+  churn_cover_kernels?: number | null;
+  churn_cover_outputs?: number | null;
+  churn_cover_error?: string | null;
   churn_spreading?: boolean | null;
   churn_target?: number | null;
   churn_counted?: number | null;
@@ -176,12 +181,21 @@ function privateCoins(): Coin[] {
     tied.churn_target = 3;
     tied.churn_counted = 1;
     tied.locked = true;
+    const checkedAt = Math.floor(Date.now() / 1000) - 40;
     if (cover === "waiting") {
       tied.churn_cover_min = 2;
       tied.churn_cover_seen = 1;
+      tied.churn_cover_checked_at = checkedAt;
+      tied.churn_cover_total = 309;
+      tied.churn_cover_kernels = 1;
+      tied.churn_cover_outputs = 2;
     } else if (cover === "spreading") {
       tied.churn_cover_min = 2;
       tied.churn_cover_seen = 3;
+      tied.churn_cover_checked_at = checkedAt;
+      tied.churn_cover_total = 412;
+      tied.churn_cover_kernels = 3;
+      tied.churn_cover_outputs = 5;
       tied.churn_spreading = true;
     }
   }

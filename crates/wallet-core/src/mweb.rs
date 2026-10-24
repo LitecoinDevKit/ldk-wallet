@@ -2252,6 +2252,11 @@ pub fn list_mweb_unspent(
                 churn_cover_hold: fields.churn_cover_hold,
                 churn_cover_min: fields.churn_cover_min,
                 churn_cover_seen: fields.churn_cover_seen,
+                churn_cover_checked_at: fields.churn_cover_checked_at,
+                churn_cover_total: fields.churn_cover_total,
+                churn_cover_kernels: fields.churn_cover_kernels,
+                churn_cover_outputs: fields.churn_cover_outputs,
+                churn_cover_error: fields.churn_cover_error,
                 churn_spreading: fields.churn_spreading,
             }
         })
@@ -2278,7 +2283,30 @@ struct ChurnFields {
     churn_cover_hold: Option<crate::dto::CoverHold>,
     churn_cover_min: Option<u32>,
     churn_cover_seen: Option<u64>,
+    churn_cover_checked_at: Option<u64>,
+    churn_cover_total: Option<u64>,
+    churn_cover_kernels: Option<u64>,
+    churn_cover_outputs: Option<u64>,
+    churn_cover_error: Option<String>,
     churn_spreading: Option<bool>,
+}
+
+/// The part of a job that belongs on the coin it currently holds.
+#[derive(Default)]
+struct LiveJobFields {
+    phase: Option<crate::dto::ChurnPhase>,
+    error: Option<String>,
+    target: Option<u32>,
+    counted: Option<u32>,
+    cover_hold: Option<crate::dto::CoverHold>,
+    cover_min: Option<u32>,
+    cover_seen: Option<u64>,
+    cover_checked_at: Option<u64>,
+    cover_total: Option<u64>,
+    cover_kernels: Option<u64>,
+    cover_outputs: Option<u64>,
+    cover_error: Option<String>,
+    spreading: Option<bool>,
 }
 
 fn churn_fields(
@@ -2297,56 +2325,53 @@ fn churn_fields(
         None
     };
     let live = match job {
-        Some(job) if job.current_output_id == output_id && job.phase.is_active() => Some((
-            Some(job.phase),
-            job.last_error.clone(),
-            Some(job.target_depth),
-            Some(job.effective_depth),
-            job.cover_hold,
-            Some(job.cover_min),
-            job.last_cover_count,
-            Some(job.spreading),
-        )),
+        Some(job) if job.current_output_id == output_id && job.phase.is_active() => {
+            LiveJobFields {
+                phase: Some(job.phase),
+                error: job.last_error.clone(),
+                target: Some(job.target_depth),
+                counted: Some(job.effective_depth),
+                cover_hold: job.cover_hold,
+                cover_min: Some(job.cover_min),
+                cover_seen: job.last_cover_count,
+                cover_checked_at: job.last_cover_check_unix,
+                cover_total: job.last_cover_total,
+                cover_kernels: job.last_cover_kernels,
+                cover_outputs: job.last_cover_outputs,
+                cover_error: job.last_cover_error.clone(),
+                spreading: Some(job.spreading),
+            }
+        }
         Some(job)
             if job.current_output_id == output_id && job.phase == crate::dto::ChurnPhase::Done =>
         {
-            Some((
-                None,
-                None,
-                Some(job.target_depth),
-                Some(job.effective_depth),
-                None,
-                None,
-                None,
-                None,
-            ))
+            LiveJobFields {
+                target: Some(job.target_depth),
+                counted: Some(job.effective_depth),
+                ..LiveJobFields::default()
+            }
         }
-        _ => None,
+        _ => LiveJobFields::default(),
     };
-    let (
-        churn_phase,
-        churn_error,
-        churn_target,
-        churn_counted,
-        churn_cover_hold,
-        churn_cover_min,
-        churn_cover_seen,
-        churn_spreading,
-    ) = live.unwrap_or((None, None, None, None, None, None, None, None));
     ChurnFields {
         from_pegin,
         non_solo_blocks,
         last_other_kernels: record.and_then(|r| r.last_other_kernels),
         last_other_outputs: record.and_then(|r| r.last_other_outputs),
         hops: record.map(|r| r.hops.clone()).unwrap_or_default(),
-        churn_phase,
-        churn_error,
-        churn_target,
-        churn_counted,
-        churn_cover_hold,
-        churn_cover_min,
-        churn_cover_seen,
-        churn_spreading,
+        churn_phase: live.phase,
+        churn_error: live.error,
+        churn_target: live.target,
+        churn_counted: live.counted,
+        churn_cover_hold: live.cover_hold,
+        churn_cover_min: live.cover_min,
+        churn_cover_seen: live.cover_seen,
+        churn_cover_checked_at: live.cover_checked_at,
+        churn_cover_total: live.cover_total,
+        churn_cover_kernels: live.cover_kernels,
+        churn_cover_outputs: live.cover_outputs,
+        churn_cover_error: live.cover_error,
+        churn_spreading: live.spreading,
     }
 }
 
@@ -3013,6 +3038,99 @@ pub fn broadcast_prepared_raw(
     broadcast_mweb_tx(&tx, rpc_url, peers, network)
 }
 
+/// One successful read of the node mempool for the cover gate.
+///
+/// `foreign_txs` is the number the gate compares against the user's count.
+/// `kernels` and `outputs` are summed over those foreign transactions only, so
+/// the card can speak the same language as the post-hop block score.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoverRead {
+    /// Every transaction id the node listed.
+    pub total_txs: u64,
+    /// Transactions with an MWEB payload or HogEx flag, ours included.
+    pub mweb_txs: u64,
+    /// MWEB transactions that are not this wallet's.
+    pub foreign_txs: u64,
+    /// MWEB kernels across the foreign transactions.
+    pub kernels: u64,
+    /// MWEB outputs across the foreign transactions.
+    pub outputs: u64,
+    /// Ids the node listed but could not hand back, or bytes that did not decode.
+    pub unreadable_txs: u64,
+    pub checked_at_unix: u64,
+}
+
+/// What one mempool entry contributes to a [`CoverRead`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverTx {
+    /// `getrawtransaction` failed or the bytes did not decode.
+    Unreadable,
+    /// A plain Litecoin transaction with no MWEB part.
+    Plain,
+    /// Carries an MWEB payload or is a HogEx. A HogEx has no kernels or outputs.
+    Mweb {
+        txid: String,
+        wtxid: String,
+        kernels: u64,
+        outputs: u64,
+    },
+}
+
+/// Classify one decoded transaction for the cover tally.
+pub fn cover_tx_from(tx: &Transaction) -> CoverTx {
+    if tx.mw_tx.is_none() && !tx.is_hog_ex {
+        return CoverTx::Plain;
+    }
+    let (kernels, outputs) = tx
+        .mw_tx
+        .as_ref()
+        .map(|mw| (mw.body.kernels.len() as u64, mw.body.outputs.len() as u64))
+        .unwrap_or((0, 0));
+    CoverTx::Mweb {
+        txid: tx.compute_txid().to_string(),
+        wtxid: tx.compute_wtxid().to_string(),
+        kernels,
+        outputs,
+    }
+}
+
+/// Sum a mempool listing. Pure so a test can feed it a fixed set.
+///
+/// Ids in `own` (txid or wtxid) are not foreign, including this wallet's other spends.
+pub fn tally_cover(
+    txs: impl IntoIterator<Item = CoverTx>,
+    own: &BTreeSet<String>,
+    now_unix: u64,
+) -> CoverRead {
+    let mut read = CoverRead {
+        checked_at_unix: now_unix,
+        ..CoverRead::default()
+    };
+    for tx in txs {
+        read.total_txs = read.total_txs.saturating_add(1);
+        match tx {
+            CoverTx::Unreadable => {
+                read.unreadable_txs = read.unreadable_txs.saturating_add(1);
+            }
+            CoverTx::Plain => {}
+            CoverTx::Mweb {
+                txid,
+                wtxid,
+                kernels,
+                outputs,
+            } => {
+                read.mweb_txs = read.mweb_txs.saturating_add(1);
+                if crate::churn::is_foreign_id(&txid, &wtxid, own) {
+                    read.foreign_txs = read.foreign_txs.saturating_add(1);
+                    read.kernels = read.kernels.saturating_add(kernels);
+                    read.outputs = read.outputs.saturating_add(outputs);
+                }
+            }
+        }
+    }
+    read
+}
+
 /// Other people's MWEB transactions in the node mempool.
 ///
 /// A transaction counts when it carries an MWEB payload or is a HogEx integration.
@@ -3020,30 +3138,21 @@ pub fn broadcast_prepared_raw(
 pub fn count_foreign_mweb_mempool(
     rpc_url: &str,
     own: &BTreeSet<String>,
-) -> Result<u64, WalletError> {
+) -> Result<CoverRead, WalletError> {
     let ids = crate::rpc::get_raw_mempool(rpc_url)?;
-    let mut count = 0u64;
-    for txid in ids {
-        let hex_tx = match crate::rpc::get_raw_transaction_hex(rpc_url, &txid) {
-            Ok(hex_tx) => hex_tx,
-            Err(_) => continue,
+    let txs = ids.iter().map(|txid| {
+        let Ok(hex_tx) = crate::rpc::get_raw_transaction_hex(rpc_url, txid) else {
+            return CoverTx::Unreadable;
         };
         let Ok(bytes) = hex::decode(&hex_tx) else {
-            continue;
+            return CoverTx::Unreadable;
         };
         let Ok(tx) = deserialize::<Transaction>(&bytes) else {
-            continue;
+            return CoverTx::Unreadable;
         };
-        if tx.mw_tx.is_none() && !tx.is_hog_ex {
-            continue;
-        }
-        let id = tx.compute_txid().to_string();
-        let wtxid = tx.compute_wtxid().to_string();
-        if crate::churn::is_foreign_id(&id, &wtxid, own) {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
+        cover_tx_from(&tx)
+    });
+    Ok(tally_cover(txs, own, crate::churn::unix_now()))
 }
 
 /// The armed hop still spends a coin this wallet can send.
@@ -3312,5 +3421,109 @@ mod churn_field_tests {
         assert!(fields.churn_error.is_none());
         assert_eq!(fields.churn_target, Some(1));
         assert_eq!(fields.churn_counted, Some(1));
+    }
+
+    #[test]
+    fn waiting_job_stamps_the_last_mempool_read() {
+        let id = output_id();
+        let mut job = churn::new_job(&id, false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::WaitingForCover;
+        churn::note_cover_read(
+            &mut job,
+            &super::CoverRead {
+                total_txs: 309,
+                mweb_txs: 1,
+                foreign_txs: 0,
+                kernels: 0,
+                outputs: 0,
+                unreadable_txs: 2,
+                checked_at_unix: 1_700_000_000,
+            },
+        );
+        let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
+        assert_eq!(fields.churn_cover_seen, Some(0));
+        assert_eq!(fields.churn_cover_checked_at, Some(1_700_000_000));
+        assert_eq!(fields.churn_cover_total, Some(309));
+        assert_eq!(fields.churn_cover_kernels, Some(0));
+        assert_eq!(fields.churn_cover_outputs, Some(0));
+        assert!(fields.churn_cover_error.is_none());
+
+        churn::note_cover_error(&mut job, 1_700_000_060, "Connection Failed");
+        let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
+        assert_eq!(fields.churn_cover_checked_at, Some(1_700_000_060));
+        assert_eq!(fields.churn_cover_error.as_deref(), Some("Connection Failed"));
+        // The last good counts stay so the card does not go blank.
+        assert_eq!(fields.churn_cover_total, Some(309));
+
+        job.phase = ChurnPhase::Done;
+        let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
+        assert!(fields.churn_cover_checked_at.is_none());
+        assert!(fields.churn_cover_error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod cover_tally_tests {
+    use super::{tally_cover, CoverRead, CoverTx};
+    use std::collections::BTreeSet;
+
+    fn mweb(txid: &str, wtxid: &str, kernels: u64, outputs: u64) -> CoverTx {
+        CoverTx::Mweb {
+            txid: txid.into(),
+            wtxid: wtxid.into(),
+            kernels,
+            outputs,
+        }
+    }
+
+    #[test]
+    fn empty_mempool_is_a_timestamped_zero() {
+        let read = tally_cover(Vec::new(), &BTreeSet::new(), 42);
+        assert_eq!(
+            read,
+            CoverRead {
+                checked_at_unix: 42,
+                ..CoverRead::default()
+            }
+        );
+    }
+
+    #[test]
+    fn plain_transactions_count_toward_total_only() {
+        let read = tally_cover(
+            vec![CoverTx::Plain, CoverTx::Plain, CoverTx::Plain],
+            &BTreeSet::new(),
+            1,
+        );
+        assert_eq!(read.total_txs, 3);
+        assert_eq!(read.mweb_txs, 0);
+        assert_eq!(read.foreign_txs, 0);
+    }
+
+    #[test]
+    fn foreign_kernels_and_outputs_are_summed_and_own_are_not() {
+        let mut own = BTreeSet::new();
+        own.insert("ours-wtxid".to_string());
+        let read = tally_cover(
+            vec![
+                CoverTx::Plain,
+                mweb("a", "aw", 1, 2),
+                mweb("b", "bw", 2, 3),
+                // Our own earlier hop is in the mempool. It is MWEB but not cover.
+                mweb("ours", "ours-wtxid", 1, 1),
+                // A HogEx has no MWEB body.
+                mweb("hogex", "hogex-w", 0, 0),
+                CoverTx::Unreadable,
+            ],
+            &own,
+            7,
+        );
+        assert_eq!(read.total_txs, 6);
+        assert_eq!(read.mweb_txs, 4);
+        assert_eq!(read.foreign_txs, 3);
+        assert_eq!(read.kernels, 3);
+        assert_eq!(read.outputs, 5);
+        assert_eq!(read.unreadable_txs, 1);
+        assert_eq!(read.checked_at_unix, 7);
     }
 }

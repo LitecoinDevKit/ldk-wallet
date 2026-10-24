@@ -1368,8 +1368,8 @@ dependencies = [
 
 [[package]]
 name = "bdk_wallet"
-version = "3.1.0-litecoin.0"
-source = "git+https://github.com/LitecoinDevKit/bdk_wallet.git?rev=f13078271e5275942ab119323d2075bec5bf66e5#f13078271e5275942ab119323d2075bec5bf66e5"
+version = "3.2.0-litecoin.0"
+source = "git+https://github.com/LitecoinDevKit/bdk_wallet.git?rev=7618a092a54da0036125b5b4bb68ba69f04dce3e#7618a092a54da0036125b5b4bb68ba69f04dce3e"
 dependencies = [
  "anyhow",
  "bdk_chain",

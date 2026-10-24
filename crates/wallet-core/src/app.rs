@@ -1180,6 +1180,9 @@ impl WalletApp {
         })
     }
 
+    // Signing goes through Wallet::sign (deprecated upstream in bdk_wallet 3.2.0) because it
+    // understands the fork's PSBT MWEB maps; moving to caller-owned keys is deferred.
+    #[allow(deprecated)]
     pub fn send(&self, req: SendRequest) -> Result<SendResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
@@ -1406,6 +1409,8 @@ impl WalletApp {
         plan_split_request(state, &req)
     }
 
+    // See `send`: Wallet::sign stays the signing path for now.
+    #[allow(deprecated)]
     pub fn split_coin(&self, req: SplitRequest) -> Result<SplitResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;

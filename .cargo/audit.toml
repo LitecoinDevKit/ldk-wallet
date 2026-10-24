@@ -1,0 +1,7 @@
+# cargo-audit config — CI runs `cargo audit` in .github/workflows/ci.yml.
+[advisories]
+ignore = [
+  # Transitive via alloy → elliptic-curve 0.13 → crypto-bigint 0.5.
+  # Fix needs elliptic-curve ≥0.14 / crypto-bigint ≥0.7.6; alloy still pins 0.13.
+  "RUSTSEC-2026-0387",
+]

@@ -11,7 +11,12 @@ all-features = false
 # surfaced as warnings by `cargo audit` in the same CI job).
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  # Transitive via alloy → elliptic-curve 0.13 → crypto-bigint 0.5.
+  # Fix needs elliptic-curve ≥0.14 / crypto-bigint ≥0.7.6; alloy still pins 0.13.
+  # Keep in sync with .cargo/audit.toml.
+  "RUSTSEC-2026-0387",
+]
 
 [licenses]
 # Permissive licenses only. Anything new that doesn't match fails CI so it

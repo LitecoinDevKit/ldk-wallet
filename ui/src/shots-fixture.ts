@@ -421,7 +421,7 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
     total: 0,
   }),
   get_diagnostics: () => ({
-    app_version: "0.4.10",
+    app_version: "0.4.11",
     os: "macos",
     generated_unix: 1_700_000_000,
     network: "mainnet",

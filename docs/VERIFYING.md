@@ -12,20 +12,20 @@ that built the artifacts. After downloading, compare:
 
 ```bash
 # macOS
-shasum -a 256 "LDK Wallet_0.4.10_aarch64.dmg"
+shasum -a 256 "LDK Wallet_0.4.11_aarch64.dmg"
 # Linux
-sha256sum "LDK Wallet_0.4.10_amd64.AppImage"
+sha256sum "LDK Wallet_0.4.11_amd64.AppImage"
 ```
 
 ```powershell
 # Windows
-Get-FileHash -Algorithm SHA256 ".\LDK Wallet_0.4.10_x64-setup.exe"
+Get-FileHash -Algorithm SHA256 ".\LDK Wallet_0.4.11_x64-setup.exe"
 ```
 
 against the matching line in the sums file (`SHA256SUMS-windows-x86_64.txt` for the installer), or use the helper:
 
 ```bash
-scripts/verify-release.sh checksums "LDK Wallet_0.4.10_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
+scripts/verify-release.sh checksums "LDK Wallet_0.4.11_aarch64.dmg" SHA256SUMS-macos-aarch64.txt
 ```
 
 Unsigned Windows installers trip SmartScreen ("Windows protected your PC"). That is expected. After the checksum matches, choose More info, then Run anyway.
@@ -40,7 +40,7 @@ build time, cryptographically linking it to the exact commit and workflow run
 that produced it. With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify "LDK Wallet_0.4.10_aarch64.dmg" --repo LitecoinDevKit/ldk-wallet
+gh attestation verify "LDK Wallet_0.4.11_aarch64.dmg" --repo LitecoinDevKit/ldk-wallet
 ```
 
 A successful verification shows the source commit and the workflow file that

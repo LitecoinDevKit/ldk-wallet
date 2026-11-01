@@ -232,6 +232,18 @@ fn classify_pass_failure(err: &bdk_mweb::Error) -> PassFailure {
             allow_public_fallback: false,
         };
     }
+    if err.ban_reason() == Some(BanReason::Undecodable) {
+        // The peer served block data our decoder rejects. That is far more
+        // likely a decoder that has drifted from Litecoin Core than a bad
+        // peer, so a public peer would fail the same way while seeing our
+        // queries.
+        return PassFailure {
+            status: "MWEB data from the peer could not be decoded; this wallet may need an \
+                     update."
+                .into(),
+            allow_public_fallback: false,
+        };
+    }
     PassFailure {
         status: format!("MWEB peer unreachable: {err}"),
         allow_public_fallback: true,
@@ -611,26 +623,12 @@ impl MwebRuntime {
         transparent: WalletSummary,
     ) -> Result<CombinedSummary, WalletError> {
         let bal = wallet.balance_combined_store(&self.store);
-        let tip = wallet.latest_checkpoint().height();
-        let immature = self
-            .store
-            .db()
-            .unspent_vec()
-            .into_iter()
-            .filter(|c| {
-                c.is_pegin
-                    && c.block_height
-                        .map(|h| tip.saturating_sub(h) < MWEB_PEGIN_MATURITY)
-                        .unwrap_or(true)
-            })
-            .map(|c| c.amount)
-            .sum::<u64>();
         let mweb_addr = self.receive_address(transparent.network).ok();
         Ok(CombinedSummary {
             transparent,
-            mweb_confirmed_sats: bal.mweb_confirmed.to_sat().saturating_sub(immature),
+            mweb_confirmed_sats: bal.mweb_confirmed.to_sat(),
             mweb_unconfirmed_sats: bal.mweb_untrusted_pending.to_sat(),
-            mweb_immature_sats: immature,
+            mweb_immature_sats: bal.mweb_immature.to_sat(),
             mweb_total_sats: bal.mweb_total().to_sat(),
             mweb_receive_address: mweb_addr,
             mweb_synced_height: self.last_synced_height,
@@ -901,7 +899,23 @@ mod tests {
         );
     }
 
-    /// Everything that is not a throttle keeps the old behavior: a node that
+    /// Block data our decoder rejects points at this wallet, not the peer:
+    /// another peer would fail the same way, so it must not get our queries.
+    #[test]
+    fn undecodable_block_data_asks_for_an_update_without_public_fallback() {
+        let failure = classify_pass_failure(&bdk_mweb::Error::undecodable(
+            "mwebutxos decode: output at leaf 7: unexpected end of file",
+        ));
+        assert!(!failure.allow_public_fallback);
+        assert!(
+            !failure.status.contains("unreachable"),
+            "{}",
+            failure.status
+        );
+        assert!(failure.status.contains("update"), "{}", failure.status);
+    }
+
+    /// Everything that is not a throttle or a decode failure keeps the old behavior: a node that
     /// is genuinely down should not leave MWEB dark.
     #[test]
     fn other_peer_failures_still_fall_back_and_read_as_unreachable() {
@@ -936,6 +950,17 @@ mod tests {
             is_pegin: false,
             leaf_index,
         }
+    }
+
+    /// A [`coin`] whose commitment opens to its amount and blind. Reloading a
+    /// store drops coins that fail that check, so tests that persist and reopen
+    /// need one.
+    fn persistable_coin(id: u8, height: Option<u32>, leaf_index: Option<u64>) -> MwebCoin {
+        let mut c = coin(id, height, leaf_index);
+        c.blind = [0x0b; 32];
+        c.commitment = bdk_mweb::crypto::switch_commit(&c.blind, c.amount, &Secp256k1::new())
+            .expect("valid blind");
+        c
     }
 
     fn id_hex(id: u8) -> String {
@@ -1393,7 +1418,10 @@ mod tests {
         // Start plaintext (legacy wallet), write a coin + history entry.
         let mut legacy =
             MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, None).unwrap();
-        legacy.store.db_mut().insert(coin(1, Some(100), Some(4)));
+        legacy
+            .store
+            .db_mut()
+            .insert(persistable_coin(1, Some(100), Some(4)));
         legacy.receive_index = 7;
         legacy.history.record(entry(TxKind::MwebSend, &[1], &[]));
         legacy.persist(dir.path()).unwrap();
@@ -1584,7 +1612,8 @@ mod tests {
 
         // Write all four files in the legacy format by hand.
         let mut cs = ChangeSet::default();
-        cs.coins.insert([1; 32], coin(1, Some(100), Some(4)));
+        cs.coins
+            .insert([1; 32], persistable_coin(1, Some(100), Some(4)));
         std::fs::write(
             meta::mweb_coins_enc_path(dir.path()),
             bdk_mweb::seal_changeset(&key, &cs).unwrap(),
@@ -3362,7 +3391,7 @@ mod pegin_balance_tests {
         .unwrap();
 
         let pegin_amount = Amount::from_sat(20_000);
-        let mweb_fee = Amount::from_sat(1_000);
+        let mweb_fee = Amount::from_sat(5_000);
         let transparent_fee = Amount::from_sat(500);
         let mut prepared = wallet
             .prepare_mweb_pegin(&keys, 2, pegin_amount, mweb_fee, transparent_fee, &secp)

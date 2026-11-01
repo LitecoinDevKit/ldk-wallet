@@ -1,6 +1,6 @@
 [package]
 name = "ltc-wallet"
-version = "0.4.12"
+version = "0.4.13"
 description = "Native Litecoin wallet for macOS, Linux, and Windows (Tauri shell)"
 authors = ["IndigoNakamoto"]
 edition.workspace = true

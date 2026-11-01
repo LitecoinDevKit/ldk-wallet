@@ -1073,20 +1073,61 @@ pub fn arm_next(record: &mut ArmedRecord, now: u64, height: u32) -> bool {
 }
 
 /// Ids this wallet must not count as cover: unconfirmed history plus every hop.
+///
+/// The empty-skeleton txid is not one of them. Every pure MWEB transaction
+/// shares it, so storing it would hide other people's private transactions.
+/// A hop's kernel id is included when the raw transaction is still on disk,
+/// including hops signed before that id was stored in `txid`.
 pub fn snapshot_own_ids(
     unconfirmed: impl IntoIterator<Item = String>,
     hops: &[ArmedHop],
 ) -> BTreeSet<String> {
-    let mut ids: BTreeSet<String> = unconfirmed.into_iter().collect();
+    let skeleton = crate::mweb::empty_mweb_skeleton_txid();
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for id in unconfirmed {
+        if id != skeleton {
+            ids.insert(id);
+        }
+    }
     for hop in hops {
-        if !hop.txid.is_empty() {
+        if !hop.txid.is_empty() && hop.txid != skeleton {
             ids.insert(hop.txid.clone());
         }
-        if !hop.wtxid.is_empty() {
+        if !hop.wtxid.is_empty() && hop.wtxid != skeleton {
             ids.insert(hop.wtxid.clone());
+        }
+        if let Some(kernel_id) = crate::mweb::kernel_id_from_raw(&hop.raw_hex) {
+            ids.insert(kernel_id);
         }
     }
     ids
+}
+
+/// Output ids an armed self-spend has marked spent but has not broadcast.
+///
+/// Sync must keep these spent. A broadcast hop is left to P-6, which restores
+/// a spend that never confirms.
+pub fn unbroadcast_hold_ids(record: &ArmedRecord) -> BTreeSet<[u8; 32]> {
+    record
+        .hops
+        .iter()
+        .filter(|hop| hop.local_applied && !hop.broadcast)
+        .filter_map(|hop| output_id_bytes(&hop.spent_output_id))
+        .collect()
+}
+
+/// Hold set for the next MWEB sync. A missing or unreadable armed file holds nothing.
+pub fn held_unbroadcast_spends(data_dir: &Path) -> BTreeSet<[u8; 32]> {
+    read_armed(data_dir)
+        .ok()
+        .flatten()
+        .map(|record| unbroadcast_hold_ids(&record))
+        .unwrap_or_default()
+}
+
+fn output_id_bytes(hex_id: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(hex_id).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
 }
 
 pub fn is_foreign_id(txid: &str, wtxid: &str, own: &BTreeSet<String>) -> bool {
@@ -1832,5 +1873,90 @@ mod tests {
         assert!(record.expired);
         assert!(record.hops[1].raw_hex.is_empty());
         assert!(!record.hops[1].broadcast);
+    }
+
+    #[test]
+    fn only_an_applied_unbroadcast_hop_is_held() {
+        let held = [0x11u8; 32];
+        let record = ArmedRecord {
+            version: 1,
+            hops: vec![
+                hop(&hex::encode(held), true, false),
+                hop(&hex::encode([0x22u8; 32]), true, true),
+                hop(&hex::encode([0x33u8; 32]), false, false),
+            ],
+            armed_index: 0,
+            armed_at_unix: 10,
+            armed_height: 20,
+            cover_min: 2,
+            send_after: None,
+            own_ids: BTreeSet::new(),
+            expired: false,
+        };
+        assert_eq!(unbroadcast_hold_ids(&record), BTreeSet::from([held]));
+    }
+
+    #[test]
+    fn snapshot_drops_the_skeleton_and_recovers_the_kernel_id() {
+        let tx = pure_mweb_for_snapshot(4);
+        let raw_hex = bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx);
+        let kernel_id = crate::mweb::kernel_id_from_raw(&raw_hex).unwrap();
+        let skeleton = crate::mweb::empty_mweb_skeleton_txid();
+        let mut hop = hop(&"ab".repeat(32), true, false);
+        hop.raw_hex = raw_hex;
+        hop.txid = skeleton.clone();
+        hop.wtxid = "hop-wtxid".into();
+        let ids = snapshot_own_ids([skeleton.clone()], &[hop]);
+        assert!(!ids.contains(&skeleton));
+        assert!(ids.contains(&kernel_id));
+        assert!(ids.contains("hop-wtxid"));
+    }
+
+    fn hop(spent_output_id: &str, local_applied: bool, broadcast: bool) -> ArmedHop {
+        ArmedHop {
+            raw_hex: "aa".into(),
+            txid: "txid".into(),
+            wtxid: "wtxid".into(),
+            spent_output_id: spent_output_id.into(),
+            created_output_id: "cd".repeat(32),
+            receive_index: 0,
+            fee_sats: 50_000,
+            local_applied,
+            broadcast,
+            created_coin: None,
+        }
+    }
+
+    fn pure_mweb_for_snapshot(excess: u8) -> bdk_wallet::bitcoin::Transaction {
+        use bdk_wallet::bitcoin::absolute::LockTime;
+        use bdk_wallet::bitcoin::blockdata::mimblewimble::{Kernel, Transaction as MwTx, TxBody};
+        use bdk_wallet::bitcoin::transaction::Version;
+        use bdk_wallet::bitcoin::Transaction;
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+            mw_tx: Some(MwTx {
+                kernel_offset: [1; 32],
+                stealth_offset: [2; 32],
+                body: TxBody {
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    kernels: vec![Kernel {
+                        features: 0x01,
+                        fee: Some(50_000),
+                        pegin: None,
+                        pegouts: Vec::new(),
+                        lock_height: None,
+                        stealth_excess: None,
+                        extra_data: Vec::new(),
+                        excess: [excess; 33],
+                        signature: [7; 64],
+                    }],
+                },
+            }),
+            is_hog_ex: false,
+        }
     }
 }

@@ -366,6 +366,7 @@ impl MwebRuntime {
         peers: &[String],
         network: WalletNetwork,
         progress: Option<Arc<SyncProgress>>,
+        hold_spent: &BTreeSet<[u8; 32]>,
     ) -> Result<(), WalletError> {
         let configured = resolve_reachable_peers(peers)?;
         let mut configured_failure = None;
@@ -377,6 +378,7 @@ impl MwebRuntime {
                 prev_tip_hash,
                 network,
                 progress.clone(),
+                hold_spent,
             ) {
                 Ok(()) => {
                     let mut candidates = configured;
@@ -417,6 +419,7 @@ impl MwebRuntime {
             prev_tip_hash,
             network,
             progress,
+            hold_spent,
         ) {
             Ok(()) => {
                 self.last_status.push_str(" via public peer");
@@ -511,6 +514,7 @@ impl MwebRuntime {
         prev_tip_hash: Option<bdk_wallet::bitcoin::BlockHash>,
         network: WalletNetwork,
         progress: Option<Arc<SyncProgress>>,
+        hold_spent: &BTreeSet<[u8; 32]>,
     ) -> Result<(), bdk_mweb::Error> {
         // Heal before this pass so a stuck split/send is included in the
         // full UTXO download rather than waiting for a later sync.
@@ -561,14 +565,7 @@ impl MwebRuntime {
                     result.downloaded,
                     result.found.len()
                 );
-                self.absorb_received_coins();
-                let leafset = self.sync_state.leafset.clone();
-                update_outgoing_confirmations(
-                    &mut self.history,
-                    self.store.db_mut(),
-                    &leafset,
-                    tip_height,
-                );
+                self.apply_post_sync(tip_height, hold_spent);
                 // Inputs recorded before leaf backfill cannot be checked against
                 // the current leafset. Force a full UTXO download next pass so
                 // sync can re-find the live coins and date or restore them.
@@ -589,6 +586,24 @@ impl MwebRuntime {
                 entry.confirmed_height = None;
             }
         }
+    }
+
+    /// Re-apply spends a self-spend is still holding, then absorb receives.
+    ///
+    /// P-6 restores a locally spent coin whose leaf is still unspent after 12
+    /// blocks. That is right for a spend that was broadcast and then dropped.
+    /// A self-spend marks its input spent when the hop is armed, which can be
+    /// many blocks before broadcast, so the restore would hand the coin back
+    /// while the signed transaction still spends it. `hold_spent` is those
+    /// inputs. Re-marking clears the staged restore, so the persist after this
+    /// pass keeps the coin spent, and absorb does not record it as a receive.
+    fn apply_post_sync(&mut self, tip_height: u32, hold_spent: &BTreeSet<[u8; 32]>) {
+        for id in hold_spent {
+            let _ = self.store.db_mut().mark_spent(id);
+        }
+        self.absorb_received_coins();
+        let leafset = self.sync_state.leafset.clone();
+        update_outgoing_confirmations(&mut self.history, self.store.db_mut(), &leafset, tip_height);
     }
 
     /// Add history entries for coins in the store that no entry accounts for
@@ -1469,6 +1484,40 @@ mod tests {
             Some([0u8; 32]),
         );
         assert!(wrong.is_err());
+    }
+
+    /// P-6 puts a locally spent coin back when its leaf is still unspent.
+    /// An unbroadcast self-spend re-marks that coin before absorb, so the
+    /// restore is not recorded as a new receive.
+    #[test]
+    fn unbroadcast_hold_keeps_a_restored_spend_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = crate::seed::MasterSecret::parse(
+            &crate::descriptors::generate_mnemonic().unwrap(),
+            None,
+        )
+        .unwrap();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        let mut runtime =
+            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, None).unwrap();
+        let coin = persistable_coin(1, Some(100), Some(4));
+        let id = coin.output_id;
+        runtime.store.db_mut().insert(coin);
+        assert!(runtime.store.db_mut().mark_spent(&id));
+        assert!(runtime.store.db_mut().restore_spent(&id));
+
+        runtime.apply_post_sync(100, &BTreeSet::from([id]));
+
+        assert!(runtime.store.db().get(&id).is_none());
+        assert!(runtime.store.db().get_spent(&id).is_some());
+        assert!(
+            !runtime
+                .history
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TxKind::MwebReceive),
+            "a held spend must not be absorbed as a receive"
+        );
     }
 
     /// Set up a sealed wallet directory and return its dir, secret, and key.
@@ -3003,7 +3052,7 @@ pub fn sign_self_spend_hops(
         let created_output_id = hex::encode(owned.output_id);
         prepared.push(PreparedHop {
             raw_hex: serialize_hex(&tx),
-            txid: tx.compute_txid().to_string(),
+            txid: mempool_id(&tx),
             wtxid: tx.compute_wtxid().to_string(),
             spent_output_id,
             created_output_id,
@@ -3103,6 +3152,10 @@ pub enum CoverTx {
 }
 
 /// Classify one decoded transaction for the cover tally.
+///
+/// A pure MWEB transaction (no transparent inputs or outputs) is identified
+/// by its first kernel id. `compute_txid` ignores `mw_tx`, so every such
+/// transaction shares one empty-skeleton txid and cannot be told apart by it.
 pub fn cover_tx_from(tx: &Transaction) -> CoverTx {
     if tx.mw_tx.is_none() && !tx.is_hog_ex {
         return CoverTx::Plain;
@@ -3113,11 +3166,59 @@ pub fn cover_tx_from(tx: &Transaction) -> CoverTx {
         .map(|mw| (mw.body.kernels.len() as u64, mw.body.outputs.len() as u64))
         .unwrap_or((0, 0));
     CoverTx::Mweb {
-        txid: tx.compute_txid().to_string(),
+        txid: mempool_id(tx),
         wtxid: tx.compute_wtxid().to_string(),
         kernels,
         outputs,
     }
+}
+
+/// Id a node and this wallet agree on for a transaction in the mempool.
+///
+/// Pure MWEB uses the first kernel's BLAKE3 hash (Core `ComputeHash`, the
+/// same id P2P broadcast inventories). Anything with a transparent input or
+/// output uses `compute_txid`.
+pub(crate) fn mempool_id(tx: &Transaction) -> String {
+    pure_mweb_kernel_id(tx).unwrap_or_else(|| tx.compute_txid().to_string())
+}
+
+/// First kernel id of a transaction with an empty transparent skeleton.
+pub(crate) fn pure_mweb_kernel_id(tx: &Transaction) -> Option<String> {
+    if !tx.input.is_empty() || !tx.output.is_empty() {
+        return None;
+    }
+    let kernel = tx.mw_tx.as_ref()?.body.kernels.first()?;
+    Some(hex::encode(bdk_mweb::kernel_id(kernel)))
+}
+
+/// `compute_txid` of every pure MWEB transaction this wallet authors.
+pub(crate) fn empty_mweb_skeleton_txid() -> String {
+    use std::sync::OnceLock;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        use bdk_wallet::bitcoin::absolute::LockTime;
+        use bdk_wallet::bitcoin::transaction::Version;
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+            mw_tx: None,
+            is_hog_ex: false,
+        };
+        tx.compute_txid().to_string()
+    })
+    .clone()
+}
+
+/// Kernel id of a pure MWEB transaction encoded as consensus hex.
+pub(crate) fn kernel_id_from_raw(raw_hex: &str) -> Option<String> {
+    if raw_hex.is_empty() {
+        return None;
+    }
+    let bytes = hex::decode(raw_hex).ok()?;
+    let tx: Transaction = deserialize(&bytes).ok()?;
+    pure_mweb_kernel_id(&tx)
 }
 
 /// Sum a mempool listing. Pure so a test can feed it a fixed set.
@@ -3508,6 +3609,7 @@ mod churn_field_tests {
 #[cfg(test)]
 mod cover_tally_tests {
     use super::{tally_cover, CoverRead, CoverTx};
+    use bdk_wallet::bitcoin::Transaction;
     use std::collections::BTreeSet;
 
     fn mweb(txid: &str, wtxid: &str, kernels: u64, outputs: u64) -> CoverTx {
@@ -3568,5 +3670,72 @@ mod cover_tally_tests {
         assert_eq!(read.outputs, 5);
         assert_eq!(read.unreadable_txs, 1);
         assert_eq!(read.checked_at_unix, 7);
+    }
+
+    /// Two pure MWEB transactions share `compute_txid`. Cover still tells them
+    /// apart by kernel id, so an own-set that contains one kernel id and the
+    /// shared skeleton counts the other transaction as foreign.
+    #[test]
+    fn pure_mweb_cover_uses_kernel_id_not_the_shared_skeleton() {
+        let ours = pure_mweb(1);
+        let theirs = pure_mweb(2);
+        let skeleton = super::empty_mweb_skeleton_txid();
+        assert_eq!(ours.compute_txid(), theirs.compute_txid());
+        assert_eq!(ours.compute_txid().to_string(), skeleton);
+
+        let ours_cover = super::cover_tx_from(&ours);
+        let theirs_cover = super::cover_tx_from(&theirs);
+        let (ours_id, theirs_id) = match (&ours_cover, &theirs_cover) {
+            (
+                CoverTx::Mweb { txid: ours_id, .. },
+                CoverTx::Mweb {
+                    txid: theirs_id, ..
+                },
+            ) => (ours_id.clone(), theirs_id.clone()),
+            _ => panic!("both transactions carry an MWEB kernel"),
+        };
+        assert_ne!(ours_id, theirs_id);
+        assert_ne!(ours_id, skeleton);
+        assert_ne!(theirs_id, skeleton);
+
+        let mut own = BTreeSet::new();
+        own.insert(ours_id);
+        own.insert(skeleton);
+        let read = tally_cover([ours_cover, theirs_cover], &own, 1);
+        assert_eq!(read.mweb_txs, 2);
+        assert_eq!(read.foreign_txs, 1);
+    }
+
+    /// Fee feature set, so the kernel round-trips through consensus encoding.
+    fn pure_mweb(excess: u8) -> Transaction {
+        use bdk_wallet::bitcoin::absolute::LockTime;
+        use bdk_wallet::bitcoin::blockdata::mimblewimble::{Kernel, Transaction as MwTx, TxBody};
+        use bdk_wallet::bitcoin::transaction::Version;
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+            mw_tx: Some(MwTx {
+                kernel_offset: [1; 32],
+                stealth_offset: [2; 32],
+                body: TxBody {
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    kernels: vec![Kernel {
+                        features: 0x01,
+                        fee: Some(50_000),
+                        pegin: None,
+                        pegouts: Vec::new(),
+                        lock_height: None,
+                        stealth_excess: None,
+                        extra_data: Vec::new(),
+                        excess: [excess; 33],
+                        signature: [7; 64],
+                    }],
+                },
+            }),
+            is_hog_ex: false,
+        }
     }
 }

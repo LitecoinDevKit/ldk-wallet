@@ -1018,6 +1018,7 @@ impl WalletApp {
                 .tip_height
                 .and_then(|h| state.wallet.local_chain().get(h))
                 .map(|cp| cp.hash());
+            let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
             self.with_mweb_progress(|progress| {
                 let _ = mweb.sync_at_tip(
                     tip_height,
@@ -1026,6 +1027,7 @@ impl WalletApp {
                     &peers,
                     network,
                     Some(progress),
+                    &hold_spent,
                 );
             });
             if state.needs_mweb_scan {
@@ -1124,10 +1126,18 @@ impl WalletApp {
             diag::log("resync_mweb: mweb download starting");
             let peers = state.mweb_peers.clone();
             let network = state.network;
+            let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
             // Fresh runtime after wipe: no previous sync state, so no extension hint.
             self.with_mweb_progress(|progress| {
-                let _ =
-                    mweb.sync_at_tip(tip_height, tip_hash, None, &peers, network, Some(progress));
+                let _ = mweb.sync_at_tip(
+                    tip_height,
+                    tip_hash,
+                    None,
+                    &peers,
+                    network,
+                    Some(progress),
+                    &hold_spent,
+                );
             });
             mweb.persist(&state.data_dir)?;
         }

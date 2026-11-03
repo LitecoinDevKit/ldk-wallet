@@ -167,13 +167,7 @@ impl LitVmClient {
     pub fn preview_send(&self, req: &LitVmSendRequest) -> Result<LitVmSendPreview, LitVmError> {
         self.ensure_signing()?;
         let to = parse_evm_address(&req.address)?;
-        let value = parse_zkltc(&req.amount_zkltc)?;
-        if value.is_zero() {
-            return Err(LitVmError::InvalidAmount(
-                "amount must be greater than 0".into(),
-            ));
-        }
-        let built = self.runtime.block_on(self.build_tx(to, value, None))?;
+        let (value, built) = self.resolve_send(to, req)?;
         Ok(LitVmSendPreview {
             from: self.address(),
             to: format_address(to),
@@ -188,13 +182,7 @@ impl LitVmClient {
     pub fn send(&self, req: &LitVmSendRequest) -> Result<LitVmSendResult, LitVmError> {
         self.ensure_signing()?;
         let to = parse_evm_address(&req.address)?;
-        let value = parse_zkltc(&req.amount_zkltc)?;
-        if value.is_zero() {
-            return Err(LitVmError::InvalidAmount(
-                "amount must be greater than 0".into(),
-            ));
-        }
-        let built = self.runtime.block_on(self.build_tx(to, value, None))?;
+        let (value, built) = self.resolve_send(to, req)?;
         let txid = self.runtime.block_on(self.broadcast(built.request))?;
         let pending = !self.runtime.block_on(self.wait_for_receipt(&txid))?;
         if pending {
@@ -294,6 +282,57 @@ impl LitVmClient {
                 .await
                 .map_err(|e| LitVmError::Rpc(e.to_string()))
         })
+    }
+
+    /// Resolve transfer value and a built tx. Drain spends balance minus max fee.
+    fn resolve_send(
+        &self,
+        to: Address,
+        req: &LitVmSendRequest,
+    ) -> Result<(U256, BuiltTx), LitVmError> {
+        if !req.drain {
+            let value = parse_zkltc(&req.amount_zkltc)?;
+            if value.is_zero() {
+                return Err(LitVmError::InvalidAmount(
+                    "amount must be greater than 0".into(),
+                ));
+            }
+            let built = self.runtime.block_on(self.build_tx(to, value, None))?;
+            return Ok((value, built));
+        }
+
+        let balance = self.balance_wei()?;
+        if balance.is_zero() {
+            return Err(LitVmError::InvalidAmount(
+                "no spendable zkLTC balance".into(),
+            ));
+        }
+        // Probe fee with a 1-wei transfer so nodes that require balance ≥ value+gas still work.
+        let probe = self
+            .runtime
+            .block_on(self.build_tx(to, U256::from(1u64), None))?;
+        let value = balance.saturating_sub(probe.max_fee);
+        if value.is_zero() {
+            return Err(LitVmError::InvalidAmount(
+                "balance too low to cover the LitVM fee".into(),
+            ));
+        }
+        let built = self
+            .runtime
+            .block_on(self.build_tx(to, value, Some(probe.nonce)))?;
+        if value.saturating_add(built.max_fee) > balance {
+            let adjusted = balance.saturating_sub(built.max_fee);
+            if adjusted.is_zero() {
+                return Err(LitVmError::InvalidAmount(
+                    "balance too low to cover the LitVM fee".into(),
+                ));
+            }
+            let rebuilt = self
+                .runtime
+                .block_on(self.build_tx(to, adjusted, Some(probe.nonce)))?;
+            return Ok((adjusted, rebuilt));
+        }
+        Ok((value, built))
     }
 
     fn push_local_pending(&self, tx: LitVmHistoryTx) {

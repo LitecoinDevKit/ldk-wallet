@@ -1521,11 +1521,16 @@ textarea {
   margin: 0 0 0.85rem;
 }
 
-#litvm-qr {
-  display: block;
-  margin: 0.5rem 0 0.75rem;
-  border-radius: 8px;
-  background: #fff;
+#litvm-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.55rem;
+}
+
+.tx-row > .row {
+  grid-column: 1 / -1;
+  margin-top: 0.1rem;
 }
 
 .banner p {

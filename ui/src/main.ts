@@ -569,20 +569,28 @@ const el = {
   litvmStatus: document.querySelector<HTMLElement>("#litvm-status")!,
   litvmAddress: document.querySelector<HTMLElement>("#litvm-address")!,
   litvmQr: document.querySelector<HTMLCanvasElement>("#litvm-qr")!,
+  litvmSegReceive: document.querySelector<HTMLButtonElement>("#litvm-seg-receive")!,
+  litvmSegSend: document.querySelector<HTMLButtonElement>("#litvm-seg-send")!,
+  litvmReceive: document.querySelector<HTMLElement>("#litvm-receive")!,
+  litvmSendPanel: document.querySelector<HTMLElement>("#litvm-send")!,
   litvmSendForm: document.querySelector<HTMLFormElement>("#litvm-send-form")!,
   litvmSendAddress: document.querySelector<HTMLInputElement>("#litvm-send-address")!,
   litvmSendAddressHint: document.querySelector<HTMLElement>("#litvm-send-address-hint")!,
   litvmSendAmount: document.querySelector<HTMLInputElement>("#litvm-send-amount")!,
+  litvmSendAmountPresets: document.querySelector<HTMLElement>("#litvm-send-amount-presets")!,
+  litvmSendDrain: document.querySelector<HTMLInputElement>("#litvm-send-drain")!,
   btnLitvmSend: document.querySelector<HTMLButtonElement>("#btn-litvm-send")!,
   btnLitvmRefresh: document.querySelector<HTMLButtonElement>("#btn-litvm-refresh")!,
   btnLitvmFaucet: document.querySelector<HTMLButtonElement>("#btn-litvm-faucet")!,
   btnCopyLitvm: document.querySelector<HTMLButtonElement>("#btn-copy-litvm")!,
   litvmTxList: document.querySelector<HTMLElement>("#litvm-tx-list")!,
   litvmTxEmpty: document.querySelector<HTMLElement>("#litvm-tx-empty")!,
-  btnLitvmHistoryRefresh: document.querySelector<HTMLButtonElement>("#btn-litvm-history-refresh")!,
+  litvmTxEmptyTitle: document.querySelector<HTMLElement>("#litvm-tx-empty-title")!,
+  litvmNetworkBadge: document.querySelector<HTMLElement>("#litvm-network-badge")!,
+  litvmStatusText: document.querySelector<HTMLElement>("#litvm-status-text")!,
+  litvmSettings: document.querySelector<HTMLElement>("#litvm-settings")!,
   litvmRpc: document.querySelector<HTMLInputElement>("#litvm-rpc")!,
   btnTestLitvmRpc: document.querySelector<HTMLButtonElement>("#btn-test-litvm-rpc")!,
-  btnSaveLitvmRpc: document.querySelector<HTMLButtonElement>("#btn-save-litvm-rpc")!,
   litvmRpcResult: document.querySelector<HTMLElement>("#litvm-rpc-result")!,
   statMweb: document.querySelector<HTMLElement>("#stat-mweb")!,
   mwebStatusCard: document.querySelector<HTMLElement>("#mweb-status-card")!,
@@ -1818,6 +1826,8 @@ let sendMode: SegMode = "public";
 let receiveMode: SegMode = "public";
 let coinsMode: SegMode = "public";
 let swapDirection: SwapDirection = "in";
+type LitvmAction = "receive" | "send";
+let litvmAction: LitvmAction = "receive";
 
 function applySeg(
   firstSeg: HTMLButtonElement,
@@ -1849,6 +1859,13 @@ function applySegModes() {
     el.coinsPrivate,
     coinsMode === "public",
   );
+  applySeg(
+    el.litvmSegReceive,
+    el.litvmReceive,
+    el.litvmSegSend,
+    el.litvmSendPanel,
+    litvmAction === "receive",
+  );
   el.coinsHintPublic.hidden = coinsMode !== "public";
   el.coinsHintPrivate.hidden = coinsMode !== "private";
 }
@@ -1877,6 +1894,14 @@ el.coinsSegPrivate.addEventListener("click", () => {
   coinsMode = "private";
   applySegModes();
   void refreshUtxos();
+});
+el.litvmSegReceive.addEventListener("click", () => {
+  litvmAction = "receive";
+  applySegModes();
+});
+el.litvmSegSend.addEventListener("click", () => {
+  litvmAction = "send";
+  applySegModes();
 });
 
 document.addEventListener("pointerdown", (event) => {
@@ -2824,6 +2849,7 @@ function updateBusyUi() {
     el.mwebSendAmountPresets,
     el.peginAmountPresets,
     el.pegoutAmountPresets,
+    el.litvmSendAmountPresets,
   ]) {
     for (const btn of group.querySelectorAll<HTMLButtonElement>("button")) {
       const pegoutPctLocked =
@@ -5116,14 +5142,31 @@ function tryParseSendPaymentUri(raw: string): boolean {
   return true;
 }
 
+/** If L1 Send holds a full 0x address, hand it to LitVM Send. */
+function maybeRouteLitvmFromL1Send(raw: string): boolean {
+  const address = raw.trim();
+  if (!looksLikeEvmAddress(address) || !litvmEnabled) return false;
+  el.sendAddress.value = "";
+  openLitvmSend(address);
+  setStatus("Opened LitVM Send with that 0x address.", "success");
+  return true;
+}
+
 el.sendAddress.addEventListener("paste", (event) => {
   const text = event.clipboardData?.getData("text") ?? "";
-  if (!/^litecoin:/i.test(text.trim())) return;
+  const trimmed = text.trim();
+  if (looksLikeEvmAddress(trimmed) && litvmEnabled) {
+    event.preventDefault();
+    maybeRouteLitvmFromL1Send(trimmed);
+    return;
+  }
+  if (!/^litecoin:/i.test(trimmed)) return;
   event.preventDefault();
   tryParseSendPaymentUri(text);
 });
 
 el.sendAddress.addEventListener("blur", () => {
+  if (maybeRouteLitvmFromL1Send(el.sendAddress.value)) return;
   tryParseSendPaymentUri(el.sendAddress.value);
 });
 
@@ -7924,6 +7967,64 @@ function reapplyPressedAmountPresets() {
   if (pegin != null) applyPeginAmountPreset(pegin, true);
   const pegout = pressedAmountPreset(el.pegoutAmountPresets);
   if (pegout != null) applyPegoutAmountPreset(pegout, true);
+  const litvm = pressedAmountPreset(el.litvmSendAmountPresets);
+  if (litvm != null) applyLitvmAmountPreset(litvm, true);
+}
+
+function clearLitvmAmountPreset() {
+  if (el.litvmSendDrain.checked) {
+    el.litvmSendDrain.checked = false;
+  }
+  setAmountPresetPressed(el.litvmSendAmountPresets, null);
+}
+
+/** Format a zkLTC decimal for the amount input (trim trailing zeros). */
+function formatZkltcInput(amount: number): string {
+  if (!Number.isFinite(amount) || amount <= 0) return "";
+  const raw = amount.toFixed(8);
+  return raw.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+function litvmSpendableAmount(): number {
+  const raw = lastLitvmSummary?.balance_zkltc?.trim() ?? "0";
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function applyLitvmAmountPreset(preset: AmountPreset, quiet = false) {
+  const balance = litvmSpendableAmount();
+  if (balance <= 0) {
+    if (quiet) {
+      el.litvmSendAmount.value = "";
+      el.litvmSendDrain.checked = preset === "max";
+      setAmountPresetPressed(el.litvmSendAmountPresets, preset);
+      updateBusyUi();
+      return;
+    }
+    setError("No spendable zkLTC balance yet.");
+    return;
+  }
+  if (preset === "max") {
+    el.litvmSendAmount.value = lastLitvmSummary?.balance_zkltc?.trim() || formatZkltcInput(balance);
+    el.litvmSendDrain.checked = true;
+  } else {
+    const amount = (balance * preset) / 100;
+    if (amount <= 0) {
+      if (quiet) {
+        el.litvmSendAmount.value = "";
+        el.litvmSendDrain.checked = false;
+        setAmountPresetPressed(el.litvmSendAmountPresets, preset);
+        updateBusyUi();
+        return;
+      }
+      setError("That percentage is too small for the current balance.");
+      return;
+    }
+    el.litvmSendAmount.value = formatZkltcInput(amount);
+    el.litvmSendDrain.checked = false;
+  }
+  setAmountPresetPressed(el.litvmSendAmountPresets, preset);
+  updateBusyUi();
 }
 
 function pegoutLocksAmount(): boolean {
@@ -7960,6 +8061,7 @@ bindAmountPresetClicks(el.sendAmountPresets, applySendAmountPreset);
 bindAmountPresetClicks(el.mwebSendAmountPresets, applyMwebSendAmountPreset);
 bindAmountPresetClicks(el.peginAmountPresets, applyPeginAmountPreset);
 bindAmountPresetClicks(el.pegoutAmountPresets, applyPegoutAmountPreset);
+bindAmountPresetClicks(el.litvmSendAmountPresets, (preset) => applyLitvmAmountPreset(preset));
 el.sendAmount.addEventListener("input", () => {
   clearSendAmountPreset();
   updateBusyUi();
@@ -7976,10 +8078,36 @@ el.pegoutAmount.addEventListener("input", () => {
   clearPegoutAmountPreset();
   updateBusyUi();
 });
+el.litvmSendAmount.addEventListener("input", () => {
+  clearLitvmAmountPreset();
+  updateBusyUi();
+});
 
 function formatZkltcDisplay(amount: string): string {
   if (hideBalances) return HIDDEN_AMOUNT;
   return `${amount} zkLTC`;
+}
+
+function truncateAddr(address: string): string {
+  const a = address.trim();
+  if (a.length <= 12) return a;
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
+/** Open LitVM Send (and optionally prefill a 0x address). Shared by UI and paste routing. */
+function openLitvmSend(address?: string) {
+  if (!litvmEnabled) {
+    setStatus("LitVM is not available in this build.", "error");
+    return;
+  }
+  litvmAction = "send";
+  applySegModes();
+  setView("litvm");
+  if (address) {
+    el.litvmSendAddress.value = address.trim();
+    updateLitvmAddressHint();
+  }
+  el.litvmSendAddress.focus();
 }
 
 function updateLitvmAddressHint() {
@@ -8020,6 +8148,7 @@ async function initLitvm() {
     litvmEnabled = false;
   }
   el.navLitvm.hidden = !litvmEnabled;
+  el.litvmSettings.hidden = !litvmEnabled;
   if (litvmEnabled) void refreshLitvm();
 }
 
@@ -8030,17 +8159,20 @@ async function refreshLitvm() {
     lastLitvmSummary = summary;
     el.litvmAddress.textContent = summary.address;
     el.litvmBalance.textContent = formatZkltcDisplay(summary.balance_zkltc);
-    el.litvmStatus.textContent = summary.signing_enabled
-      ? `${summary.network_name} · chain ${summary.chain_id} · ready`
-      : `${summary.network_name} · waiting for RPC chain ID ${summary.chain_id}`;
+    el.litvmNetworkBadge.hidden = false;
+    el.litvmNetworkBadge.textContent = summary.network_name;
+    el.litvmStatusText.textContent = summary.signing_enabled ? "Ready" : "Waiting for RPC";
     litvmFaucetUrl = summary.faucet_url || "https://testnet.litvm.com";
     el.litvmRpc.placeholder = summary.rpc_http;
     await renderQr(el.litvmQr, summary.address);
     const settings = await invoke<LitVmSettings>("get_litvm_settings");
     el.litvmRpc.value = settings.rpc_http_override ?? "";
+    const litvmPreset = pressedAmountPreset(el.litvmSendAmountPresets);
+    if (litvmPreset != null) applyLitvmAmountPreset(litvmPreset, true);
     await refreshLitvmHistory();
   } catch (e) {
-    el.litvmStatus.textContent = String(e);
+    el.litvmNetworkBadge.hidden = true;
+    el.litvmStatusText.textContent = String(e);
   }
 }
 
@@ -8061,30 +8193,61 @@ async function refreshLitvmHistory() {
 function renderLitvmHistory() {
   el.litvmTxList.textContent = "";
   const empty = litvmHistory.length === 0;
-  el.litvmTxEmpty.hidden = !empty && !litvmHistoryWarning;
-  if (empty && litvmHistoryWarning) {
+  if (empty) {
     el.litvmTxEmpty.hidden = false;
-    el.litvmTxEmpty.textContent = litvmHistoryWarning;
-  } else if (empty) {
-    el.litvmTxEmpty.hidden = false;
-    el.litvmTxEmpty.textContent = "No LitVM transactions yet.";
-  } else if (litvmHistoryWarning) {
-    el.litvmTxEmpty.hidden = false;
-    el.litvmTxEmpty.textContent = litvmHistoryWarning;
+    el.litvmTxEmptyTitle.textContent = litvmHistoryWarning || "No LitVM transactions yet.";
+  } else {
+    el.litvmTxEmpty.hidden = true;
   }
   for (const tx of litvmHistory) {
-    const li = document.createElement("li");
-    li.className = "tx-row";
+    const dir = tx.incoming ? "in" : "out";
+    const counterparty = tx.incoming ? tx.from : tx.to;
+
+    const icon = document.createElement("span");
+    icon.className = `tx-icon ${dir}`;
+    icon.innerHTML = dir === "in" ? SVG_ARROW_IN : SVG_ARROW_OUT;
+
+    const amount = document.createElement("span");
+    amount.className = dir === "in" ? "tx-amt in" : "tx-amt";
+    amount.textContent = hideBalances
+      ? HIDDEN_AMOUNT
+      : `${dir === "in" ? "+" : "−"}${tx.amount_zkltc} zkLTC`;
+
+    const meta = document.createElement("span");
+    meta.className = "tx-meta";
+    meta.textContent = [
+      tx.incoming ? "Received" : "Sent",
+      truncateAddr(counterparty),
+      formatTxTime(tx.timestamp),
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
     const main = document.createElement("div");
     main.className = "tx-main";
-    const title = document.createElement("div");
-    const kind = tx.incoming ? "Received" : "Sent";
-    title.textContent = `${kind} ${formatZkltcDisplay(tx.amount_zkltc)}`;
-    const meta = document.createElement("div");
-    meta.className = "hint";
-    const state = tx.failed ? " · failed" : tx.pending ? " · pending" : "";
-    meta.textContent = `${tx.txid.slice(0, 10)}…${state}`;
-    main.append(title, meta);
+    main.append(amount, meta);
+
+    const pill = document.createElement("span");
+    if (tx.failed) {
+      pill.className = "pill pending";
+      pill.textContent = "failed";
+    } else if (tx.pending) {
+      pill.className = "pill pending";
+      pill.textContent = "pending";
+    } else {
+      pill.className = "pill";
+      pill.textContent = "confirmed";
+    }
+
+    const txid = document.createElement("span");
+    txid.className = "tx-id";
+    txid.textContent = `${tx.txid.slice(0, 8)}…${tx.txid.slice(-8)}`;
+    txid.title = tx.txid;
+
+    const side = document.createElement("div");
+    side.className = "tx-side";
+    side.append(pill, txid);
+
     const actions = document.createElement("div");
     actions.className = "row";
     const explore = document.createElement("button");
@@ -8107,7 +8270,13 @@ function renderLitvmHistory() {
       });
       actions.append(speed);
     }
-    li.append(main, actions);
+
+    const li = document.createElement("li");
+    li.className = "tx-row";
+    li.dataset.txid = tx.txid;
+    li.dataset.pending = String(tx.pending);
+    li.dataset.failed = String(tx.failed);
+    li.append(icon, main, side, actions);
     el.litvmTxList.appendChild(li);
   }
 }
@@ -8159,7 +8328,6 @@ async function replaceLitvmTx(tx: LitVmHistoryTx) {
 }
 
 el.btnLitvmRefresh.addEventListener("click", () => void refreshLitvm());
-el.btnLitvmHistoryRefresh.addEventListener("click", () => void refreshLitvmHistory());
 el.btnCopyLitvm.addEventListener("click", () => {
   const addr = el.litvmAddress.textContent?.trim() ?? "";
   if (addr && addr !== "—") void copyText(addr, "LitVM address copied.");
@@ -8169,28 +8337,19 @@ el.btnLitvmFaucet.addEventListener("click", () => {
 });
 el.litvmSendAddress.addEventListener("input", updateLitvmAddressHint);
 el.btnTestLitvmRpc.addEventListener("click", async () => {
-  showLoading("Probing LitVM RPC…");
+  el.litvmRpcResult.textContent = "Testing…";
   try {
+    // Persist the typed override so the probe uses the field value (IPC has no URL arg).
+    await invoke<LitVmSettings>("update_litvm_settings", {
+      req: { rpc_http_override: el.litvmRpc.value.trim() || null },
+    });
     const probe = await invoke<LitVmProbe>("test_litvm_rpc");
     el.litvmRpcResult.textContent = probe.matches
       ? `OK · chain ${probe.rpc_chain_id}`
       : probe.error || "Chain ID mismatch";
-    await refreshLitvm();
+    if (litvmEnabled) await refreshLitvm();
   } catch (e) {
     el.litvmRpcResult.textContent = String(e);
-  } finally {
-    hideLoading();
-  }
-});
-el.btnSaveLitvmRpc.addEventListener("click", async () => {
-  try {
-    await invoke<LitVmSettings>("update_litvm_settings", {
-      req: { rpc_http_override: el.litvmRpc.value.trim() || null },
-    });
-    setStatus("LitVM RPC saved.", "success");
-    await refreshLitvm();
-  } catch (e) {
-    setStatus(String(e), "error");
   }
 });
 el.litvmSendForm.addEventListener("submit", async (event) => {
@@ -8208,7 +8367,8 @@ el.litvmSendForm.addEventListener("submit", async (event) => {
     setError(String(e));
     return;
   }
-  if (!amount) {
+  const drain = el.litvmSendDrain.checked;
+  if (!drain && !amount) {
     setError("Enter a zkLTC amount.");
     return;
   }
@@ -8218,7 +8378,7 @@ el.litvmSendForm.addEventListener("submit", async (event) => {
   let preview: LitVmSendPreview;
   try {
     preview = await invoke<LitVmSendPreview>("preview_litvm_send", {
-      req: { address, amount_zkltc: amount },
+      req: { address, amount_zkltc: amount || "0", drain },
     });
   } catch (e) {
     setError(String(e));
@@ -8249,10 +8409,11 @@ el.litvmSendForm.addEventListener("submit", async (event) => {
   showLoading("Broadcasting on LiteForge…");
   try {
     const result = await invoke<LitVmSendResult>("send_litvm", {
-      req: { address, amount_zkltc: amount },
+      req: { address, amount_zkltc: amount || "0", drain },
     });
     el.litvmSendAddress.value = "";
     el.litvmSendAmount.value = "";
+    clearLitvmAmountPreset();
     setStatus(
       result.pending
         ? `Broadcast zkLTC · ${result.txid.slice(0, 10)}… (waiting on explorer index)`
@@ -8286,7 +8447,9 @@ el.sendForm.addEventListener("submit", async (event) => {
     return;
   }
   if (looksLikeEvmAddress(address)) {
-    setError("That is a LitVM address. Switch to the LitVM tab to send zkLTC.");
+    el.sendAddress.value = "";
+    openLitvmSend(address);
+    setStatus("Opened LitVM Send with that 0x address.", "success");
     return;
   }
 
@@ -8487,6 +8650,13 @@ el.btnSaveSettings.addEventListener("click", async () => {
         insights_enabled: el.settingsInsightsEnabled.checked,
       },
     });
+    if (litvmEnabled) {
+      await invoke<LitVmSettings>("update_litvm_settings", {
+        req: { rpc_http_override: el.litvmRpc.value.trim() || null },
+      });
+      el.litvmRpcResult.textContent = "";
+      void refreshLitvm();
+    }
     autoLockMinutes = autoLock;
     showFiat = el.settingsShowFiat.checked;
     useExplorerFeeHints = el.settingsFeeHints.checked;

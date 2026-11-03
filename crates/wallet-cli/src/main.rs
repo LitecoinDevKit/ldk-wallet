@@ -347,6 +347,7 @@ fn main() -> Result<()> {
             let result = client.send(&wallet_litvm::LitVmSendRequest {
                 address,
                 amount_zkltc: amount,
+                drain: false,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }

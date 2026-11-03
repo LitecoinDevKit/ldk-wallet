@@ -1119,64 +1119,104 @@
                 <button type="button" id="btn-litvm-refresh" class="btn btn-ghost btn-sm">Refresh</button>
               </div>
               <p class="balance-total" id="litvm-balance">0 zkLTC</p>
-              <p class="hint" id="litvm-status">Not connected</p>
+              <p class="hint" id="litvm-status">
+                <span class="pill" id="litvm-network-badge" hidden></span>
+                <span id="litvm-status-text">Not connected</span>
+              </p>
             </div>
             <div class="card">
-              <h3>Receive</h3>
-              <canvas id="litvm-qr" class="qr" width="180" height="180" aria-label="LitVM receive QR"></canvas>
-              <p class="mono address" id="litvm-address">—</p>
-              <div class="row">
-                <button type="button" id="btn-copy-litvm" class="btn btn-secondary">Copy address</button>
+              <div class="seg-toggle" id="litvm-toggle" role="tablist" aria-label="LitVM action">
+                <button
+                  type="button"
+                  id="litvm-seg-receive"
+                  class="seg"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="litvm-receive"
+                >
+                  <span class="seg-label">Receive</span>
+                </button>
+                <button
+                  type="button"
+                  id="litvm-seg-send"
+                  class="seg"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="litvm-send"
+                >
+                  <span class="seg-label">Send</span>
+                </button>
               </div>
-            </div>
-            <div class="card">
-              <h3>Send</h3>
-              <form id="litvm-send-form">
-                <label class="field">
-                  <span class="field-label">LitVM address</span>
-                  <input
-                    id="litvm-send-address"
-                    class="mono"
-                    type="text"
-                    spellcheck="false"
-                    autocomplete="off"
-                    placeholder="0x…"
-                  />
-                </label>
-                <p class="hint" id="litvm-send-address-hint" hidden></p>
-                <label class="field">
-                  <span class="field-label">Amount (zkLTC)</span>
-                  <input id="litvm-send-amount" type="text" inputmode="decimal" placeholder="0.0" />
-                </label>
-                <div class="row">
-                  <button type="submit" id="btn-litvm-send" class="btn btn-primary">Send zkLTC</button>
+              <div id="litvm-receive" class="seg-panel" role="tabpanel" aria-labelledby="litvm-seg-receive">
+                <div class="receive-row">
+                  <div class="qr-card">
+                    <canvas id="litvm-qr" width="176" height="176" aria-label="LitVM receive QR"></canvas>
+                  </div>
+                  <div class="receive-meta">
+                    <p class="mono receive-address" id="litvm-address">—</p>
+                    <div class="row">
+                      <button type="button" id="btn-copy-litvm" class="btn btn-primary">
+                        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                          <rect x="9" y="9" width="11" height="11" rx="2" />
+                          <path d="M15 5.5A1.5 1.5 0 0 0 13.5 4H6a2 2 0 0 0-2 2v7.5A1.5 1.5 0 0 0 5.5 15" />
+                        </svg>
+                        <span class="btn-label">Copy address</span>
+                      </button>
+                    </div>
+                    <p class="hint">
+                      LitVM <code>0x</code> address derived from your recovery phrase. zkLTC is not L1
+                      Litecoin.
+                    </p>
+                  </div>
                 </div>
-              </form>
+              </div>
+              <div id="litvm-send" class="seg-panel" role="tabpanel" aria-labelledby="litvm-seg-send" hidden>
+                <form id="litvm-send-form">
+                  <label class="field">
+                    <span class="field-label">LitVM address</span>
+                    <input
+                      id="litvm-send-address"
+                      class="mono"
+                      type="text"
+                      spellcheck="false"
+                      autocomplete="off"
+                      placeholder="0x…"
+                    />
+                  </label>
+                  <p class="hint" id="litvm-send-address-hint" hidden></p>
+                  <label class="field">
+                    <span class="field-label">Amount (zkLTC)</span>
+                    <input id="litvm-send-amount" type="text" inputmode="decimal" placeholder="0.0" />
+                  </label>
+                  <div
+                    class="amount-presets"
+                    id="litvm-send-amount-presets"
+                    role="group"
+                    aria-label="Amount presets"
+                  >
+                    <button type="button" class="fee-chip amount-preset" data-pct="25">25%</button>
+                    <button type="button" class="fee-chip amount-preset" data-pct="50">50%</button>
+                    <button type="button" class="fee-chip amount-preset" data-pct="75">75%</button>
+                    <button type="button" class="fee-chip amount-preset" data-pct="max">Max</button>
+                  </div>
+                  <input id="litvm-send-drain" type="checkbox" hidden />
+                  <div class="row">
+                    <button type="submit" id="btn-litvm-send" class="btn btn-primary">Send zkLTC</button>
+                  </div>
+                </form>
+              </div>
             </div>
             <div class="card">
               <div class="sheet-head">
                 <h3>Activity</h3>
-                <button type="button" id="btn-litvm-history-refresh" class="btn btn-ghost btn-sm">
-                  Refresh
-                </button>
               </div>
               <ul id="litvm-tx-list" class="tx-list"></ul>
-              <p class="hint" id="litvm-tx-empty">No LitVM transactions yet, or the explorer index is unavailable.</p>
-            </div>
-            <div class="card">
-              <h3>RPC</h3>
-              <label class="field">
-                <span class="field-label">HTTP RPC (blank = LiteForge default)</span>
-                <input id="litvm-rpc" class="mono" type="text" spellcheck="false" placeholder="https://…" />
-              </label>
-              <div class="row">
-                <button type="button" id="btn-test-litvm-rpc" class="btn btn-ghost btn-sm">
-                  Test connection
-                </button>
-                <button type="button" id="btn-save-litvm-rpc" class="btn btn-secondary btn-sm">
-                  Save RPC
-                </button>
-                <span class="hint" id="litvm-rpc-result"></span>
+              <div class="empty" id="litvm-tx-empty">
+                <svg class="icon icon-lg" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.5" />
+                  <path d="M12 7.2V12l3.4 2" />
+                </svg>
+                <p class="empty-title" id="litvm-tx-empty-title">No LitVM transactions yet.</p>
               </div>
             </div>
           </section>
@@ -1478,6 +1518,28 @@
                   run litecoind locally — a dead localhost peer used to stall first sync.
                 </span>
               </label>
+              <div id="litvm-settings" hidden>
+                <label class="field">
+                  <span class="field-label">LitVM HTTP RPC</span>
+                  <input
+                    id="litvm-rpc"
+                    class="mono"
+                    type="text"
+                    spellcheck="false"
+                    placeholder="https://…"
+                  />
+                  <span class="hint">
+                    Blank uses the LiteForge default. The endpoint learns your IP and LitVM
+                    <code>0x</code> address when you open the LitVM tab or send zkLTC.
+                  </span>
+                </label>
+                <div class="row">
+                  <button type="button" id="btn-test-litvm-rpc" class="btn btn-ghost btn-sm">
+                    Test connection
+                  </button>
+                  <span class="hint" id="litvm-rpc-result"></span>
+                </div>
+              </div>
               <div class="row">
                 <button type="button" id="btn-save-settings" class="btn btn-primary">Save settings</button>
               </div>

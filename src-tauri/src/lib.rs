@@ -4,16 +4,18 @@ use std::sync::{mpsc, Arc};
 
 use tauri::{AppHandle, Manager, State};
 use wallet_core::{
-    AddressReuseHint, CombinedSummary, ContactRecord, CreateWalletRequest, CreateWalletResponse,
-    DeleteContactRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder,
+    AddressReuseHint, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary, ContactRecord,
+    CreateAccountRequest, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest,
+    DeleteWalletRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder,
     HistoryExportFormat, MetadataImportResult, MetricSeries, MigrateEncryptRequest,
     MwebBroadcastResult, MwebSendPreview, MwebSendRequest, MwebSyncProgress, MwebUtxoRecord,
     NetworkPulse, PeginPreview, PeginRequest, PeginResult, PegoutPreview, PegoutRequest,
-    RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse, SendPreview, SendRequest,
-    SendResult, SetTxLabelRequest, SetUtxoLabelRequest, SetMwebUtxoLockedRequest,
-    SetUtxoLockedRequest, SplitPreview, SplitRequest, SplitResult, SyncResult, TxEnrichment,
-    TxRecord, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletApp,
-    WalletSettings, WalletSummary, ChurnPreview, ChurnRequest, ChurnStatus,
+    RenameWalletRequest, RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse,
+    SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest, SetTxLabelRequest,
+    SetUtxoLabelRequest, SetUtxoLockedRequest, SplitPreview, SplitRequest, SplitResult,
+    SwitchWalletRequest, SyncResult, TransferCoinPreview, TransferCoinRequest, TransferCoinResult,
+    TxEnrichment, TxRecord, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
+    WalletApp, WalletListItem, WalletSettings, WalletSummary,
 };
 
 mod litvm;
@@ -161,6 +163,125 @@ async fn load_wallet(
         }
     }
     result
+}
+
+#[tauri::command]
+async fn list_wallets(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<Vec<WalletListItem>, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.list_wallets(&dir).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn create_wallet_account(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: CreateAccountRequest,
+) -> Result<WalletSummary, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        wallet.create_wallet_account(&dir, req).map_err(map_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        #[cfg(feature = "litvm")]
+        {
+            let _ = litvm::attach_from_app(&app, &state).await;
+        }
+    }
+    result
+}
+
+#[tauri::command]
+async fn switch_wallet(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: SwitchWalletRequest,
+) -> Result<WalletSummary, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        wallet.switch_wallet(&dir, req).map_err(map_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        #[cfg(feature = "litvm")]
+        {
+            let _ = litvm::attach_from_app(&app, &state).await;
+        }
+    }
+    result
+}
+
+#[tauri::command]
+async fn rename_wallet(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: RenameWalletRequest,
+) -> Result<Vec<WalletListItem>, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.rename_wallet(&dir, req).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn delete_wallet_account(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: DeleteWalletRequest,
+) -> Result<WalletSummary, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        wallet.delete_wallet(&dir, req).map_err(map_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        #[cfg(feature = "litvm")]
+        {
+            let _ = litvm::attach_from_app(&app, &state).await;
+        }
+    }
+    result
+}
+
+#[tauri::command]
+async fn preview_transfer_coin(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: TransferCoinRequest,
+) -> Result<TransferCoinPreview, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        wallet.preview_transfer_coin(&dir, req).map_err(map_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn transfer_coin(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+    req: TransferCoinRequest,
+) -> Result<TransferCoinResult, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.transfer_coin(&dir, req).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -882,6 +1003,13 @@ pub fn run() {
             create_wallet,
             restore_wallet,
             load_wallet,
+            list_wallets,
+            create_wallet_account,
+            switch_wallet,
+            rename_wallet,
+            delete_wallet_account,
+            preview_transfer_coin,
+            transfer_coin,
             sync_wallet,
             get_summary,
             get_combined_summary,

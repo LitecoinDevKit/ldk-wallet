@@ -2,6 +2,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::network::WalletNetwork;
 
+/// One entry in the multi-wallet switcher (same seed, BIP84 account index).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletListItem {
+    pub index: u32,
+    pub name: String,
+    pub is_active: bool,
+}
+
+/// Request to add another BIP84 account under the existing seed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAccountRequest {
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Request to switch the active wallet account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchWalletRequest {
+    pub index: u32,
+}
+
+/// Request to rename a wallet account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameWalletRequest {
+    pub index: u32,
+    pub name: String,
+}
+
+/// Request to delete a wallet account (not the last).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteWalletRequest {
+    pub index: u32,
+}
+
 /// Request to create a new wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateWalletRequest {
@@ -701,6 +735,44 @@ pub struct MwebBroadcastResult {
 pub enum SplitChain {
     Public,
     Private,
+}
+
+/// Move one coin from the active wallet to another BIP84 account (same seed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferCoinRequest {
+    pub chain: SplitChain,
+    /// Public: `txid:vout`. Private: 32-byte output id hex.
+    pub coin_id: String,
+    pub to_account_index: u32,
+    /// Transparent fee rate (sat/vB). When omitted or zero, estimated from Electrum.
+    #[serde(default)]
+    pub fee_rate_sat_vb: Option<u64>,
+    /// MWEB kernel fee. `0` means auto ([`DEFAULT_MWEB_FEE_SATS`]).
+    #[serde(default)]
+    pub fee_sats: u64,
+}
+
+/// Dry-run of an inter-wallet coin transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferCoinPreview {
+    pub to_account_index: u32,
+    pub to_wallet_name: String,
+    pub address: String,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    #[serde(default)]
+    pub fee_rate_sat_vb: Option<u64>,
+    #[serde(default)]
+    pub creates_change: bool,
+}
+
+/// Result of broadcasting an inter-wallet coin transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferCoinResult {
+    pub txid: String,
+    pub fee_sats: u64,
+    pub address: String,
+    pub to_account_index: u32,
 }
 
 /// One spendable MWEB coin for the Coins list / split picker.

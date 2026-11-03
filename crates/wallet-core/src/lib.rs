@@ -2,6 +2,7 @@
 //!
 //! Public API exposes serde DTOs only. BDK types remain private.
 
+mod accounts;
 mod aezeed;
 mod app;
 mod churn;
@@ -32,17 +33,19 @@ mod utxo_labels;
 pub use app::{MemoryBackedApp, WalletApp};
 pub use dto::{
     AddressReuseHint, ChurnDepthRecord, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus,
-    CombinedSummary, ContactKind, ContactRecord, CoverHold, CreateWalletRequest,
-    CreateWalletResponse, DeleteContactRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate,
-    FeeLadder, MetricSeries, MigrateEncryptRequest, MwebBroadcastResult, MwebScheme,
-    MwebSendPreview, MwebSendRequest, MwebSyncProgress, MwebUtxoRecord, NetworkPulse, PeginPreview,
-    PeginRequest, PeginResult, PegoutPreview, PegoutRequest, RestoreWalletRequest,
-    RevealMnemonicRequest, RevealMnemonicResponse, SendPreview, SendRequest, SendResult,
-    SetMwebUtxoLockedRequest, SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest,
-    SplitChain, SplitOutput, SplitPreview, SplitRequest, SplitResult, SyncPhase, SyncResult,
-    TxEnrichment, TxIo, TxKind, TxRecord, TxStatus, UnlockRequest, UpdateSettingsRequest,
-    UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE,
-    CHURN_MAX_TARGET, CHURN_QUIET_NOTE, DEFAULT_MWEB_FEE_SATS,
+    CombinedSummary, ContactKind, ContactRecord, CoverHold, CreateAccountRequest,
+    CreateWalletRequest, CreateWalletResponse, DeleteContactRequest, DeleteWalletRequest,
+    DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder, MetricSeries, MigrateEncryptRequest,
+    MwebBroadcastResult, MwebScheme, MwebSendPreview, MwebSendRequest, MwebSyncProgress,
+    MwebUtxoRecord, NetworkPulse, PeginPreview, PeginRequest, PeginResult, PegoutPreview,
+    PegoutRequest,     RenameWalletRequest, RestoreWalletRequest, RevealMnemonicRequest,
+    RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest,
+    SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitOutput,
+    SplitPreview, SplitRequest, SplitResult, SwitchWalletRequest, SyncPhase, SyncResult,
+    TransferCoinPreview, TransferCoinRequest, TransferCoinResult, TxEnrichment, TxIo, TxKind,
+    TxRecord, TxStatus, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
+    WalletListItem, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_MAX_TARGET,
+    CHURN_QUIET_NOTE, DEFAULT_MWEB_FEE_SATS,
 };
 pub use error::{BroadcastFailureKind, WalletError};
 pub use explorer::{is_chain_txid, DEFAULT_EXPLORER_BASE_URL};

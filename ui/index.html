@@ -393,6 +393,14 @@
         <header class="topbar" data-tauri-drag-region>
           <h2 class="topbar-title" id="view-title">Balance</h2>
           <div class="topbar-actions">
+            <button
+              type="button"
+              id="btn-wallet-switcher"
+              class="btn btn-ghost btn-sm wallet-switcher-btn"
+              title="Switch wallet (same recovery phrase)"
+            >
+              <span id="wallet-switcher-label">Personal</span>
+            </button>
             <span class="sync-dot" id="sync-dot" data-state="idle" title="Idle"></span>
             <span class="badge" id="network-badge">mainnet</span>
             <button type="button" id="btn-sync" class="btn btn-secondary">

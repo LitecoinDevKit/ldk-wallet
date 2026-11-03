@@ -174,9 +174,10 @@ pub async fn litvm_explorer_tx_url(
 }
 
 fn attach_from_app_blocking(app: &AppHandle, wallet: &WalletApp) -> Result<(), String> {
-    let dir = data_dir(app)?;
+    let root = data_dir(app)?;
+    let account_dir = wallet.active_account_dir(&root).map_err(map_err)?;
     let handle = app.state::<Arc<LitVmHandle>>();
-    attach(wallet, &handle, &dir)
+    attach(wallet, &handle, &account_dir)
 }
 
 fn drop_from_app_blocking(app: &AppHandle) {

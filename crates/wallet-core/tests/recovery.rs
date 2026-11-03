@@ -45,7 +45,7 @@ const CHILD_ZPRV: &str = "zprvAYwxAu3aPgFFtbyACXnREEYDwzAJCcwDYcyNKJuxc6YSSaYTyH
 /// The mwebd addresses are the pre-migration path (`m/1000'/2'/0'/{0,1}'`).
 #[test]
 fn frozen_derivation_vectors_all_schemes() {
-    let p = derive_preview(BIP39_TEST, None, WalletNetwork::Mainnet, 2).unwrap();
+    let p = derive_preview(BIP39_TEST, None, WalletNetwork::Mainnet, 2, 0).unwrap();
     assert_eq!(p.kind, "BIP39 mnemonic");
     assert_eq!(p.master_fingerprint, "73c5da0a");
     assert_eq!(p.depth, 0);
@@ -89,7 +89,7 @@ fn frozen_derivation_vectors_all_schemes() {
 
 #[test]
 fn restore_aezeed_matches_preview_and_reloads() {
-    let preview = derive_preview(AEZEED_WORDS, None, WalletNetwork::Testnet, 1).unwrap();
+    let preview = derive_preview(AEZEED_WORDS, None, WalletNetwork::Testnet, 1, 0).unwrap();
     assert_eq!(preview.kind, "aezeed seed");
     // Birthday 0 = lnd's Bitcoin genesis epoch.
     assert_eq!(preview.birthday_unix, Some(1_231_006_505));
@@ -118,7 +118,7 @@ fn restore_aezeed_matches_preview_and_reloads() {
 
 #[test]
 fn restore_root_zprv_matches_preview_and_reloads() {
-    let preview = derive_preview(ROOT_ZPRV, None, WalletNetwork::Testnet, 1).unwrap();
+    let preview = derive_preview(ROOT_ZPRV, None, WalletNetwork::Testnet, 1, 0).unwrap();
     assert_eq!(preview.kind, "extended private key");
     assert_eq!(preview.depth, 0);
     // BIP32 test vector 1 master fingerprint.
@@ -220,7 +220,7 @@ fn reveal_mnemonic_strips_aezeed_storage_tag() {
 /// wallet hands out, and it survives a lock/reload cycle.
 #[test]
 fn mweb_scheme_selects_receive_addresses_end_to_end() {
-    let preview = derive_preview(AEZEED_WORDS, None, WalletNetwork::Testnet, 1).unwrap();
+    let preview = derive_preview(AEZEED_WORDS, None, WalletNetwork::Testnet, 1, 0).unwrap();
     let mwebd_addr0 = &preview
         .mweb
         .iter()

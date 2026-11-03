@@ -33,6 +33,12 @@ type CreateWalletResponse = {
   summary: WalletSummary;
 };
 
+type WalletListItem = {
+  index: number;
+  name: string;
+  is_active: boolean;
+};
+
 type RevealMnemonicResponse = {
   kind: string;
   phrase: string;
@@ -268,6 +274,23 @@ type SplitResult = {
 };
 
 type SplitChain = "public" | "private";
+
+type TransferCoinPreview = {
+  to_account_index: number;
+  to_wallet_name: string;
+  address: string;
+  amount_sats: number;
+  fee_sats: number;
+  fee_rate_sat_vb?: number | null;
+  creates_change?: boolean;
+};
+
+type TransferCoinResult = {
+  txid: string;
+  fee_sats: number;
+  address: string;
+  to_account_index: number;
+};
 
 type TxRecord = {
   txid: string;
@@ -512,6 +535,8 @@ const el = {
   navCoinsDot: document.querySelector<HTMLElement>("#nav-coins-dot")!,
   viewTitle: document.querySelector<HTMLElement>("#view-title")!,
   networkBadge: document.querySelector<HTMLElement>("#network-badge")!,
+  btnWalletSwitcher: document.querySelector<HTMLButtonElement>("#btn-wallet-switcher")!,
+  walletSwitcherLabel: document.querySelector<HTMLElement>("#wallet-switcher-label")!,
   syncDot: document.querySelector<HTMLElement>("#sync-dot")!,
   syncLabel: document.querySelector<HTMLElement>("#sync-label")!,
   balanceTotal: document.querySelector<HTMLElement>("#balance-total")!,
@@ -4421,6 +4446,9 @@ async function enterReady(opts?: { sync?: boolean; summary?: WalletSummary }) {
   // flip to ready before any further IPC (avoids a second load_wallet gate).
   const s = opts?.summary ?? (await invoke<WalletSummary>("load_wallet"));
   renderSummary(s);
+  // Update the switcher label before slower refreshes so a wallet switch is
+  // visible even if combined history/LitVM calls lag or fail.
+  await refreshWalletSwitcher();
   // Legacy installs that already hold funds skip the first-receive modal.
   if (lastTotalSats > 0 && !isFirstReceiveSeen()) setFirstReceiveSeen(true);
   lastPendingSats = transparentPendingSats(s);
@@ -4434,6 +4462,186 @@ async function enterReady(opts?: { sync?: boolean; summary?: WalletSummary }) {
   void refreshFeeLadder();
   if (shouldSync) void runSync({ quiet: false });
   maybeShowMwebCoach();
+}
+
+let cachedWallets: WalletListItem[] = [];
+
+async function refreshWalletSwitcher() {
+  try {
+    const wallets = await invoke<WalletListItem[]>("list_wallets");
+    cachedWallets = wallets;
+    const active = wallets.find((w) => w.is_active) ?? wallets[0];
+    el.walletSwitcherLabel.textContent = active ? active.name : "Wallet";
+    el.btnWalletSwitcher.hidden = false;
+  } catch {
+    cachedWallets = [];
+    el.btnWalletSwitcher.hidden = true;
+  }
+}
+
+function otherWallets(): WalletListItem[] {
+  return cachedWallets.filter((w) => !w.is_active);
+}
+
+/** Text prompt via the glass modal — `window.prompt` is a no-op in Tauri. */
+async function promptWalletName(
+  title: string,
+  initial: string,
+): Promise<string | null> {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.maxLength = 64;
+  input.value = initial;
+  input.autocomplete = "off";
+  const result = await openModal({
+    title,
+    build: (body) => {
+      const field = document.createElement("label");
+      field.className = "field";
+      const caption = document.createElement("span");
+      caption.className = "field-label";
+      caption.textContent = "Name";
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          closeModal("save");
+        }
+      });
+      field.append(caption, input);
+      body.appendChild(field);
+    },
+    actions: [
+      { id: "cancel", label: "Cancel", kind: "ghost" },
+      { id: "save", label: "Save", kind: "primary" },
+    ],
+    focus: () => input,
+  });
+  if (result !== "save") return null;
+  return input.value.trim();
+}
+
+async function applyActiveWallet(summary: WalletSummary, walletName: string) {
+  await enterReady({ summary, sync: true });
+  setStatus(`Switched to ${walletName}.`, "success");
+}
+
+async function openWalletSwitcher() {
+  const wallets = await invoke<WalletListItem[]>("list_wallets");
+  const action = await openModal({
+    title: "Wallets",
+    actions: [
+      { id: "add", label: "Add wallet", kind: "primary" },
+      { id: "close", label: "Close", kind: "secondary" },
+    ],
+    build: (body) => {
+      appendParagraph(
+        body,
+        "Each wallet is a separate account under the same recovery phrase. Balances are not combined.",
+        "lede",
+      );
+      const list = document.createElement("ul");
+      list.className = "wallet-switcher-list";
+      for (const w of wallets) {
+        const li = document.createElement("li");
+        li.className = "wallet-switcher-row";
+        if (w.is_active) li.classList.add("is-active");
+        const label = document.createElement("span");
+        label.textContent = w.is_active ? `${w.name} (active)` : w.name;
+        li.appendChild(label);
+        if (!w.is_active) {
+          const sw = document.createElement("button");
+          sw.type = "button";
+          sw.className = "btn btn-secondary btn-sm";
+          sw.textContent = "Switch";
+          sw.addEventListener("click", () => closeModal(`switch:${w.index}`));
+          li.appendChild(sw);
+        }
+        const ren = document.createElement("button");
+        ren.type = "button";
+        ren.className = "btn btn-ghost btn-sm";
+        ren.textContent = "Rename";
+        ren.addEventListener("click", () => closeModal(`rename:${w.index}`));
+        li.appendChild(ren);
+        if (wallets.length > 1) {
+          const del = document.createElement("button");
+          del.type = "button";
+          del.className = "btn btn-ghost btn-sm";
+          del.textContent = "Delete";
+          del.addEventListener("click", () => closeModal(`delete:${w.index}`));
+          li.appendChild(del);
+        }
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    },
+  });
+
+  if (action === "add") {
+    const name = await promptWalletName("Add wallet", "Tip jar");
+    if (name === null) {
+      await openWalletSwitcher();
+      return;
+    }
+    const summary = await invoke<WalletSummary>("create_wallet_account", {
+      req: { name },
+    });
+    await applyActiveWallet(summary, name || "Wallet");
+    return;
+  }
+
+  if (action?.startsWith("switch:")) {
+    const index = Number(action.slice("switch:".length));
+    const current = wallets.find((w) => w.index === index);
+    if (!current) return;
+    const summary = await invoke<WalletSummary>("switch_wallet", {
+      req: { index },
+    });
+    await applyActiveWallet(summary, current.name);
+    return;
+  }
+
+  if (action?.startsWith("rename:")) {
+    const index = Number(action.slice("rename:".length));
+    const current = wallets.find((w) => w.index === index);
+    if (!current) return;
+    const name = await promptWalletName("Rename wallet", current.name);
+    if (!name) {
+      await openWalletSwitcher();
+      return;
+    }
+    await invoke("rename_wallet", { req: { index, name } });
+    await refreshWalletSwitcher();
+    await openWalletSwitcher();
+    return;
+  }
+
+  if (action?.startsWith("delete:")) {
+    const index = Number(action.slice("delete:".length));
+    const current = wallets.find((w) => w.index === index);
+    if (!current) return;
+    const confirm = await openModal({
+      title: "Delete wallet?",
+      build: (body) => {
+        appendParagraph(
+          body,
+          `Delete “${current.name}” from this device? Local data only — the recovery phrase still restores it.`,
+          "lede",
+        );
+      },
+      actions: [
+        { id: "cancel", label: "Cancel", kind: "ghost" },
+        { id: "delete", label: "Delete", kind: "danger" },
+      ],
+    });
+    if (confirm !== "delete") {
+      await openWalletSwitcher();
+      return;
+    }
+    const summary = await invoke<WalletSummary>("delete_wallet_account", {
+      req: { index },
+    });
+    await applyActiveWallet(summary, "wallet");
+  }
 }
 
 /** Phrase required by the `wipe_wallet` command; enforced backend-side too. */
@@ -4452,7 +4660,7 @@ async function confirmWipePhrase(): Promise<string | null> {
     build: (body) => {
       appendParagraph(
         body,
-        "This deletes the local wallet, its encrypted mnemonic and all cached chain data from this machine.",
+        "This deletes every wallet on this device, the shared recovery phrase, and all cached chain data.",
         "lede",
       );
       appendParagraph(
@@ -4828,6 +5036,10 @@ el.btnFundReceiveHistory.addEventListener("click", () => openPublicReceive());
 el.btnSecurityChecklistDismiss.addEventListener("click", () => {
   setSecurityChecklistDismissed(true);
   updateSecurityChecklist();
+});
+
+el.btnWalletSwitcher.addEventListener("click", () => {
+  void openWalletSwitcher().catch((e) => setError(String(e)));
 });
 
 el.btnSync.addEventListener("click", () => {
@@ -5269,10 +5481,12 @@ function renderCoinsList() {
   for (const utxo of utxoCache) {
     if (utxo.locked) frozen += 1;
     const expanded = publicCoinExpanded.has(utxo.outpoint);
+    const spendPending = isCoinSpendPending("public", utxo.outpoint);
     const li = document.createElement("li");
     li.dataset.outpoint = utxo.outpoint;
     const rowClass = ["utxo-row"];
     if (utxo.locked) rowClass.push("is-frozen");
+    if (spendPending) rowClass.push("is-pending");
     li.className = rowClass.join(" ");
 
     const main = document.createElement("div");
@@ -5282,7 +5496,12 @@ function renderCoinsList() {
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(utxo.amount_sats);
     amtRow.append(amt);
-    if (utxo.locked) {
+    if (spendPending) {
+      const pill = document.createElement("span");
+      pill.className = "pill pending";
+      pill.textContent = coinSpendPending!.pill;
+      amtRow.append(pill);
+    } else if (utxo.locked) {
       const pill = document.createElement("span");
       pill.className = "pill pill-frozen";
       pill.textContent = "Frozen";
@@ -5296,9 +5515,14 @@ function renderCoinsList() {
         : `${utxo.confirmations.toLocaleString("en-US")} conf`;
     const status = document.createElement("span");
     status.className = "utxo-status";
-    status.textContent = `${kind} · ${conf}`;
+    status.textContent = spendPending ? coinSpendPending!.status : `${kind} · ${conf}`;
     main.append(amtRow, status);
     li.append(main);
+
+    if (spendPending) {
+      el.coinsUtxoList.appendChild(li);
+      continue;
+    }
 
     const actions = document.createElement("div");
     actions.className = "split-actions split-actions-private";
@@ -5368,7 +5592,32 @@ function renderCoinsList() {
       });
     });
 
-    moreMenu.append(detailsBtn, freeze, split);
+    const transfer = document.createElement("button");
+    transfer.type = "button";
+    transfer.className = "btn btn-ghost btn-sm";
+    transfer.setAttribute("role", "menuitem");
+    transfer.textContent = "Transfer to…";
+    const canTransfer =
+      otherWallets().length > 0 && !utxo.locked && utxo.confirmations > 0;
+    transfer.disabled = !canTransfer;
+    transfer.title = utxo.locked
+      ? "Unfreeze to transfer."
+      : utxo.confirmations === 0
+        ? "Transfer is disabled until the coin is confirmed."
+        : otherWallets().length === 0
+          ? "Add another wallet to transfer coins between them."
+          : "Send this coin to another wallet on this device";
+    transfer.addEventListener("click", (event) => {
+      event.stopPropagation();
+      more.open = false;
+      void openTransferModal({
+        chain: "public",
+        id: utxo.outpoint,
+        amount_sats: utxo.amount_sats,
+      });
+    });
+
+    moreMenu.append(detailsBtn, freeze, split, transfer);
     more.append(moreSummary, moreMenu);
     actions.append(more);
     li.append(actions);
@@ -5450,6 +5699,37 @@ function renderCoinsList() {
 const CHURN_BANNER_DISMISSED_KEY = "ltc-churn-banner-dismissed";
 
 let churnPending: "retry" | "cancel" | null = null;
+
+/**
+ * In-flight coin spend (transfer or private send). Marks matching Coins rows
+ * pending without a blocking full-screen overlay during multi-peer broadcast.
+ */
+let coinSpendPending: {
+  chain: SplitChain;
+  ids: string[];
+  pill: string;
+  status: string;
+} | null = null;
+
+function isCoinSpendPending(chain: SplitChain, id: string): boolean {
+  return (
+    !!coinSpendPending &&
+    coinSpendPending.chain === chain &&
+    coinSpendPending.ids.includes(id)
+  );
+}
+
+function beginCoinSpendPending(pending: NonNullable<typeof coinSpendPending>) {
+  coinSpendPending = pending;
+  renderCoinsList();
+  renderMwebCoinsList();
+}
+
+function endCoinSpendPending() {
+  coinSpendPending = null;
+  renderCoinsList();
+  renderMwebCoinsList();
+}
 let churnActionError: string | null = null;
 let churnSawActive = false;
 let churnSuppressFinish = false;
@@ -5733,6 +6013,9 @@ type RowChip = { label: string; className: string };
 
 /** Exactly one status chip for the default Private row, or none when clean mature. */
 function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
+  if (isCoinSpendPending("private", coin.output_id)) {
+    return { label: coinSpendPending!.pill, className: "pill pending" };
+  }
   const pill = churnPill(coin);
   if (pill) return { label: pill.label, className: churnPillClass(pill.kind) };
   if (justSpent) return { label: "Just spent", className: "pill churn-pill-accent" };
@@ -6071,7 +6354,8 @@ function renderMwebCoinsList() {
     if (!coin.mature) immature += 1;
     if (userFrozen(coin)) frozenCount += 1;
     if (churnNeedsAttention(coin)) attentionCount += 1;
-    const jobHolds = churnPhaseActive(coin.churn_phase);
+    const spendPending = isCoinSpendPending("private", coin.output_id);
+    const jobHolds = churnPhaseActive(coin.churn_phase) || spendPending;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const tied = pegInStillTied(coin);
     const expanded = mwebCoinExpanded.has(coin.output_id);
@@ -6079,7 +6363,8 @@ function renderMwebCoinsList() {
     const li = document.createElement("li");
     li.dataset.outputId = coin.output_id;
     const rowClass = ["utxo-row"];
-    if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
+    if (spendPending) rowClass.push("is-pending");
+    else if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
     else if (!coin.mature) rowClass.push("is-pending");
     else if (userFrozen(coin)) rowClass.push("is-frozen");
     else if (tied) rowClass.push("is-tied");
@@ -6102,7 +6387,7 @@ function renderMwebCoinsList() {
       amtRow.append(pill);
     }
 
-    const statusLine = mwebRowStatusLine(coin);
+    const statusLine = spendPending ? coinSpendPending!.status : mwebRowStatusLine(coin);
     const status = document.createElement("span");
     status.className = "utxo-status";
     status.hidden = !statusLine;
@@ -6200,7 +6485,34 @@ function renderMwebCoinsList() {
         });
       });
 
-      moreMenu.append(detailsBtn, freeze, split);
+      const transfer = document.createElement("button");
+      transfer.type = "button";
+      transfer.className = "btn btn-ghost btn-sm";
+      transfer.setAttribute("role", "menuitem");
+      transfer.textContent = "Transfer to…";
+      const canTransfer =
+        otherWallets().length > 0 && !coin.locked && !!coin.mature;
+      transfer.disabled = !canTransfer;
+      transfer.title = coin.locked
+        ? "Unfreeze to transfer."
+        : !coin.mature
+          ? left > 0
+            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
+            : "Cannot transfer until confirmed."
+          : otherWallets().length === 0
+            ? "Add another wallet to transfer coins between them."
+            : "Send this coin to another wallet on this device";
+      transfer.addEventListener("click", (event) => {
+        event.stopPropagation();
+        more.open = false;
+        void openTransferModal({
+          chain: "private",
+          id: coin.output_id,
+          amount_sats: coin.amount_sats,
+        });
+      });
+
+      moreMenu.append(detailsBtn, freeze, split, transfer);
       more.append(moreSummary, moreMenu);
       actions.append(more);
       li.append(actions);
@@ -6915,6 +7227,149 @@ function greedyFillQtys(available: number): number[] {
     }
   }
   return qtys;
+}
+
+async function openTransferModal(coin: {
+  chain: SplitChain;
+  id: string;
+  amount_sats: number;
+}) {
+  if (cachedWallets.length === 0) {
+    await refreshWalletSwitcher();
+  }
+  const destinations = otherWallets();
+  if (destinations.length === 0) {
+    setStatus("Add another wallet before transferring a coin.", "error");
+    return;
+  }
+
+  let selectedIndex = destinations[0]!.index;
+
+  const feeRate = selectedFeeRateSatVb ?? 1;
+
+  for (;;) {
+    const destName =
+      destinations.find((w) => w.index === selectedIndex)?.name ?? "wallet";
+    let preview: TransferCoinPreview | null = null;
+    let previewError: string | null = null;
+    try {
+      preview = await invoke<TransferCoinPreview>("preview_transfer_coin", {
+        req: {
+          chain: coin.chain,
+          coin_id: coin.id,
+          to_account_index: selectedIndex,
+          fee_rate_sat_vb: coin.chain === "public" ? feeRate : null,
+          fee_sats: 0,
+        },
+      });
+    } catch (err) {
+      previewError = String(err);
+    }
+    const shown = preview;
+    const shownError = previewError;
+
+    const action = await openModal({
+      title: "Transfer coin",
+      build: (body) => {
+        const badge = coin.chain === "public" ? "Public" : "Private · MWEB";
+        appendParagraph(
+          body,
+          `${badge} · ${formatAmountPlain(coin.amount_sats)}. Sends this coin to another wallet on this device (same recovery phrase).`,
+          "lede",
+        );
+
+        const field = document.createElement("label");
+        field.className = "field";
+        const caption = document.createElement("span");
+        caption.className = "field-label";
+        caption.textContent = "Destination wallet";
+        const select = document.createElement("select");
+        for (const w of destinations) {
+          const opt = document.createElement("option");
+          opt.value = String(w.index);
+          opt.textContent = w.name;
+          if (w.index === selectedIndex) opt.selected = true;
+          select.appendChild(opt);
+        }
+        select.addEventListener("change", () => {
+          selectedIndex = Number(select.value);
+          closeModal("repreview");
+        });
+        field.append(caption, select);
+        body.appendChild(field);
+
+        if (shownError) {
+          appendParagraph(body, shownError, "hint");
+        } else if (shown) {
+          const rows: DetailRow[] = [
+            ["To", shown.to_wallet_name],
+            ["Address", shown.address, true],
+            ["Amount", formatAmountPlain(shown.amount_sats)],
+            ["Fee", formatAmountPlain(shown.fee_sats)],
+          ];
+          if (shown.fee_rate_sat_vb != null) {
+            rows.push(["Fee rate", `${shown.fee_rate_sat_vb} sat/vB`]);
+          }
+          body.appendChild(buildDetailList(rows));
+          if (shown.creates_change) {
+            appendParagraph(
+              body,
+              "This transfer creates change back to the source wallet.",
+              "hint",
+            );
+          }
+        }
+      },
+      actions: [
+        { id: "cancel", label: "Cancel", kind: "ghost" },
+        {
+          id: "transfer",
+          label: `Transfer to ${destName}`,
+          kind: "primary",
+        },
+      ],
+    });
+
+    if (action === "repreview") continue;
+    if (action !== "transfer" || !shown) return;
+
+    if (syncing || sending) return;
+    sending = true;
+    beginCoinSpendPending({
+      chain: coin.chain,
+      ids: [coin.id],
+      pill: "Broadcasting",
+      status: `Broadcasting transfer to ${shown.to_wallet_name}…`,
+    });
+    updateBusyUi();
+    setStatus(`Broadcasting transfer to ${shown.to_wallet_name}…`, "info");
+    try {
+      const result = await invoke<TransferCoinResult>("transfer_coin", {
+        req: {
+          chain: coin.chain,
+          coin_id: coin.id,
+          to_account_index: selectedIndex,
+          fee_rate_sat_vb: coin.chain === "public" ? feeRate : null,
+          fee_sats: 0,
+        },
+      });
+      setStatus(
+        `Transferred to ${shown.to_wallet_name}. ${truncateId(result.txid)}`,
+        "success",
+      );
+      await refreshUtxos();
+      await refreshCombined();
+      return;
+    } catch (err) {
+      setStatus(String(err), "error");
+      // Re-open the sheet so the user can retry without rebuilding the selection.
+      continue;
+    } finally {
+      endCoinSpendPending();
+      sending = false;
+      updateBusyUi();
+    }
+  }
 }
 
 async function openSplitModal(coin: {
@@ -8272,8 +8727,20 @@ el.btnMwebSend.addEventListener("click", async () => {
   const pendingLabel = readLabel();
   el.mwebSendNote.value = pendingLabel;
 
+  const pendingIds = selected_output_ids?.length ? [...selected_output_ids] : [];
+  beginCoinSpendPending({
+    chain: "private",
+    ids: pendingIds,
+    pill: "Sending",
+    status: "Broadcasting private send…",
+  });
   updateBusyUi();
-  showLoading("Broadcasting private send…");
+  setStatus(
+    pendingIds.length > 0
+      ? `Sending ${pendingIds.length} private coin${pendingIds.length === 1 ? "" : "s"}…`
+      : "Broadcasting private send…",
+    "info",
+  );
   let result: { wtxid: string; fee_sats: number };
   try {
     result = await invoke("mweb_send_ltc", {
@@ -8288,7 +8755,7 @@ el.btnMwebSend.addEventListener("click", async () => {
     await showBroadcastFailure(e);
     return;
   } finally {
-    hideLoading();
+    endCoinSpendPending();
     sending = false;
     updateBusyUi();
   }

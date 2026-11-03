@@ -15,20 +15,23 @@ use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, PersistedWallet};
 
+use crate::accounts;
 use crate::churn;
 use crate::contacts;
 use crate::descriptors::{self, create_params, load_params, sign_and_finalize, signer};
 use crate::diag;
 use crate::dto::{
     AddressReuseHint, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary,
-    ContactRecord, CoverHold, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest,
-    DiagnosticsBundle, ElectrumProbe, FeeEstimate, MigrateEncryptRequest, MwebBroadcastResult,
-    MwebScheme, MwebSendPreview, MwebSendRequest, MwebUtxoRecord, PeginPreview, PeginRequest,
-    PeginResult, PegoutPreview, PegoutRequest, RestoreWalletRequest, RevealMnemonicRequest,
-    RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest,
-    SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitPreview,
-    SplitRequest, SplitResult, SyncPhase, SyncResult, TxKind, TxRecord, UnlockRequest,
-    UpdateSettingsRequest, UpsertContactRequest, UtxoRecord, WalletSettings, WalletSummary,
+    ContactRecord, CoverHold, CreateAccountRequest, CreateWalletRequest, CreateWalletResponse,
+    DeleteContactRequest, DeleteWalletRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate,
+    MigrateEncryptRequest, MwebBroadcastResult, MwebScheme, MwebSendPreview, MwebSendRequest,
+    MwebUtxoRecord, PeginPreview, PeginRequest, PeginResult, PegoutPreview, PegoutRequest,
+    RenameWalletRequest, RestoreWalletRequest, RevealMnemonicRequest, RevealMnemonicResponse,
+    SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest, SetTxLabelRequest,
+    SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitPreview, SplitRequest, SplitResult,
+    SwitchWalletRequest, SyncPhase, SyncResult, TransferCoinPreview, TransferCoinRequest,
+    TransferCoinResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest,
+    UpsertContactRequest, UtxoRecord, WalletListItem, WalletSettings, WalletSummary,
     CHURN_AMOUNT_NOTE, DEFAULT_MWEB_FEE_SATS,
 };
 use crate::electrum::{self, BATCH_SIZE, MIN_FEE_RATE_SAT_VB, STOP_GAP};
@@ -52,6 +55,8 @@ struct WalletState {
     /// holds no secrets. Lives and dies with this state, i.e. cleared on `lock()`.
     signer: KeyMapWrapper,
     db: Connection,
+    /// BIP84 / MWEB / LitVM account index for [`Self::data_dir`].
+    account_index: u32,
     network: WalletNetwork,
     electrum_url: String,
     /// Verify TLS certificates on ssl:// Electrum servers.
@@ -84,6 +89,7 @@ struct WalletState {
 /// every `write_meta` call).
 fn meta_from_state(state: &WalletState) -> WalletMeta {
     WalletMeta {
+        account_index: state.account_index,
         network: state.network,
         electrum_url: state.electrum_url.clone(),
         electrum_validate_domain: state.electrum_validate_domain,
@@ -291,23 +297,196 @@ impl WalletApp {
     }
 
     pub fn exists(&self, data_dir: &Path) -> bool {
-        meta::wallet_files_exist(data_dir)
+        accounts::wallet_exists(data_dir)
     }
 
     pub fn is_locked(&self) -> bool {
         self.secrets.is_locked()
     }
 
-    /// 32-byte secp256k1 secret for LitVM (`m/44'/60'/0'/0/0`). Requires unlock.
+    /// 32-byte secp256k1 secret for LitVM (`m/44'/60'/{account}'/0/0`).
+    /// Uses the loaded wallet's account index (0 if none loaded). Requires unlock.
     /// Caller must zeroize after use. Never log this value.
     pub fn litvm_account_secret(&self) -> Result<[u8; 32], WalletError> {
+        self.ensure_unlocked()?;
+        let account = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.account_index))
+            .unwrap_or(0);
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        secret.litvm_account_secret(account)
+    }
+
+    /// Active account directory under `root` (after migration).
+    pub fn active_account_dir(&self, root: &Path) -> Result<PathBuf, WalletError> {
+        accounts::active_account_dir(root)
+    }
+
+    pub fn list_wallets(&self, root: &Path) -> Result<Vec<WalletListItem>, WalletError> {
+        accounts::ensure_layout(root)?;
+        let reg = accounts::read_registry(root)?;
+        Ok(reg
+            .accounts
+            .iter()
+            .map(|a| WalletListItem {
+                index: a.index,
+                name: a.name.clone(),
+                is_active: a.index == reg.active_index,
+            })
+            .collect())
+    }
+
+    pub fn rename_wallet(
+        &self,
+        root: &Path,
+        req: RenameWalletRequest,
+    ) -> Result<Vec<WalletListItem>, WalletError> {
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        let entry = reg
+            .accounts
+            .iter_mut()
+            .find(|a| a.index == req.index)
+            .ok_or(WalletError::NotFound)?;
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(WalletError::Meta("wallet name must not be empty".into()));
+        }
+        entry.name = name.to_string();
+        accounts::write_registry(root, &reg)?;
+        self.list_wallets(root)
+    }
+
+    pub fn switch_wallet(
+        &self,
+        root: &Path,
+        req: SwitchWalletRequest,
+    ) -> Result<WalletSummary, WalletError> {
+        self.ensure_unlocked()?;
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        if reg.get(req.index).is_none() {
+            return Err(WalletError::NotFound);
+        }
+        reg.active_index = req.index;
+        accounts::write_registry(root, &reg)?;
+        self.load(root)
+    }
+
+    pub fn delete_wallet(
+        &self,
+        root: &Path,
+        req: DeleteWalletRequest,
+    ) -> Result<WalletSummary, WalletError> {
+        self.ensure_unlocked()?;
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        if reg.accounts.len() <= 1 {
+            return Err(WalletError::Meta(
+                "cannot delete the last wallet; wipe the device instead".into(),
+            ));
+        }
+        if reg.get(req.index).is_none() {
+            return Err(WalletError::NotFound);
+        }
+        let switching = reg.active_index == req.index;
+        reg.accounts.retain(|a| a.index != req.index);
+        if switching {
+            reg.active_index = reg.accounts[0].index;
+        }
+        accounts::remove_account_dir(root, req.index)?;
+        accounts::write_registry(root, &reg)?;
+        if switching {
+            self.load(root)
+        } else {
+            self.summary()
+        }
+    }
+
+    pub fn create_wallet_account(
+        &self,
+        root: &Path,
+        req: CreateAccountRequest,
+    ) -> Result<WalletSummary, WalletError> {
+        self.ensure_unlocked()?;
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        let index = reg.next_free_index();
+        let name = {
+            let trimmed = req.name.trim();
+            if trimmed.is_empty() {
+                format!("Wallet {index}")
+            } else {
+                trimmed.to_string()
+            }
+        };
+
+        let template = {
+            let guard = self.lock_state()?;
+            let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+            meta_from_state(state)
+        };
+
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let account_dir = accounts::account_dir(root, index);
+        let meta = accounts::meta_for_new_account(&template, index);
+        if let Err(e) = open_created_account(&account_dir, &secret, &meta) {
+            let _ = accounts::remove_account_dir(root, index);
+            return Err(e);
+        }
+
+        reg.accounts.push(accounts::AccountEntry { index, name });
+        reg.active_index = index;
+        accounts::write_registry(root, &reg)?;
+        self.load(root)
+    }
+
+    /// Dry-run transferring one coin to another account under the same seed.
+    pub fn preview_transfer_coin(
+        &self,
+        root: &Path,
+        req: TransferCoinRequest,
+    ) -> Result<TransferCoinPreview, WalletError> {
         self.ensure_unlocked()?;
         let stored = self
             .secrets
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
-        secret.litvm_account_secret()
+        let sealing = self.secrets.sealing_key();
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let prepared = prepare_transfer(root, state, &secret, sealing, &req, false)?;
+        finish_transfer_preview(state, prepared)
+    }
+
+    /// Broadcast transferring one coin to another account under the same seed.
+    pub fn transfer_coin(
+        &self,
+        root: &Path,
+        req: TransferCoinRequest,
+    ) -> Result<TransferCoinResult, WalletError> {
+        self.ensure_unlocked()?;
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let sealing = self.secrets.sealing_key();
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let prepared = prepare_transfer(root, state, &secret, sealing, &req, true)?;
+        finish_transfer_broadcast(state, prepared)
     }
 
     pub fn needs_migration(&self) -> bool {
@@ -388,12 +567,12 @@ impl WalletApp {
         self.secrets.migrate_encrypt(&req.passphrase)
     }
 
-    /// Delete wallet files and mnemonic secret. Safe if already absent.
+    /// Delete all accounts, registry, and mnemonic secret. Safe if already absent.
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
         *self.lock_state()? = None;
         self.clear_insights();
         self.secrets.delete_mnemonic()?;
-        meta::remove_wallet_files(data_dir)?;
+        accounts::remove_all_accounts(data_dir)?;
         Ok(())
     }
 
@@ -438,26 +617,29 @@ impl WalletApp {
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
-
-        let meta = meta::read_meta(data_dir)?;
+        accounts::ensure_layout(data_dir)?;
+        let account_dir = accounts::active_account_dir(data_dir)?;
+        let meta = meta::read_meta(&account_dir)?;
+        let account = meta.account_index;
         let stored = self
             .secrets
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
 
-        let mut db = Connection::open(meta::db_path(data_dir))
+        let mut db = Connection::open(meta::db_path(&account_dir))
             .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = load_params(&secret, meta.network)?;
+        let params = load_params(&secret, meta.network, account)?;
         let wallet = PersistedWallet::load(&mut db, params)
             .map_err(|e| WalletError::Persist(e.to_string()))?
             .ok_or(WalletError::NotFound)?;
 
         let mweb = MwebRuntime::open(
-            data_dir,
+            &account_dir,
             &secret,
             meta.network,
             meta.mweb_scheme.to_master_scheme(),
+            account,
             self.secrets.sealing_key(),
         )
         .ok();
@@ -467,8 +649,9 @@ impl WalletApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
-            signer: signer(&secret, meta.network)?,
+            signer: signer(&secret, meta.network, account)?,
             db,
+            account_index: account,
             network: meta.network,
             electrum_url: meta.electrum_url,
             electrum_validate_domain: meta.electrum_validate_domain,
@@ -482,7 +665,7 @@ impl WalletApp {
             show_fiat: meta.show_fiat,
             use_explorer_fee_hints: meta.use_explorer_fee_hints,
             insights_enabled: meta.insights_enabled,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: account_dir,
             needs_full_scan: meta.needs_full_scan,
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb,
@@ -1116,6 +1299,7 @@ impl WalletApp {
             &secret,
             state.network,
             state.mweb_scheme.to_master_scheme(),
+            state.account_index,
             self.secrets.sealing_key(),
         )?);
         state.needs_mweb_scan = true;
@@ -1630,41 +1814,33 @@ impl WalletApp {
             .set_with_passphrase(passphrase, &secret.to_stored())?;
 
         std::fs::create_dir_all(data_dir)?;
+        let account_dir = match accounts::init_registry_account0(data_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = self.secrets.delete_mnemonic();
+                return Err(e);
+            }
+        };
 
-        let create_db =
-            || -> Result<(PersistedWallet<Connection>, Connection, WalletMeta), WalletError> {
-                let db_path = meta::db_path(data_dir);
-                let mut db =
-                    Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
-                let params = create_params(secret, network)?;
-                let mut wallet = PersistedWallet::create(&mut db, params)
-                    .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let mut meta = WalletMeta::new(network, electrum_url);
+        meta.mweb_scheme = mweb_scheme;
+        meta.account_index = 0;
 
-                let _ = wallet.next_unused_address(KeychainKind::External);
-                wallet
-                    .persist(&mut db)
-                    .map_err(|e| WalletError::Persist(e.to_string()))?;
-
-                let mut meta = WalletMeta::new(network, electrum_url.clone());
-                meta.mweb_scheme = mweb_scheme;
-                meta::write_meta(data_dir, &meta)?;
-                Ok((wallet, db, meta))
-            };
-
-        let (wallet, db, meta) = match create_db() {
+        let (wallet, db, meta) = match open_created_account(&account_dir, secret, &meta) {
             Ok(v) => v,
             Err(e) => {
-                let _ = meta::remove_wallet_files(data_dir);
+                let _ = accounts::remove_all_accounts(data_dir);
                 let _ = self.secrets.delete_mnemonic();
                 return Err(e);
             }
         };
 
         let mweb = MwebRuntime::open(
-            data_dir,
+            &account_dir,
             secret,
             network,
             mweb_scheme.to_master_scheme(),
+            0,
             self.secrets.sealing_key(),
         )
         .ok();
@@ -1674,8 +1850,9 @@ impl WalletApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
-            signer: signer(secret, network)?,
+            signer: signer(secret, network, 0)?,
             db,
+            account_index: 0,
             network,
             electrum_url: meta.electrum_url,
             electrum_validate_domain: meta.electrum_validate_domain,
@@ -1689,7 +1866,7 @@ impl WalletApp {
             show_fiat: meta.show_fiat,
             use_explorer_fee_hints: meta.use_explorer_fee_hints,
             insights_enabled: meta.insights_enabled,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: account_dir,
             needs_full_scan: meta.needs_full_scan,
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb,
@@ -1715,6 +1892,26 @@ impl WalletApp {
     }
 }
 
+/// Create BIP84 sqlite + meta under an account directory (does not touch the registry).
+fn open_created_account(
+    account_dir: &Path,
+    secret: &MasterSecret,
+    meta: &WalletMeta,
+) -> Result<(PersistedWallet<Connection>, Connection, WalletMeta), WalletError> {
+    std::fs::create_dir_all(account_dir)?;
+    let db_path = meta::db_path(account_dir);
+    let mut db = Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
+    let params = create_params(secret, meta.network, meta.account_index)?;
+    let mut wallet =
+        PersistedWallet::create(&mut db, params).map_err(|e| WalletError::Persist(e.to_string()))?;
+    let _ = wallet.next_unused_address(KeychainKind::External);
+    wallet
+        .persist(&mut db)
+        .map_err(|e| WalletError::Persist(e.to_string()))?;
+    meta::write_meta(account_dir, meta)?;
+    Ok((wallet, db, meta.clone()))
+}
+
 /// Test-only wallet app backed by an arbitrary [`SecretStore`] (typically [`crate::secrets::MemoryStore`]).
 pub struct MemoryBackedApp {
     state: Mutex<Option<WalletState>>,
@@ -1723,7 +1920,93 @@ pub struct MemoryBackedApp {
 
 impl MemoryBackedApp {
     pub fn exists(&self, data_dir: &Path) -> bool {
-        meta::wallet_files_exist(data_dir)
+        accounts::wallet_exists(data_dir)
+    }
+
+    pub fn list_wallets(&self, root: &Path) -> Result<Vec<WalletListItem>, WalletError> {
+        accounts::ensure_layout(root)?;
+        let reg = accounts::read_registry(root)?;
+        Ok(reg
+            .accounts
+            .iter()
+            .map(|a| WalletListItem {
+                index: a.index,
+                name: a.name.clone(),
+                is_active: a.index == reg.active_index,
+            })
+            .collect())
+    }
+
+    pub fn create_wallet_account(
+        &self,
+        root: &Path,
+        req: CreateAccountRequest,
+    ) -> Result<WalletSummary, WalletError> {
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        let index = reg.next_free_index();
+        let name = {
+            let trimmed = req.name.trim();
+            if trimmed.is_empty() {
+                format!("Wallet {index}")
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let template = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
+            let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
+            meta_from_state(state)
+        };
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let account_dir = accounts::account_dir(root, index);
+        let meta = accounts::meta_for_new_account(&template, index);
+        open_created_account(&account_dir, &secret, &meta)?;
+        reg.accounts.push(accounts::AccountEntry { index, name });
+        reg.active_index = index;
+        accounts::write_registry(root, &reg)?;
+        self.load(root)
+    }
+
+    pub fn switch_wallet(
+        &self,
+        root: &Path,
+        req: SwitchWalletRequest,
+    ) -> Result<WalletSummary, WalletError> {
+        accounts::ensure_layout(root)?;
+        let mut reg = accounts::read_registry(root)?;
+        if reg.get(req.index).is_none() {
+            return Err(WalletError::NotFound);
+        }
+        reg.active_index = req.index;
+        accounts::write_registry(root, &reg)?;
+        self.load(root)
+    }
+
+    pub fn preview_transfer_coin(
+        &self,
+        root: &Path,
+        req: TransferCoinRequest,
+    ) -> Result<TransferCoinPreview, WalletError> {
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let prepared = prepare_transfer(root, state, &secret, None, &req, false)?;
+        finish_transfer_preview(state, prepared)
     }
 
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
@@ -1732,7 +2015,7 @@ impl MemoryBackedApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))? = None;
         self.secrets.delete_mnemonic()?;
-        meta::remove_wallet_files(data_dir)?;
+        accounts::remove_all_accounts(data_dir)?;
         Ok(())
     }
 
@@ -1772,15 +2055,18 @@ impl MemoryBackedApp {
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
-        let meta = meta::read_meta(data_dir)?;
+        accounts::ensure_layout(data_dir)?;
+        let account_dir = accounts::active_account_dir(data_dir)?;
+        let meta = meta::read_meta(&account_dir)?;
+        let account = meta.account_index;
         let stored = self
             .secrets
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
-        let mut db = Connection::open(meta::db_path(data_dir))
+        let mut db = Connection::open(meta::db_path(&account_dir))
             .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = load_params(&secret, meta.network)?;
+        let params = load_params(&secret, meta.network, account)?;
         let wallet = PersistedWallet::load(&mut db, params)
             .map_err(|e| WalletError::Persist(e.to_string()))?
             .ok_or(WalletError::NotFound)?;
@@ -1789,8 +2075,9 @@ impl MemoryBackedApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
-            signer: signer(&secret, meta.network)?,
+            signer: signer(&secret, meta.network, account)?,
             db,
+            account_index: account,
             network: meta.network,
             electrum_url: meta.electrum_url,
             electrum_validate_domain: meta.electrum_validate_domain,
@@ -1804,7 +2091,7 @@ impl MemoryBackedApp {
             show_fiat: meta.show_fiat,
             use_explorer_fee_hints: meta.use_explorer_fee_hints,
             insights_enabled: meta.insights_enabled,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: account_dir,
             needs_full_scan: meta.needs_full_scan,
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb: None,
@@ -2116,25 +2403,19 @@ impl MemoryBackedApp {
             ));
         }
         std::fs::create_dir_all(data_dir)?;
-        let db_path = meta::db_path(data_dir);
-        let mut db = Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = create_params(secret, network)?;
-        let mut wallet = PersistedWallet::create(&mut db, params)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let _ = wallet.next_unused_address(KeychainKind::External);
-        wallet
-            .persist(&mut db)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let account_dir = accounts::init_registry_account0(data_dir)?;
         let mut meta = WalletMeta::new(network, electrum_url);
         meta.mweb_scheme = mweb_scheme;
-        meta::write_meta(data_dir, &meta)?;
+        meta.account_index = 0;
+        let (wallet, db, meta) = open_created_account(&account_dir, secret, &meta)?;
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
             tip_time: None,
             tip_time_height: 0,
             wallet,
-            signer: signer(secret, network)?,
+            signer: signer(secret, network, 0)?,
             db,
+            account_index: 0,
             network,
             electrum_url: meta.electrum_url,
             electrum_validate_domain: meta.electrum_validate_domain,
@@ -2148,7 +2429,7 @@ impl MemoryBackedApp {
             show_fiat: meta.show_fiat,
             use_explorer_fee_hints: meta.use_explorer_fee_hints,
             insights_enabled: meta.insights_enabled,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: account_dir,
             needs_full_scan: meta.needs_full_scan,
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb: None,
@@ -2440,6 +2721,248 @@ fn resolve_pegout_request(
         },
         dust_sats,
     ))
+}
+
+struct PreparedTransfer {
+    chain: SplitChain,
+    to_account_index: u32,
+    to_wallet_name: String,
+    address: String,
+    send_req: Option<SendRequest>,
+    mweb_req: Option<MwebSendRequest>,
+}
+
+fn prepare_transfer(
+    root: &Path,
+    state: &WalletState,
+    secret: &MasterSecret,
+    sealing_key: Option<[u8; 32]>,
+    req: &TransferCoinRequest,
+    commit_dest: bool,
+) -> Result<PreparedTransfer, WalletError> {
+    accounts::ensure_layout(root)?;
+    let reg = accounts::read_registry(root)?;
+    if req.to_account_index == state.account_index {
+        return Err(WalletError::Meta(
+            "cannot transfer a coin to the active wallet".into(),
+        ));
+    }
+    let dest_entry = reg.get(req.to_account_index).ok_or(WalletError::NotFound)?;
+    let to_wallet_name = dest_entry.name.clone();
+    let coin_id = req.coin_id.trim();
+    if coin_id.is_empty() {
+        return Err(WalletError::BuildTx("coin id is required".into()));
+    }
+
+    let address = reveal_dest_address(
+        root,
+        secret,
+        sealing_key,
+        req.to_account_index,
+        req.chain,
+        state.network,
+        state.mweb_scheme,
+        commit_dest,
+    )?;
+
+    match req.chain {
+        SplitChain::Public => Ok(PreparedTransfer {
+            chain: SplitChain::Public,
+            to_account_index: req.to_account_index,
+            to_wallet_name,
+            address: address.clone(),
+            send_req: Some(SendRequest {
+                address,
+                amount_sats: 0,
+                fee_rate_sat_vb: req.fee_rate_sat_vb,
+                drain: true,
+                selected_outpoints: Some(vec![coin_id.to_string()]),
+            }),
+            mweb_req: None,
+        }),
+        SplitChain::Private => Ok(PreparedTransfer {
+            chain: SplitChain::Private,
+            to_account_index: req.to_account_index,
+            to_wallet_name,
+            address: address.clone(),
+            send_req: None,
+            mweb_req: Some(MwebSendRequest {
+                address,
+                amount_sats: 0,
+                fee_sats: req.fee_sats,
+                drain: true,
+                selected_output_ids: Some(vec![coin_id.to_string()]),
+            }),
+        }),
+    }
+}
+
+fn reveal_dest_address(
+    root: &Path,
+    secret: &MasterSecret,
+    sealing_key: Option<[u8; 32]>,
+    to_account: u32,
+    chain: SplitChain,
+    network: WalletNetwork,
+    mweb_scheme: MwebScheme,
+    commit: bool,
+) -> Result<String, WalletError> {
+    let account_dir = accounts::account_dir(root, to_account);
+    if !meta::wallet_files_exist(&account_dir) {
+        return Err(WalletError::NotFound);
+    }
+    match chain {
+        SplitChain::Public => {
+            let mut db = Connection::open(meta::db_path(&account_dir))
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            let params = load_params(secret, network, to_account)?;
+            let mut wallet = PersistedWallet::load(&mut db, params)
+                .map_err(|e| WalletError::Persist(e.to_string()))?
+                .ok_or(WalletError::NotFound)?;
+            let address = if commit {
+                let addr = wallet
+                    .reveal_next_address(KeychainKind::External)
+                    .to_string();
+                wallet
+                    .persist(&mut db)
+                    .map_err(|e| WalletError::Persist(e.to_string()))?;
+                addr
+            } else {
+                current_receive_address(&mut wallet)
+            };
+            Ok(address)
+        }
+        SplitChain::Private => {
+            let mut mweb = MwebRuntime::open(
+                &account_dir,
+                secret,
+                network,
+                mweb_scheme.to_master_scheme(),
+                to_account,
+                sealing_key,
+            )?;
+            let address = mweb.receive_address(network)?;
+            if commit {
+                mweb.advance_receive_index();
+                mweb.persist(&account_dir)?;
+            }
+            Ok(address)
+        }
+    }
+}
+
+fn finish_transfer_preview(
+    state: &mut WalletState,
+    prepared: PreparedTransfer,
+) -> Result<TransferCoinPreview, WalletError> {
+    match prepared.chain {
+        SplitChain::Public => {
+            let send_req = prepared.send_req.expect("public transfer");
+            let (fee_rate_sat_vb, psbt, recipient_script) = build_send_psbt(state, &send_req)?;
+            let fee_sats = psbt
+                .fee_amount()
+                .ok_or_else(|| WalletError::BuildTx("unable to compute fee".into()))?
+                .to_sat();
+            let amount_sats = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .find(|o| o.script_pubkey == recipient_script)
+                .map(|o| o.value.to_sat())
+                .unwrap_or(0);
+            state
+                .wallet
+                .persist(&mut state.db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(TransferCoinPreview {
+                to_account_index: prepared.to_account_index,
+                to_wallet_name: prepared.to_wallet_name,
+                address: prepared.address,
+                amount_sats,
+                fee_sats,
+                fee_rate_sat_vb: Some(fee_rate_sat_vb),
+                creates_change: psbt.unsigned_tx.output.len() > 1,
+            })
+        }
+        SplitChain::Private => {
+            let mweb_req = prepared.mweb_req.expect("private transfer");
+            let resolved = resolve_mweb_send_request(state, mweb_req)?;
+            Ok(TransferCoinPreview {
+                to_account_index: prepared.to_account_index,
+                to_wallet_name: prepared.to_wallet_name,
+                address: prepared.address,
+                amount_sats: resolved.amount_sats,
+                fee_sats: resolved.fee_sats,
+                fee_rate_sat_vb: None,
+                creates_change: mweb_selection_creates_change(state, &resolved)?,
+            })
+        }
+    }
+}
+
+fn finish_transfer_broadcast(
+    state: &mut WalletState,
+    prepared: PreparedTransfer,
+) -> Result<TransferCoinResult, WalletError> {
+    match prepared.chain {
+        SplitChain::Public => {
+            let send_req = prepared.send_req.expect("public transfer");
+            let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &send_req)?;
+            sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
+            let fee_sats = psbt
+                .fee_amount()
+                .ok_or_else(|| WalletError::BuildTx("unable to compute fee".into()))?
+                .to_sat();
+            let tx = psbt
+                .extract_tx()
+                .map_err(|e| WalletError::BuildTx(e.to_string()))?;
+            let client = connect_electrum(state)?;
+            client.transaction_broadcast(&tx).map_err(|e| {
+                WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
+            })?;
+            state
+                .wallet
+                .apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
+            state
+                .wallet
+                .persist(&mut state.db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(TransferCoinResult {
+                txid: tx.compute_txid().to_string(),
+                fee_sats,
+                address: prepared.address,
+                to_account_index: prepared.to_account_index,
+            })
+        }
+        SplitChain::Private => {
+            let mweb_req = prepared.mweb_req.expect("private transfer");
+            let resolved = resolve_mweb_send_request(state, mweb_req)?;
+            let rpc_url = state.litecoin_rpc_url.clone();
+            let peers = state.mweb_peers.clone();
+            let network = state.network;
+            let data_dir = state.data_dir.clone();
+            let mweb = state
+                .mweb
+                .as_mut()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+            let result = mweb::mweb_send(
+                &state.wallet,
+                mweb,
+                &data_dir,
+                rpc_url.as_deref(),
+                &peers,
+                resolved,
+                network,
+            )?;
+            mweb.persist(&data_dir)?;
+            Ok(TransferCoinResult {
+                txid: result.wtxid,
+                fee_sats: result.fee_sats,
+                address: prepared.address,
+                to_account_index: prepared.to_account_index,
+            })
+        }
+    }
 }
 
 /// Build a send PSBT. Resolves fee rate from the request or Electrum.
@@ -4022,6 +4545,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             MwebScheme::default().to_master_scheme(),
+            0,
             None,
         )
         .unwrap();
@@ -4064,6 +4588,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             MwebScheme::default().to_master_scheme(),
+            0,
             None,
         )
         .unwrap();

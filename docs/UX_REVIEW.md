@@ -342,8 +342,8 @@ Labelled against [`CHAT_HANDOFF.md`](CHAT_HANDOFF.md) out-of-scope and Guide cha
 - **User problem:** Separate tip jar vs savings ([wallet privacy — multiple wallets](https://bitcoin.design/guide/how-it-works/wallet-privacy/), personal finance).
 - **Proposed UX:** Multiple wallet files or account switcher.
 - **Acceptance criteria:** Isolation of keys and history per wallet.
-- **Dependencies:** **Major architecture** — out of scope today.
-- **Non-goals:** Shipping in v0.2 polish.
+- **Shipped:** Single-seed BIP84 accounts + topbar switcher. Canonical design [`MULTI_WALLET.md`](MULTI_WALLET.md). Multi-seed deferred.
+- **Non-goals:** Separate seeds / HW in this slice.
 
 #### P4-5 — Hardware wallets & multi-key
 
@@ -371,7 +371,7 @@ Labelled against [`CHAT_HANDOFF.md`](CHAT_HANDOFF.md) out-of-scope and Guide cha
 | **P1** | Public/Private coach, maturity state, Swap fee / explorer copy | UI + existing DTOs |
 | **P2** | Units, BIP21, fee chips/custom, receive feedback | UI (+ optional thin core parse) |
 | **P3** | Hide balance, reuse warn, privacy panel, labels | Mix UI / small storage |
-| **P4** | Contacts, coin control, export shipped; multi-wallet, HW, Tor deferred | Mixed / future architecture |
+| **P4** | Contacts, coin control, export, single-seed multi-wallet shipped; HW, Tor deferred | Mixed / future architecture |
 
 ---
 

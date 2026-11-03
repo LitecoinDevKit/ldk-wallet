@@ -1,4 +1,4 @@
-# Chat handoff — Litecoin Mac wallet (v0.4.13)
+# Chat handoff — Litecoin Mac wallet (v0.4.11)
 
 Paste or `@`-reference this file when starting a new Cursor chat in this repo.
 
@@ -19,9 +19,10 @@ Paste or `@`-reference this file when starting a new Cursor chat in this repo.
   - Litecoin **testnet** = `Network::Testnet4`, coin type **`1`**
 - **Boundary:** UI/Tauri never see BDK types. `wallet-core` exposes serde DTOs only.
 - **Secrets:** Argon2id + ChaCha20-Poly1305 `wallet.mnemonic.enc` (legacy plaintext migrated on unlock). Mode `0600`. Never store mnemonic in SQLite.
+- **Multi-wallet:** One seed; BIP84 account dirs under `accounts/N/` + `accounts.json`. Full isolation (transparent + MWEB + LitVM). See [`MULTI_WALLET.md`](MULTI_WALLET.md).
 - **Concurrency:** Electrum/BDK/MWEB calls are blocking → `spawn_blocking` + `Mutex<WalletState>`.
 - **UX:** No optimistic balance after send — sync, then refresh. Amounts in LTC (string decimal → litoshis). Dust floor ~2940 litoshis for `ltc1`. Auto-sync every 60s (status-line errors only).
-- **LitVM:** Sidecar crate `wallet-litvm` (alloy), same seed `m/44'/60'/0'/0/0`, LiteForge presets in `litvm.json`. Testnet-only until official mainnet params. See [`docs/LITVM.md`](LITVM.md).
+- **LitVM:** Sidecar crate `wallet-litvm` (alloy), same seed `m/44'/60'/{account}'/0/0` (per wallet), LiteForge presets in `accounts/N/litvm.json`. Testnet-only until official mainnet params. See [`docs/LITVM.md`](LITVM.md).
 - **Grail:** Sibling `grail-sdk-rust` — verify-before-fund, no invented leaf. `wallet-cli grail-verify --offer`. `grail-deposit` stubbed until a captured offer verifies. No Tauri UI. No mainnet.
 
 ## Default endpoints
@@ -72,7 +73,7 @@ Boot → Unlock | Migrate | Onboarding → Mnemonic backup → verify quiz → H
 - **Done (feat/denomination-split):** Coins Public/Private lists; Split modal (equal + preset denominations) as 1-in-N-out self-transfer. Simple Send stays single-recipient.
 - **Done (feat/n-to-n-pegout):** Swap → Public Max / Choose coins emit one HogEx output per private coin (one kernel, fee from largest). Typed amount with no coins picked stays 1-out.
 - **Done (feat/mweb-churn):** Coins → Spend to self. One private coin, one confirmed block per hop, counted only when the inclusion headers show the block was not ours alone. See [`docs/CHURN.md`](CHURN.md).
-- **Next (P4 deferred):** Multi-wallet, hardware wallets, Tor/proxy — future architecture.
+- **Next (P4 deferred):** Hardware wallets, Tor/proxy — future architecture. Multi-wallet (single seed) shipped — [`MULTI_WALLET.md`](MULTI_WALLET.md).
 
 ## Implementation status
 

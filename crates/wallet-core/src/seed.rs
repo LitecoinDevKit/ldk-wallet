@@ -5,14 +5,13 @@
 //! scan/spend keys — branches from one BIP32 master key, so any input that
 //! yields a *root* `Xpriv` can restore a full wallet.
 
-use bdk_mweb::keys::{MasterKeyScheme, MasterKeys};
+use bdk_mweb::keys::MasterKeyScheme;
 use bdk_wallet::bitcoin::base58;
 use bdk_wallet::bitcoin::bip32::{DerivationPath, Xpriv};
 use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::{Network, NetworkKind};
 use bdk_wallet::keys::bip39::{Language, Mnemonic};
-use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, Wallet};
+use bdk_wallet::KeychainKind;
 use serde::Serialize;
 
 use crate::aezeed::{self, DecodedAezeed};
@@ -160,19 +159,18 @@ impl MasterSecret {
         }
     }
 
-    /// secp256k1 secret for the LitVM sidecar account (`m/44'/60'/0'/0/0`).
+    /// secp256k1 secret for the LitVM sidecar (`m/44'/60'/{account}'/0/0`).
     ///
-    /// Same path MetaMask/Rabby use. Network version bytes on the master xprv
-    /// do not change the derived 32-byte key.
-    pub fn litvm_account_secret(&self) -> Result<[u8; 32], WalletError> {
+    /// Account 0 matches MetaMask/Rabby default. Network version bytes on the
+    /// master xprv do not change the derived 32-byte key.
+    pub fn litvm_account_secret(&self, account: u32) -> Result<[u8; 32], WalletError> {
         let master = self.master_xprv(Network::Bitcoin)?;
         let secp = Secp256k1::new();
-        let path: DerivationPath =
-            "m/44'/60'/0'/0/0"
-                .parse()
-                .map_err(|e: bdk_wallet::bitcoin::bip32::Error| {
-                    WalletError::Descriptor(e.to_string())
-                })?;
+        let path: DerivationPath = format!("m/44'/60'/{account}'/0/0")
+            .parse()
+            .map_err(|e: bdk_wallet::bitcoin::bip32::Error| {
+                WalletError::Descriptor(e.to_string())
+            })?;
         let child = master
             .derive_priv(&secp, &path)
             .map_err(|e| WalletError::Descriptor(e.to_string()))?;
@@ -223,25 +221,22 @@ pub struct MwebSchemePreview {
 }
 
 /// Derive a [`DerivePreview`] from raw seed input without touching any
-/// wallet state on disk.
+/// wallet state on disk. `account` selects the BIP84 / MWEB / LitVM account index.
 pub fn derive_preview(
     input: &str,
     aezeed_passphrase: Option<&str>,
     network: WalletNetwork,
     count: u32,
+    account: u32,
 ) -> Result<DerivePreview, WalletError> {
     let secret = MasterSecret::parse(input, aezeed_passphrase)?;
     let bdk_net = network.to_bitcoin_network();
     let secp = Secp256k1::new();
     let xprv = secret.master_xprv(bdk_net)?;
 
-    let wallet = Wallet::create(
-        Bip84(xprv, KeychainKind::External),
-        Bip84(xprv, KeychainKind::Internal),
-    )
-    .network(bdk_net)
-    .create_wallet_no_persist()
-    .map_err(|e| WalletError::Descriptor(e.to_string()))?;
+    let wallet = crate::descriptors::create_params(&secret, network, account)?
+        .create_wallet_no_persist()
+        .map_err(|e| WalletError::Descriptor(e.to_string()))?;
 
     let peek = |keychain: KeychainKind| -> Vec<String> {
         (0..count)
@@ -257,8 +252,7 @@ pub fn derive_preview(
     ];
     let mut mweb = Vec::with_capacity(schemes.len());
     for (name, scheme) in schemes {
-        let keys = MasterKeys::from_xprv(&xprv, scheme, &secp)
-            .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        let keys = crate::mweb::master_keys_for_account(&xprv, scheme, account, &secp)?;
         let addresses = (0..count)
             .map(|i| {
                 keys.address(i, NetworkKind::from(bdk_net), &secp)
@@ -395,7 +389,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let got = secret.litvm_account_secret().unwrap();
+        let got = secret.litvm_account_secret(0).unwrap();
         let expected =
             hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
                 .unwrap();

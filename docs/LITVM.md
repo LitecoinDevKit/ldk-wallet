@@ -22,8 +22,9 @@ overlays a just-sent tx locally until the indexer lists it.
 - Separate workspace crate `wallet-litvm` (alloy, not ethers-rs). Feature flag
   `litvm`. Do not pull alloy types into `wallet-core` or the BDK/`litecoin`
   crate graph.
-- Same BIP39 seed as L1. Derivation `m/44'/60'/0'/0/0` (MetaMask/Rabby default).
-  Same passphrase lock and wipe as the L1 mnemonic.
+- Same BIP39 seed as L1. Derivation `m/44'/60'/{account}'/0/0` (MetaMask/Rabby
+  account index; wallet 0 is the default). Settings live under `accounts/N/litvm.json`.
+  Same passphrase lock and wipe as the L1 mnemonic. See [`MULTI_WALLET.md`](MULTI_WALLET.md).
 - Tauri IPC stays serde string DTOs (`0x` address, decimal zkLTC). No
   `alloy::primitives` across the boundary.
 - Signing **chain ID is hardcoded per network preset**. Do not use the RPC

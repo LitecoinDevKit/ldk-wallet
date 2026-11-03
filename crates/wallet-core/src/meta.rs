@@ -51,6 +51,9 @@ fn default_explorer_base_url() -> String {
 /// Lightweight metadata stored beside the BDK sqlite DB (never secrets).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletMeta {
+    /// BIP84 / MWEB / LitVM account index for this wallet directory.
+    #[serde(default)]
+    pub account_index: u32,
     pub network: WalletNetwork,
     pub electrum_url: String,
     /// Verify TLS certificates (CA chain + hostname) on ssl:// Electrum servers.
@@ -99,6 +102,7 @@ pub struct WalletMeta {
 impl WalletMeta {
     pub fn new(network: WalletNetwork, electrum_url: Option<String>) -> Self {
         Self {
+            account_index: 0,
             network,
             electrum_url: electrum_url
                 .unwrap_or_else(|| network.default_electrum_url().to_string()),
@@ -202,6 +206,7 @@ fn migrate_localhost_only_peers(meta: &mut WalletMeta) -> bool {
     true
 }
 
+/// True when this directory holds a BDK wallet DB (one account dir).
 pub fn wallet_files_exist(data_dir: &Path) -> bool {
     db_path(data_dir).is_file()
 }
@@ -249,6 +254,8 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
         data_dir.join(CHURN_DEPTH_FILE),
         data_dir.join(crate::churn::CHURN_ARMED_FILE),
         data_dir.join(CONTACTS_FILE),
+        mweb_seal_counter_path(data_dir),
+        data_dir.join("litvm.json"),
         // Legacy Insights LLM key file (feature removed; delete on wipe if present).
         data_dir.join("insights_llm_key.enc"),
         data_dir.join(MNEMONIC_FILE),

@@ -21,8 +21,10 @@ use bdk_mweb::pmmr::verify_leafset;
 use bdk_mweb::tx_builder::CHANGE_ADDRESS_INDEX;
 use bdk_mweb::MwebCoinDatabase;
 use bdk_mweb::{AddressBook, BanReason, ChangeSet, SealContext, MWEB_PEGIN_MATURITY};
+use bdk_wallet::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bdk_wallet::bitcoin::key::Secp256k1;
+use bdk_wallet::bitcoin::secp256k1::All;
 use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use bdk_wallet::chain::Merge;
 use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
@@ -250,19 +252,94 @@ fn classify_pass_failure(err: &bdk_mweb::Error) -> PassFailure {
     }
 }
 
+/// Account-aware MWEB scan/spend paths. Account 0 matches `MasterKeyScheme` defaults.
+pub fn mweb_scan_spend_paths(
+    scheme: MasterKeyScheme,
+    account: u32,
+) -> Result<(DerivationPath, DerivationPath), WalletError> {
+    let map = |e: bdk_wallet::bitcoin::bip32::Error| WalletError::Mweb(e.to_string());
+    match scheme {
+        MasterKeyScheme::LitecoinCore => Ok((
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(100).map_err(map)?,
+                ChildNumber::from_hardened_idx(0).map_err(map)?,
+            ]),
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(100).map_err(map)?,
+                ChildNumber::from_hardened_idx(1).map_err(map)?,
+            ]),
+        )),
+        MasterKeyScheme::Lip0004 => Ok((
+            DerivationPath::from(vec![
+                ChildNumber::from_normal_idx(1).map_err(map)?,
+                ChildNumber::from_normal_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(100).map_err(map)?,
+            ]),
+            DerivationPath::from(vec![
+                ChildNumber::from_normal_idx(1).map_err(map)?,
+                ChildNumber::from_normal_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(101).map_err(map)?,
+            ]),
+        )),
+        MasterKeyScheme::Mwebd => Ok((
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(1000).map_err(map)?,
+                ChildNumber::from_hardened_idx(2).map_err(map)?,
+                ChildNumber::from_hardened_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(0).map_err(map)?,
+            ]),
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(1000).map_err(map)?,
+                ChildNumber::from_hardened_idx(2).map_err(map)?,
+                ChildNumber::from_hardened_idx(account).map_err(map)?,
+                ChildNumber::from_hardened_idx(1).map_err(map)?,
+            ]),
+        )),
+    }
+}
+
+/// Derive MWEB master keys for `account` from a depth-0 master xprv.
+pub fn master_keys_for_account(
+    master: &Xpriv,
+    scheme: MasterKeyScheme,
+    account: u32,
+    secp: &Secp256k1<All>,
+) -> Result<MasterKeys, WalletError> {
+    let (scan_path, spend_path) = mweb_scan_spend_paths(scheme, account)?;
+    let fingerprint = master.fingerprint(secp);
+    let scan = master
+        .derive_priv(secp, &scan_path)
+        .map_err(|e| WalletError::Mweb(e.to_string()))?
+        .private_key;
+    let spend = master
+        .derive_priv(secp, &spend_path)
+        .map_err(|e| WalletError::Mweb(e.to_string()))?
+        .private_key;
+    Ok(MasterKeys {
+        scan,
+        spend,
+        scheme,
+        master_fingerprint: fingerprint,
+        scan_path,
+        spend_path,
+    })
+}
+
 impl MwebRuntime {
     pub fn open(
         data_dir: &Path,
         secret: &crate::seed::MasterSecret,
         network: WalletNetwork,
         scheme: MasterKeyScheme,
+        account: u32,
         sealing_key: Option<[u8; 32]>,
     ) -> Result<Self, WalletError> {
         let secp = Secp256k1::new();
         let bdk_net = network.to_bitcoin_network();
         let master = secret.master_xprv(bdk_net)?;
-        let keys = MasterKeys::from_xprv(&master, scheme, &secp)
-            .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        let keys = master_keys_for_account(&master, scheme, account, &secp)?;
         let book = AddressBook::from_keys(&keys, MWEB_GAP_LIMIT, &secp)
             .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
@@ -1343,6 +1420,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             crate::dto::MwebScheme::default().to_master_scheme(),
+            0,
             None,
         )
         .unwrap();
@@ -1368,6 +1446,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             MwebScheme::default().to_master_scheme(),
+            0,
             None,
         )
         .unwrap();
@@ -1432,7 +1511,7 @@ mod tests {
 
         // Start plaintext (legacy wallet), write a coin + history entry.
         let mut legacy =
-            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, None).unwrap();
+            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None).unwrap();
         legacy
             .store
             .db_mut()
@@ -1449,6 +1528,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         )
         .unwrap();
@@ -1466,6 +1546,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         )
         .unwrap();
@@ -1481,6 +1562,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some([0u8; 32]),
         );
         assert!(wrong.is_err());
@@ -1499,7 +1581,7 @@ mod tests {
         .unwrap();
         let scheme = crate::dto::MwebScheme::default().to_master_scheme();
         let mut runtime =
-            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, None).unwrap();
+            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None).unwrap();
         let coin = persistable_coin(1, Some(100), Some(4));
         let id = coin.output_id;
         runtime.store.db_mut().insert(coin);
@@ -1536,6 +1618,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         )
         .unwrap();
@@ -1563,6 +1646,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         );
         assert!(
@@ -1625,6 +1709,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         )
         .unwrap();
@@ -1689,6 +1774,7 @@ mod tests {
             &secret,
             WalletNetwork::Testnet,
             scheme,
+            0,
             Some(key),
         )
         .unwrap();

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use tempfile::tempdir;
 use wallet_core::{
-    CreateWalletRequest, MemoryBackedApp, MemoryStore, RestoreWalletRequest, SecretStore,
-    SendRequest, SetTxLabelRequest, SetUtxoLockedRequest, SplitChain, SplitRequest, WalletError,
-    WalletNetwork,
+    CreateAccountRequest, CreateWalletRequest, MemoryBackedApp, MemoryStore, RestoreWalletRequest,
+    SecretStore, SendRequest, SetTxLabelRequest, SetUtxoLockedRequest, SplitChain, SplitRequest,
+    SwitchWalletRequest, TransferCoinRequest, WalletError, WalletNetwork,
 };
 
 fn with_secrets(secrets: Arc<dyn SecretStore>) -> MemoryBackedApp {
@@ -226,10 +226,11 @@ fn create_marks_needs_full_scan_in_meta() {
     )
     .unwrap();
 
-    let meta_path = dir.path().join("wallet_meta.json");
+    let meta_path = dir.path().join("accounts/0/wallet_meta.json");
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
     assert_eq!(meta["needs_full_scan"], true);
+    assert_eq!(meta["account_index"], 0);
 }
 
 #[test]
@@ -292,10 +293,10 @@ fn tx_labels_round_trip_and_wipe() {
     .unwrap();
     let labels = app.get_tx_labels().unwrap();
     assert_eq!(labels.get("deadbeef").map(String::as_str), Some("coffee"));
-    assert!(dir.path().join("tx_labels.json").is_file());
+    assert!(dir.path().join("accounts/0/tx_labels.json").is_file());
 
     app.wipe(dir.path()).unwrap();
-    assert!(!dir.path().join("tx_labels.json").is_file());
+    assert!(!dir.path().join("accounts/0/tx_labels.json").is_file());
 }
 
 #[test]
@@ -322,11 +323,11 @@ fn mweb_frozen_and_label_wipe() {
         label: "savings".into(),
     })
     .unwrap();
-    assert!(dir.path().join("mweb_frozen.json").is_file());
-    assert!(dir.path().join("utxo_labels.json").is_file());
+    assert!(dir.path().join("accounts/0/mweb_frozen.json").is_file());
+    assert!(dir.path().join("accounts/0/utxo_labels.json").is_file());
     app.wipe(dir.path()).unwrap();
-    assert!(!dir.path().join("mweb_frozen.json").is_file());
-    assert!(!dir.path().join("utxo_labels.json").is_file());
+    assert!(!dir.path().join("accounts/0/mweb_frozen.json").is_file());
+    assert!(!dir.path().join("accounts/0/utxo_labels.json").is_file());
 }
 
 #[test]
@@ -355,7 +356,7 @@ fn contacts_round_trip_and_wipe() {
         .unwrap();
     assert_eq!(contact.name, "Alice");
     assert_eq!(contact.address, address);
-    assert!(dir.path().join("contacts.json").is_file());
+    assert!(dir.path().join("accounts/0/contacts.json").is_file());
 
     let listed = app.list_contacts().unwrap();
     assert_eq!(listed.len(), 1);
@@ -366,7 +367,7 @@ fn contacts_round_trip_and_wipe() {
     })
     .unwrap();
     assert!(app.list_contacts().unwrap().is_empty());
-    assert!(!dir.path().join("contacts.json").is_file());
+    assert!(!dir.path().join("accounts/0/contacts.json").is_file());
 
     app.upsert_contact(UpsertContactRequest {
         id: None,
@@ -375,9 +376,9 @@ fn contacts_round_trip_and_wipe() {
         kind: ContactKind::Public,
     })
     .unwrap();
-    assert!(dir.path().join("contacts.json").is_file());
+    assert!(dir.path().join("accounts/0/contacts.json").is_file());
     app.wipe(dir.path()).unwrap();
-    assert!(!dir.path().join("contacts.json").is_file());
+    assert!(!dir.path().join("accounts/0/contacts.json").is_file());
 }
 
 #[test]
@@ -716,6 +717,165 @@ fn public_denom_split_change_and_frozen() {
         })
         .unwrap_err();
     assert!(err.to_string().contains("frozen"), "got {err}");
+}
+
+#[test]
+fn multi_wallet_accounts_diverge_and_switch() {
+    let dir = tempdir().unwrap();
+    let app = with_secrets(Arc::new(MemoryStore::new()));
+    let created = app
+        .create(
+            dir.path(),
+            CreateWalletRequest {
+                network: WalletNetwork::Testnet,
+                electrum_url: None,
+            },
+        )
+        .expect("create");
+    let addr0 = created.summary.receive_address.clone();
+    assert!(dir.path().join("accounts/0/wallet.sqlite").is_file());
+
+    let list = app.list_wallets(dir.path()).expect("list");
+    assert_eq!(list.len(), 1);
+    assert!(list[0].is_active);
+
+    let summary1 = app
+        .create_wallet_account(
+            dir.path(),
+            CreateAccountRequest {
+                name: "Tip jar".into(),
+            },
+        )
+        .expect("add account");
+    assert_ne!(summary1.receive_address, addr0);
+    assert!(dir.path().join("accounts/1/wallet.sqlite").is_file());
+
+    let list = app.list_wallets(dir.path()).expect("list 2");
+    assert_eq!(list.len(), 2);
+    assert_eq!(
+        list.iter().find(|w| w.is_active).map(|w| w.index),
+        Some(1)
+    );
+
+    let back = app
+        .switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .expect("switch");
+    assert_eq!(back.receive_address, addr0);
+}
+
+#[test]
+fn transfer_public_coin_preview_to_other_account() {
+    let dir = tempdir().unwrap();
+    let app = with_secrets(Arc::new(MemoryStore::new()));
+    app.create(
+        dir.path(),
+        CreateWalletRequest {
+            network: WalletNetwork::Testnet,
+            electrum_url: None,
+        },
+    )
+    .unwrap();
+    app.create_wallet_account(
+        dir.path(),
+        CreateAccountRequest {
+            name: "Tip jar".into(),
+        },
+    )
+    .unwrap();
+    // Active is account 1 after create; switch back to 0 and fund it.
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .unwrap();
+    let outpoint = fund_confirmed_utxo(&app, 500_000);
+
+    let preview = app
+        .preview_transfer_coin(
+            dir.path(),
+            TransferCoinRequest {
+                chain: SplitChain::Public,
+                coin_id: outpoint.clone(),
+                to_account_index: 1,
+                fee_rate_sat_vb: Some(1),
+                fee_sats: 0,
+            },
+        )
+        .expect("preview transfer");
+    assert_eq!(preview.to_account_index, 1);
+    assert_eq!(preview.to_wallet_name, "Tip jar");
+    assert!(preview.address.starts_with("tltc1"));
+    assert!(preview.amount_sats + preview.fee_sats <= 500_000);
+    assert!(preview.fee_sats > 0);
+    assert!(!preview.creates_change);
+
+    // Source wallet stays active.
+    let list = app.list_wallets(dir.path()).unwrap();
+    assert_eq!(
+        list.iter().find(|w| w.is_active).map(|w| w.index),
+        Some(0)
+    );
+}
+
+#[test]
+fn transfer_rejects_active_account_and_frozen_coin() {
+    let dir = tempdir().unwrap();
+    let app = with_secrets(Arc::new(MemoryStore::new()));
+    app.create(
+        dir.path(),
+        CreateWalletRequest {
+            network: WalletNetwork::Testnet,
+            electrum_url: None,
+        },
+    )
+    .unwrap();
+    app.create_wallet_account(
+        dir.path(),
+        CreateAccountRequest {
+            name: "Tip jar".into(),
+        },
+    )
+    .unwrap();
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .unwrap();
+    let outpoint = fund_confirmed_utxo(&app, 200_000);
+
+    let self_err = app
+        .preview_transfer_coin(
+            dir.path(),
+            TransferCoinRequest {
+                chain: SplitChain::Public,
+                coin_id: outpoint.clone(),
+                to_account_index: 0,
+                fee_rate_sat_vb: Some(1),
+                fee_sats: 0,
+            },
+        )
+        .expect_err("self transfer");
+    assert!(
+        self_err.to_string().contains("active"),
+        "got {self_err}"
+    );
+
+    app.set_utxo_locked(SetUtxoLockedRequest {
+        outpoint: outpoint.clone(),
+        locked: true,
+    })
+    .unwrap();
+    let frozen_err = app
+        .preview_transfer_coin(
+            dir.path(),
+            TransferCoinRequest {
+                chain: SplitChain::Public,
+                coin_id: outpoint,
+                to_account_index: 1,
+                fee_rate_sat_vb: Some(1),
+                fee_sats: 0,
+            },
+        )
+        .expect_err("frozen");
+    assert!(
+        frozen_err.to_string().to_lowercase().contains("frozen")
+            || frozen_err.to_string().to_lowercase().contains("locked"),
+        "got {frozen_err}"
+    );
 }
 
 #[test]

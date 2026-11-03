@@ -18,6 +18,7 @@ ldk-wallet/
   docs/
     CHAT_HANDOFF.md       # short decisions for new Cursor chats
     ARCHITECTURE.md       # this file
+    MULTI_WALLET.md       # single-seed multi-wallet (BIP84 accounts)
     LITVM.md              # LitVM sidecar plan
   crates/wallet-core/     # BDK boundary + DTOs + encrypted secrets + MWEB
   crates/wallet-litvm/    # alloy EVM sidecar (LiteForge); no BDK types
@@ -62,12 +63,12 @@ Sibling checkouts (expected on a dev machine):
 
 ## Network and descriptors
 
-| User-facing | `bitcoin::Network` (litecoin crate) | BIP84 path |
+| User-facing | `bitcoin::Network` (litecoin crate) | BIP84 path (account 0) |
 | --- | --- | --- |
 | Litecoin mainnet | `Network::Bitcoin` | `m/84'/2'/0'/{0,1}/*` |
 | Litecoin testnet | `Network::Testnet4` | `m/84'/1'/0'/{0,1}/*` |
 
-Descriptors are BIP84 `wpkh` external/internal. Format the coin type from the selected network so testnet paths never land on mainnet wallets.
+Descriptors are BIP84 `wpkh` external/internal. Format the coin type from the selected network so testnet paths never land on mainnet wallets. Additional wallets share one seed at other BIP84 account indices; see [`MULTI_WALLET.md`](MULTI_WALLET.md).
 
 Addresses: `ltc1…` mainnet, `tltc1…` testnet.
 

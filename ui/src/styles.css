@@ -647,6 +647,40 @@ code {
   gap: 0.6rem;
 }
 
+.wallet-switcher-btn {
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallet-switcher-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.wallet-switcher-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.5rem;
+}
+
+.wallet-switcher-row.is-active {
+  background: color-mix(in srgb, var(--accent, #6cb6ff) 18%, transparent);
+}
+
+.wallet-switcher-row > span {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
 /* Chrome buttons and badges become clear glass pills with white ink. */
 .topbar .btn-secondary,
 .topbar .btn-ghost {

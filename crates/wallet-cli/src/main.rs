@@ -130,6 +130,9 @@ enum Command {
         /// Number of addresses to derive per chain.
         #[arg(long, default_value_t = 5)]
         count: u32,
+        /// BIP84 / MWEB / LitVM account index (default 0).
+        #[arg(long, default_value_t = 0)]
+        account: u32,
         /// aezeed cipher-seed passphrase, if one was set (Nexus advanced setting).
         #[arg(long)]
         aezeed_passphrase: Option<String>,
@@ -299,6 +302,7 @@ fn main() -> Result<()> {
             input,
             network,
             count,
+            account,
             aezeed_passphrase,
         } => {
             let input = match input {
@@ -317,6 +321,7 @@ fn main() -> Result<()> {
                 aezeed_passphrase.as_deref(),
                 network.into(),
                 count,
+                account,
             )
             .context("derive preview")?;
             println!("{}", serde_json::to_string_pretty(&preview)?);
@@ -369,7 +374,10 @@ fn main() -> Result<()> {
 #[cfg(feature = "litvm")]
 fn open_litvm(app: &WalletApp, data_dir: &Path) -> Result<wallet_litvm::LitVmClient> {
     let secret = app.litvm_account_secret().context("derive LitVM account")?;
-    wallet_litvm::LitVmClient::open(data_dir, secret).context("open LitVM client")
+    let account_dir = app
+        .active_account_dir(data_dir)
+        .context("resolve active account dir")?;
+    wallet_litvm::LitVmClient::open(&account_dir, secret).context("open LitVM client")
 }
 
 #[cfg(feature = "grail")]

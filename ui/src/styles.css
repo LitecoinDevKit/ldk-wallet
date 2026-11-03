@@ -2687,23 +2687,34 @@ textarea {
   gap: 0.4rem;
 }
 
-.fee-chip-row,
-.amount-presets {
+.fee-chip-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
 }
 
 .amount-presets {
-  margin: -0.15rem 0 0.55rem;
+  display: flex;
+  gap: 0.4rem;
+  margin: 0.35rem 0 0.55rem;
+}
+
+.amount-presets .amount-preset {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
 }
 
 .fee-chip {
+  margin: 0;
   border: 1px solid var(--border);
   background: var(--surface-1);
   color: var(--text-1);
   border-radius: var(--radius-sm);
   padding: 0.35rem 0.65rem;
+  font: inherit;
   font-size: 0.8rem;
   cursor: pointer;
 }

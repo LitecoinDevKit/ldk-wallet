@@ -28,6 +28,9 @@ pub struct LitVmProbe {
 pub struct LitVmSendRequest {
     pub address: String,
     pub amount_zkltc: String,
+    /// When true, spend the full balance minus max fee (amount_zkltc is ignored).
+    #[serde(default)]
+    pub drain: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

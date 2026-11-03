@@ -8,7 +8,7 @@ Canonical MWEB shape in `wallet-core`: Electrum/RPC tip → `MwebStore` + LIP sy
 
 ## Status
 
-**v0.4.13** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. MWEB path aligned with Litecoin Core 0.21.5.8. A self-spend stays spent while it waits for cover, and other private mempool transactions count toward that cover. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
+**v0.4.14** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. MWEB path aligned with Litecoin Core 0.21.5.8. Amount percentage chips share the amount field width evenly. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
 
 Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LDK Wallet.app"`), **Linux x86_64** (`.deb` / `.AppImage`), and **Windows x64** (unsigned per-user installer — SmartScreen may warn; More info → Run anyway). No Intel Mac or ARM Linux build.
 

@@ -292,6 +292,20 @@ async fn sync_wallet(state: State<'_, Arc<WalletApp>>) -> Result<SyncResult, Str
         .map_err(|e| e.to_string())?
 }
 
+/// Watch-only Electrum pass while the unlock screen is up.
+/// `true` when a locked sync was saved. MWEB is not touched.
+#[tauri::command]
+async fn prefetch_transparent_sync(
+    app: AppHandle,
+    state: State<'_, Arc<WalletApp>>,
+) -> Result<bool, String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.prefetch_transparent(&dir).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn get_summary(state: State<'_, Arc<WalletApp>>) -> Result<WalletSummary, String> {
     let wallet = Arc::clone(&state);
@@ -1011,6 +1025,7 @@ pub fn run() {
             preview_transfer_coin,
             transfer_coin,
             sync_wallet,
+            prefetch_transparent_sync,
             get_summary,
             get_combined_summary,
             list_transactions,

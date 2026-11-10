@@ -63,16 +63,14 @@ fn with_client<T>(
     f: impl FnOnce(&mut LitVmClient) -> Result<T, wallet_litvm::LitVmError>,
 ) -> Result<T, String> {
     let mut guard = handle.slot();
-    let client = guard.as_mut().ok_or_else(|| {
-        "LitVM is not ready — unlock the wallet first".to_string()
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| "LitVM is not ready — unlock the wallet first".to_string())?;
     f(client).map_err(map_litvm)
 }
 
 #[tauri::command]
-pub async fn litvm_summary(
-    handle: State<'_, Arc<LitVmHandle>>,
-) -> Result<LitVmSummary, String> {
+pub async fn litvm_summary(handle: State<'_, Arc<LitVmHandle>>) -> Result<LitVmSummary, String> {
     let handle = Arc::clone(&handle);
     tauri::async_runtime::spawn_blocking(move || with_client(&handle, |c| c.summary()))
         .await
@@ -80,9 +78,7 @@ pub async fn litvm_summary(
 }
 
 #[tauri::command]
-pub async fn test_litvm_rpc(
-    handle: State<'_, Arc<LitVmHandle>>,
-) -> Result<LitVmProbe, String> {
+pub async fn test_litvm_rpc(handle: State<'_, Arc<LitVmHandle>>) -> Result<LitVmProbe, String> {
     let handle = Arc::clone(&handle);
     tauri::async_runtime::spawn_blocking(move || with_client(&handle, |c| Ok(c.probe())))
         .await

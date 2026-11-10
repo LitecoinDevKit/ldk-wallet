@@ -6,7 +6,7 @@ Cut-through does not hide a same-block intermediate. LIP-0004 §6 keeps the spen
 
 ## What the wallet does
 
-One coin, one job. Each hop is a 1-in-1 spend to a fresh address of this wallet. The fee is the public kernel fee (0.0005 LTC). The coin stays frozen until the job is cancelled or finished, so Send, Swap, and Split cannot take it.
+One coin, one job. Each hop is a 1-in-1 spend to a fresh address of this wallet. The fee is the public kernel fee (0.0005 LTC). The coin stays frozen until the job is cancelled or finished, so Send, Swap, and Split cannot take it. Send, Split, and Transfer stay disabled only for that coin. Other coins can be broadcast while the hop is signed, waiting, or unconfirmed.
 
 The default is one hop. A collapsed control can ask for up to 10 non-solo blocks. While the wallet is unlocked the wallet signs that many hops and reserves a receive index for each one. It does not rewind those indexes if the job is cancelled or the signature expires. Only the first hop is applied to the coin list. The rest stay in `churn_armed.json` (mode `0600`) until each previous hop is scored. That file is not part of the metadata export.
 

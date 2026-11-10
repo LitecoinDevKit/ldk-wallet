@@ -78,10 +78,48 @@ async function capture(page, theme) {
     await page.getByText("LiteForge testnet.").waitFor();
     await page.locator(".content").screenshot({ path: out("litvm.png") });
 
+    const modal = page.locator("#modal-panel");
+    // The glass panel lets the balance show through in a crop, so hide the app behind it.
+    const settleModal = () =>
+      modal.evaluate(async (el) => {
+        document.querySelector("#ready").style.visibility = "hidden";
+        for (const animation of document.getAnimations()) animation.finish();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        el.scrollTop = 0;
+      });
+    const showApp = () =>
+      page.evaluate(() => {
+        document.querySelector("#ready").style.visibility = "";
+      });
+
+    await page.locator("#nav-balance").click();
+    await page.locator("#btn-wallet-switcher", { hasText: "Personal" }).click();
+    await modal.getByRole("heading", { name: "Wallets" }).waitFor();
+    await modal.locator(".wallet-switcher-row", { hasText: "Tip jar" }).waitFor();
+    await settleModal();
+    await modal.screenshot({ path: out("wallets.png"), animations: "disabled" });
+    await page.locator("#modal-close").click();
+    await page.locator("#modal-overlay").waitFor({ state: "hidden" });
+    await showApp();
+
+    await page.locator("#nav-coins").click();
+    await page.locator("#coins-seg-public").click();
+    const publicCoin = page.locator("#coins-utxo-list li:not(.is-frozen)").first();
+    await publicCoin.locator("details summary").click();
+    await publicCoin.getByRole("menuitem", { name: "Transfer to…" }).click();
+    await modal.getByRole("heading", { name: "Transfer coin" }).waitFor();
+    await page.getByRole("button", { name: "Transfer to Tip jar" }).waitFor();
+    await modal.getByText("Fee rate").waitFor();
+    await settleModal();
+    await modal.screenshot({ path: out("transfer.png"), animations: "disabled" });
+    await page.locator("#modal-close").click();
+    await page.locator("#modal-overlay").waitFor({ state: "hidden" });
+    await showApp();
+
     await prepare(page, "coins", theme);
     await page.locator("#nav-coins").click();
     await page.locator("#coins-seg-private").click();
-    await page.getByText("Maturing · 4 blocks left").waitFor();
+    await page.locator("#coins-mweb-list").getByText("Maturing · 4 blocks left").waitFor();
     await page.locator("#coins-mweb-list").getByText("Frozen").waitFor();
     await page.locator("#coins-mweb-list").getByText("Tied to peg-in").waitFor();
     // Labels live behind More → Details — expand until Savings is visible.
@@ -119,8 +157,9 @@ async function capture(page, theme) {
 
     await page.locator("#nav-send").click();
     await page.locator("#send-seg-private").click();
-    await page.locator("#mweb-send-coin-control summary").click();
-    const savings = page.locator("#mweb-send-utxo-list li").filter({ hasText: "Savings" });
+    await page.locator("#mweb-send-coin-control > summary").click();
+    // Picker rows keep labels behind Details, so select the fixture's Savings coin by id.
+    const savings = page.locator('#mweb-send-utxo-list li[data-output-id^="b2"]');
     await savings.locator('input[type="checkbox"]').check();
     await page.locator("#mweb-send-coin-control").evaluate((el) => {
       el.scrollIntoView({ block: "start" });

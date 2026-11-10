@@ -386,6 +386,54 @@ function churnRequest(args: Args): { cover_min: number; spread_send: boolean } {
   };
 }
 
+function publicCoins() {
+  return [
+    {
+      outpoint: `${id("91")}:0`,
+      txid: id("91"),
+      vout: 0,
+      amount_sats: S.p1000,
+      keychain: "external",
+      confirmations: 12,
+      locked: false,
+    },
+    {
+      outpoint: `${id("92")}:1`,
+      txid: id("92"),
+      vout: 1,
+      amount_sats: S.p240,
+      keychain: "external",
+      confirmations: 4,
+      locked: false,
+    },
+  ];
+}
+
+/** Drains the picked coin, so the preview amount is that coin minus the fee. */
+function transferPreview(args: Args) {
+  const req = (args?.req ?? {}) as {
+    chain?: string;
+    coin_id?: string;
+    fee_rate_sat_vb?: number | null;
+  };
+  const isPublic = req.chain === "public";
+  const coinSats = isPublic
+    ? publicCoins().find((c) => c.outpoint === req.coin_id)?.amount_sats
+    : privateCoins().find((c) => c.output_id === req.coin_id)?.amount_sats;
+  const rate = req.fee_rate_sat_vb ?? 1;
+  // One P2WPKH input to one P2WPKH output is about 110 vB.
+  const feeSats = isPublic ? Math.ceil(110 * rate) : 2_000;
+  return {
+    to_account_index: 1,
+    to_wallet_name: "Tip jar",
+    address: isPublic ? PUBLIC_ADDRESS : PRIVATE_ADDRESS,
+    amount_sats: (coinSats ?? S.p75) - feeSats,
+    fee_sats: feeSats,
+    fee_rate_sat_vb: isPublic ? rate : null,
+    creates_change: false,
+  };
+}
+
 const COMMANDS: Record<string, (args?: Args) => unknown> = {
   wallet_exists: () => scene() !== "recovery",
   wallet_needs_migration: () => false,
@@ -402,21 +450,16 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
     { index: 1, name: "Tip jar", is_active: false },
   ],
   delete_wallet_account: () => combined().transparent,
-  preview_transfer_coin: () => ({
-    to_account_index: 1,
-    to_wallet_name: "Tip jar",
-    address: PUBLIC_ADDRESS,
-    amount_sats: S.p75 - 200,
-    fee_sats: 200,
-    fee_rate_sat_vb: 1,
-    creates_change: false,
-  }),
-  transfer_coin: () => ({
-    txid: id("xfer"),
-    fee_sats: 200,
-    address: PUBLIC_ADDRESS,
-    to_account_index: 1,
-  }),
+  preview_transfer_coin: (args) => transferPreview(args),
+  transfer_coin: (args) => {
+    const preview = transferPreview(args);
+    return {
+      txid: id("xfer"),
+      fee_sats: preview.fee_sats,
+      address: preview.address,
+      to_account_index: 1,
+    };
+  },
   get_summary: () => combined().transparent,
   get_combined_summary: () => combined(),
   get_tx_labels: () => ({}),
@@ -480,26 +523,7 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
     signing_enabled: true,
   }),
   litvm_history: () => litvmHistory(),
-  list_unspent: () => [
-    {
-      outpoint: `${id("91")}:0`,
-      txid: id("91"),
-      vout: 0,
-      amount_sats: S.p1000,
-      keychain: "external",
-      confirmations: 12,
-      locked: false,
-    },
-    {
-      outpoint: `${id("92")}:1`,
-      txid: id("92"),
-      vout: 1,
-      amount_sats: S.p240,
-      keychain: "external",
-      confirmations: 4,
-      locked: false,
-    },
-  ],
+  list_unspent: () => publicCoins(),
   list_mweb_unspent: () => privateCoins(),
   preview_churn: (args) => ({
     input_sats: S.p75,

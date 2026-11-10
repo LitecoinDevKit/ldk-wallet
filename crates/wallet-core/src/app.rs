@@ -8,7 +8,7 @@ use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_mweb::mweb_sync::SyncProgress;
 
 use bdk_wallet::bitcoin::consensus::encode::deserialize;
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
 use bdk_wallet::psbt::PsbtUtils;
@@ -107,18 +107,23 @@ fn meta_from_state(state: &WalletState) -> WalletMeta {
     }
 }
 
-/// Candidate Electrum URLs in try order: last-good this session, configured,
+/// Candidate Electrum URLs in try order: session URL (if any), configured,
 /// then (unless the user opted out) the built-in public defaults.
-fn electrum_candidates(state: &WalletState) -> Vec<String> {
+fn electrum_candidate_list(
+    session_url: Option<&str>,
+    configured_url: &str,
+    use_public_fallback: bool,
+    network: WalletNetwork,
+) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
-    if let Some(active) = &state.active_electrum_url {
-        urls.push(active.clone());
+    if let Some(session) = session_url.filter(|url| !url.is_empty()) {
+        urls.push(session.to_string());
     }
-    if !urls.contains(&state.electrum_url) {
-        urls.push(state.electrum_url.clone());
+    if !urls.iter().any(|url| url == configured_url) {
+        urls.push(configured_url.to_string());
     }
-    if state.electrum_use_public_fallback {
-        for default in state.network.default_electrum_urls() {
+    if use_public_fallback {
+        for default in network.default_electrum_urls() {
             let default = default.to_string();
             if !urls.contains(&default) {
                 urls.push(default);
@@ -128,11 +133,35 @@ fn electrum_candidates(state: &WalletState) -> Vec<String> {
     urls
 }
 
-/// Connect with fallback across [`electrum_candidates`], remembering what worked.
+/// Candidate Electrum URLs for a loaded wallet: last-good this session, configured,
+/// then (unless the user opted out) the built-in public defaults.
+fn electrum_candidates(state: &WalletState) -> Vec<String> {
+    electrum_candidate_list(
+        state.active_electrum_url.as_deref(),
+        &state.electrum_url,
+        state.electrum_use_public_fallback,
+        state.network,
+    )
+}
+
+/// Connect with fallback, remembering what worked on `state`.
 fn connect_electrum(
     state: &mut WalletState,
 ) -> Result<crate::electrum::ElectrumClient, WalletError> {
-    let candidates = electrum_candidates(state);
+    connect_electrum_prefer(state, None)
+}
+
+/// [`connect_electrum`] with an extra URL tried first (the server that worked
+/// before this wallet was locked).
+fn connect_electrum_prefer(
+    state: &mut WalletState,
+    prefer: Option<&str>,
+) -> Result<crate::electrum::ElectrumClient, WalletError> {
+    let mut candidates = electrum_candidates(state);
+    if let Some(prefer) = prefer.filter(|url| !url.is_empty()) {
+        candidates.retain(|url| url != prefer);
+        candidates.insert(0, prefer.to_string());
+    }
     let (client, used) = electrum::connect_first(&candidates, state.electrum_validate_domain)?;
     if used != state.electrum_url {
         diag::log(format!(
@@ -141,6 +170,75 @@ fn connect_electrum(
     }
     state.active_electrum_url = Some(used);
     Ok(client)
+}
+
+fn connect_from_meta(
+    meta: &WalletMeta,
+    prefer: Option<&str>,
+) -> Result<(crate::electrum::ElectrumClient, String), WalletError> {
+    let mut candidates = electrum_candidate_list(
+        None,
+        &meta.electrum_url,
+        meta.electrum_use_public_fallback,
+        meta.network,
+    );
+    if let Some(prefer) = prefer.filter(|url| !url.is_empty()) {
+        candidates.retain(|url| url != prefer);
+        candidates.insert(0, prefer.to_string());
+    }
+    let (client, used) = electrum::connect_first(&candidates, meta.electrum_validate_domain)?;
+    if used != meta.electrum_url {
+        diag::log(format!(
+            "electrum: configured server unavailable; using fallback {used}"
+        ));
+    }
+    Ok((client, used))
+}
+
+/// One Electrum full scan or incremental sync applied to `wallet`. Does not persist.
+fn apply_electrum_chain_update(
+    wallet: &mut PersistedWallet<Connection>,
+    client: &crate::electrum::ElectrumClient,
+    full_scan: bool,
+) -> Result<(), WalletError> {
+    client.populate_tx_cache(wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx));
+    if full_scan {
+        diag::log("sync: electrum full_scan starting");
+        let request = wallet.start_full_scan();
+        let update = client
+            .full_scan(request, STOP_GAP, BATCH_SIZE, false)
+            .map_err(|e| WalletError::Electrum(e.to_string()))?;
+        wallet
+            .apply_update(update)
+            .map_err(|e| WalletError::Electrum(e.to_string()))?;
+    } else {
+        diag::log("sync: electrum sync starting");
+        let request = wallet.start_sync_with_revealed_spks();
+        let update = client
+            .sync(request, BATCH_SIZE, false)
+            .map_err(|e| WalletError::Electrum(e.to_string()))?;
+        wallet
+            .apply_update(update)
+            .map_err(|e| WalletError::Electrum(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// True when `wallet`'s chain still contains the previous tip header and the tip
+/// did not move backwards. A lower tip or a replaced header is a reorg.
+fn chain_extended_in_place(
+    wallet: &PersistedWallet<Connection>,
+    prev_height: u32,
+    prev_hash: bdk_wallet::bitcoin::BlockHash,
+) -> bool {
+    if wallet.latest_checkpoint().height() < prev_height {
+        return false;
+    }
+    wallet
+        .local_chain()
+        .get(prev_height)
+        .map(|cp| cp.hash() == prev_hash)
+        .unwrap_or(false)
 }
 
 /// Explorer settings Insights needs. Kept off the wallet mutex so a litview
@@ -163,6 +261,9 @@ pub struct WalletApp {
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
+    /// Electrum URL that connected most recently. Survives lock so the next
+    /// sync does not retry a dead configured server first. Not a secret.
+    last_good_electrum: Mutex<Option<String>>,
     /// Copied from wallet state on load and settings save. Insights reads this
     /// instead of the wallet mutex.
     insights_endpoint: Mutex<Option<InsightsEndpoint>>,
@@ -181,7 +282,27 @@ impl WalletApp {
             mweb_sync_active: AtomicBool::new(false),
             sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
             pending_lock: AtomicBool::new(false),
+            last_good_electrum: Mutex::new(None),
             insights_endpoint: Mutex::new(None),
+        }
+    }
+
+    fn remembered_electrum(&self) -> Option<String> {
+        self.last_good_electrum
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    fn remember_electrum(&self, url: String) {
+        if let Ok(mut slot) = self.last_good_electrum.lock() {
+            *slot = Some(url);
+        }
+    }
+
+    fn forget_electrum(&self) {
+        if let Ok(mut slot) = self.last_good_electrum.lock() {
+            *slot = None;
         }
     }
 
@@ -216,7 +337,7 @@ impl WalletApp {
         }
     }
 
-    /// Redacted support bundle for Export diagnostics (no secrets).
+    /// Redacted support bundle for Export diagnostics (no secrets, no Unstoppable API key).
     pub fn diagnostics(&self, app_version: &str) -> DiagnosticsBundle {
         let generated_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -471,6 +592,10 @@ impl WalletApp {
     }
 
     /// Broadcast transferring one coin to another account under the same seed.
+    ///
+    /// Signs and reserves the coin under the wallet lock, then broadcasts
+    /// without it. Peer and Electrum round-trips must not block a split or
+    /// another coin's transfer.
     pub fn transfer_coin(
         &self,
         root: &Path,
@@ -483,10 +608,70 @@ impl WalletApp {
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
         let sealing = self.secrets.sealing_key();
-        let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let prepared = prepare_transfer(root, state, &secret, sealing, &req, true)?;
-        finish_transfer_broadcast(state, prepared)
+        let prepared = {
+            let mut guard = self.lock_state()?;
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+            prepare_transfer_broadcast(root, state, &secret, sealing, &req)?
+        };
+        match prepared {
+            PreparedTransferBroadcast::Public {
+                source_dir,
+                electrum_candidates,
+                electrum_validate_domain,
+                tx,
+                outpoint,
+                fee_sats,
+                address,
+                to_account_index,
+            } => {
+                let client =
+                    match electrum::connect_first(&electrum_candidates, electrum_validate_domain) {
+                        Ok((client, _)) => client,
+                        Err(e) => {
+                            self.release_public_split_hold(&source_dir, outpoint);
+                            return Err(e);
+                        }
+                    };
+                if let Err(e) = client.transaction_broadcast(&tx) {
+                    self.release_public_split_hold(&source_dir, outpoint);
+                    return Err(WalletError::Electrum(
+                        crate::error::humanize_broadcast_error(&e.to_string()),
+                    ));
+                }
+                self.commit_public_transfer(
+                    &source_dir,
+                    tx,
+                    outpoint,
+                    fee_sats,
+                    address,
+                    to_account_index,
+                )
+            }
+            PreparedTransferBroadcast::Private {
+                source_dir,
+                signed,
+                rpc_url,
+                peers,
+                network,
+                address,
+                to_account_index,
+                input_ids,
+            } => {
+                if let Err(e) =
+                    mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)
+                {
+                    self.unfreeze_mweb_ids(&source_dir, &input_ids);
+                    return Err(e);
+                }
+                self.commit_private_transfer(
+                    &source_dir,
+                    &signed,
+                    &input_ids,
+                    address,
+                    to_account_index,
+                )
+            }
+        }
     }
 
     pub fn needs_migration(&self) -> bool {
@@ -626,6 +811,10 @@ impl WalletApp {
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
+        let sealing = self.secrets.sealing_key();
+        // Read the account under the wallet lock. A split commit writes those
+        // same files under this lock, after broadcasting without holding it.
+        let mut guard = self.lock_state()?;
 
         let mut db = Connection::open(meta::db_path(&account_dir))
             .map_err(|e| WalletError::Persist(e.to_string()))?;
@@ -640,7 +829,7 @@ impl WalletApp {
             meta.network,
             meta.mweb_scheme.to_master_scheme(),
             account,
-            self.secrets.sealing_key(),
+            sealing,
         )
         .ok();
 
@@ -672,7 +861,7 @@ impl WalletApp {
         };
         let summary = build_summary(&mut state)?;
         self.publish_insights(&state);
-        *self.lock_state()? = Some(state);
+        *guard = Some(state);
         Ok(summary)
     }
 
@@ -980,6 +1169,7 @@ impl WalletApp {
         state.auto_lock_minutes = req.auto_lock_minutes;
         // New configured server should be tried first on the next connection.
         state.active_electrum_url = None;
+        self.forget_electrum();
         state.litecoin_rpc_url = req
             .litecoin_rpc_url
             .map(|s| crate::rpc::normalize_rpc_url(&s))
@@ -1083,6 +1273,104 @@ impl WalletApp {
         crate::insights::fetch_insight_charts(&base)
     }
 
+    /// Refresh the active account's transparent chain while the wallet is locked.
+    ///
+    /// Opens the public BDK database only (no mnemonic, no signer, no MWEB).
+    /// Persists when the chain extended in place. A lower tip or a replaced
+    /// header is left unpersisted so the unlocked sync can disconnect MWEB.
+    ///
+    /// Returns `Ok(true)` when an Electrum pass finished and was saved.
+    /// Returns `Ok(false)` when there is nothing to do (already unlocked, no
+    /// wallet, a session is loaded) or the update was discarded as a reorg.
+    /// Network failures are `Err` and leave the database unchanged.
+    pub fn prefetch_transparent(&self, data_dir: &Path) -> Result<bool, WalletError> {
+        if !self.secrets.is_locked() || !self.exists(data_dir) {
+            return Ok(false);
+        }
+        let guard = self.lock_state()?;
+        if !self.secrets.is_locked() || guard.is_some() {
+            return Ok(false);
+        }
+        // Hold `guard` for the whole Electrum pass so unlock's `load` waits,
+        // then drop the watch-only wallet before the guard releases.
+        let synced = self.prefetch_transparent_holding(data_dir);
+        drop(guard);
+        synced
+    }
+
+    fn prefetch_transparent_holding(&self, data_dir: &Path) -> Result<bool, WalletError> {
+        accounts::ensure_layout(data_dir)?;
+        let account_dir = accounts::active_account_dir(data_dir)?;
+        let mut meta = meta::read_meta(&account_dir)?;
+        let mut db = Connection::open(meta::db_path(&account_dir))
+            .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let params = bdk_wallet::Wallet::load().check_network(meta.network.to_bitcoin_network());
+        let mut wallet = PersistedWallet::load(&mut db, params)
+            .map_err(|e| WalletError::Persist(e.to_string()))?
+            .ok_or(WalletError::NotFound)?;
+
+        let prev = wallet.latest_checkpoint();
+        let prev_height = prev.height();
+        let prev_hash = prev.hash();
+
+        let prefer = self.remembered_electrum();
+        let (client, used) = match connect_from_meta(&meta, prefer.as_deref()) {
+            Ok(connected) => connected,
+            Err(e) => {
+                self.set_sync_phase(SyncPhase::Idle);
+                return Err(e);
+            }
+        };
+        self.remember_electrum(used);
+
+        let full_scan = meta.needs_full_scan;
+        self.set_sync_phase(if full_scan {
+            SyncPhase::ElectrumFullScan
+        } else {
+            SyncPhase::ElectrumSync
+        });
+        if let Err(e) = apply_electrum_chain_update(&mut wallet, &client, full_scan) {
+            self.set_sync_phase(SyncPhase::Idle);
+            return Err(e);
+        }
+
+        if !chain_extended_in_place(&wallet, prev_height, prev_hash) {
+            diag::log("prefetch: electrum update looked like a reorg; not persisting");
+            self.set_sync_phase(SyncPhase::Idle);
+            return Ok(false);
+        }
+
+        if let Err(e) = wallet.persist(&mut db) {
+            self.set_sync_phase(SyncPhase::Idle);
+            return Err(WalletError::Persist(e.to_string()));
+        }
+        if full_scan {
+            meta.needs_full_scan = false;
+            if let Err(e) = meta::write_meta(&account_dir, &meta) {
+                self.set_sync_phase(SyncPhase::Idle);
+                return Err(e);
+            }
+        }
+        self.set_sync_phase(SyncPhase::Idle);
+        Ok(true)
+    }
+
+    /// Receive address from the on-disk public descriptor. Does not unlock and
+    /// does not keep the wallet in memory.
+    #[cfg(test)]
+    fn watch_only_receive_address(data_dir: &Path) -> Result<String, WalletError> {
+        accounts::ensure_layout(data_dir)?;
+        let account_dir = accounts::active_account_dir(data_dir)?;
+        let meta = meta::read_meta(&account_dir)?;
+        let mut db = Connection::open(meta::db_path(&account_dir))
+            .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let params = bdk_wallet::Wallet::load().check_network(meta.network.to_bitcoin_network());
+        let mut wallet = PersistedWallet::load(&mut db, params)
+            .map_err(|e| WalletError::Persist(e.to_string()))?
+            .ok_or(WalletError::NotFound)?;
+        Ok(current_receive_address(&mut wallet))
+    }
+
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
@@ -1090,38 +1378,24 @@ impl WalletApp {
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
         let electrum_started = std::time::Instant::now();
-        let client = connect_electrum(state)?;
-        client.populate_tx_cache(state.wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx));
+        let prefer = self.remembered_electrum();
+        let client = connect_electrum_prefer(state, prefer.as_deref())?;
+        if let Some(used) = state.active_electrum_url.clone() {
+            self.remember_electrum(used);
+        }
 
         let tx_count_before = state.wallet.transactions().count();
         let did_full_scan = state.needs_full_scan;
         let prev_tip = state.last_tip_height;
 
-        if did_full_scan {
-            self.set_sync_phase(SyncPhase::ElectrumFullScan);
-            diag::log("sync: electrum full_scan starting");
-            let request = state.wallet.start_full_scan();
-            let update = client
-                .full_scan(request, STOP_GAP, BATCH_SIZE, false)
-                .map_err(|e| {
-                    self.set_sync_phase(SyncPhase::Idle);
-                    WalletError::Electrum(e.to_string())
-                })?;
-            state.wallet.apply_update(update).map_err(|e| {
-                self.set_sync_phase(SyncPhase::Idle);
-                WalletError::Electrum(e.to_string())
-            })?;
+        self.set_sync_phase(if did_full_scan {
+            SyncPhase::ElectrumFullScan
         } else {
-            self.set_sync_phase(SyncPhase::ElectrumSync);
-            let request = state.wallet.start_sync_with_revealed_spks();
-            let update = client.sync(request, BATCH_SIZE, false).map_err(|e| {
-                self.set_sync_phase(SyncPhase::Idle);
-                WalletError::Electrum(e.to_string())
-            })?;
-            state.wallet.apply_update(update).map_err(|e| {
-                self.set_sync_phase(SyncPhase::Idle);
-                WalletError::Electrum(e.to_string())
-            })?;
+            SyncPhase::ElectrumSync
+        });
+        if let Err(e) = apply_electrum_chain_update(&mut state.wallet, &client, did_full_scan) {
+            self.set_sync_phase(SyncPhase::Idle);
+            return Err(e);
         }
 
         state
@@ -1480,27 +1754,35 @@ impl WalletApp {
 
     pub fn mweb_send(&self, req: MwebSendRequest) -> Result<MwebBroadcastResult, WalletError> {
         self.ensure_unlocked()?;
-        let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let req = resolve_mweb_send_request(state, req)?;
-        let rpc_url = state.litecoin_rpc_url.clone();
-        let peers = state.mweb_peers.clone();
-        let network = state.network;
-        let data_dir = state.data_dir.clone();
-        let mweb = state
-            .mweb
-            .as_mut()
-            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-        let result = mweb::mweb_send(
-            &state.wallet,
-            mweb,
-            &data_dir,
-            rpc_url.as_deref(),
-            &peers,
-            req,
-            network,
-        )?;
-        mweb.persist(&data_dir)?;
+        // Sign under the lock, then broadcast without it so a transfer or split
+        // of a different coin can start while peers are still being tried.
+        let (data_dir, signed, rpc_url, peers, network, input_ids) = {
+            let mut guard = self.lock_state()?;
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+            let req = resolve_mweb_send_request(state, req)?;
+            let rpc_url = state.litecoin_rpc_url.clone();
+            let peers = state.mweb_peers.clone();
+            let network = state.network;
+            let data_dir = state.data_dir.clone();
+            let mweb = state
+                .mweb
+                .as_mut()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+            let signed = mweb::sign_mweb_send(&state.wallet, mweb, &data_dir, &req, network)?;
+            let input_ids = signed.input_ids();
+            for id in &input_ids {
+                mweb_frozen::set_locked(&data_dir, id, true)?;
+            }
+            (data_dir, signed, rpc_url, peers, network, input_ids)
+        };
+        if let Err(e) = mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network) {
+            self.unfreeze_mweb_ids(&data_dir, &input_ids);
+            return Err(e);
+        }
+        let result = self.with_account_mweb(&data_dir, |runtime| {
+            Ok(mweb::apply_signed_mweb_send(runtime, &signed))
+        })?;
+        self.unfreeze_mweb_ids(&data_dir, &input_ids);
         Ok(result)
     }
 
@@ -1602,66 +1884,222 @@ impl WalletApp {
 
     pub fn split_coin(&self, req: SplitRequest) -> Result<SplitResult, WalletError> {
         self.ensure_unlocked()?;
-        let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let preview = plan_split_request(state, &req)?;
-        match req.chain {
-            SplitChain::Public => {
-                let (psbt, fee_sats) = build_public_split_psbt(state, &req.input, &preview)?;
-                let mut psbt = psbt;
-                sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
-                let tx = psbt
-                    .extract_tx()
-                    .map_err(|e| WalletError::Sign(e.to_string()))?;
-                let client = connect_electrum(state)?;
-                client.transaction_broadcast(&tx).map_err(|e| {
-                    WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
-                })?;
-                state
-                    .wallet
-                    .apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
-                state
-                    .wallet
-                    .persist(&mut state.db)
-                    .map_err(|e| WalletError::Persist(e.to_string()))?;
-                let txid = tx.compute_txid().to_string();
-                split_ids::record_txid(&state.data_dir, &txid)?;
-                Ok(SplitResult {
-                    txid,
-                    fee_sats,
-                    output_count: preview.outputs.len() as u32,
-                })
+        // Sign under the lock, then broadcast without it. Peer and Electrum
+        // round-trips take long enough that an account switch must not wait
+        // on them. The coin is reserved first so a switch cannot spend it.
+        let prepared = {
+            let mut guard = self.lock_state()?;
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+            prepare_split(state, &req)?
+        };
+        match prepared {
+            PreparedSplit::Public {
+                source_dir,
+                electrum_candidates,
+                electrum_validate_domain,
+                tx,
+                outpoint,
+                fee_sats,
+                output_count,
+            } => {
+                let client =
+                    match electrum::connect_first(&electrum_candidates, electrum_validate_domain) {
+                        Ok((client, _)) => client,
+                        Err(e) => {
+                            self.release_public_split_hold(&source_dir, outpoint);
+                            return Err(e);
+                        }
+                    };
+                if let Err(e) = client.transaction_broadcast(&tx) {
+                    self.release_public_split_hold(&source_dir, outpoint);
+                    return Err(WalletError::Electrum(
+                        crate::error::humanize_broadcast_error(&e.to_string()),
+                    ));
+                }
+                self.commit_public_split(&source_dir, tx, outpoint, fee_sats, output_count)
             }
-            SplitChain::Private => {
-                let recipients: Vec<u64> = preview
-                    .outputs
-                    .iter()
-                    .filter(|o| !o.is_change)
-                    .map(|o| o.amount_sats)
-                    .collect();
-                let rpc_url = state.litecoin_rpc_url.clone();
-                let peers = state.mweb_peers.clone();
-                let network = state.network;
-                let data_dir = state.data_dir.clone();
-                let mweb = state
-                    .mweb
-                    .as_mut()
-                    .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-                let result = mweb::mweb_split(
-                    &state.wallet,
-                    mweb,
-                    &data_dir,
-                    rpc_url.as_deref(),
-                    &peers,
-                    &req.input,
-                    &recipients,
-                    preview.fee_sats,
-                    network,
-                )?;
-                mweb.persist(&data_dir)?;
-                Ok(result)
+            PreparedSplit::Private {
+                source_dir,
+                signed,
+                rpc_url,
+                peers,
+                network,
+            } => {
+                if let Err(e) =
+                    mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)
+                {
+                    let _ = mweb_frozen::set_locked(&source_dir, &signed.input_id, false);
+                    return Err(e);
+                }
+                self.commit_private_split(&source_dir, &signed)
             }
         }
+    }
+
+    fn release_public_split_hold(&self, source_dir: &Path, outpoint: OutPoint) {
+        let _ = self.with_account_wallet(source_dir, |wallet, db| {
+            wallet.unlock_outpoint(outpoint);
+            wallet
+                .persist(db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(())
+        });
+    }
+
+    fn commit_public_split(
+        &self,
+        source_dir: &Path,
+        tx: Transaction,
+        outpoint: OutPoint,
+        fee_sats: u64,
+        output_count: u32,
+    ) -> Result<SplitResult, WalletError> {
+        let txid = tx.compute_txid().to_string();
+        self.with_account_wallet(source_dir, |wallet, db| {
+            wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
+            wallet.unlock_outpoint(outpoint);
+            wallet
+                .persist(db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(())
+        })?;
+        split_ids::record_txid(source_dir, &txid)?;
+        Ok(SplitResult {
+            txid,
+            fee_sats,
+            output_count,
+        })
+    }
+
+    fn commit_private_split(
+        &self,
+        source_dir: &Path,
+        signed: &mweb::SignedMwebSplit,
+    ) -> Result<SplitResult, WalletError> {
+        let result = signed.result();
+        self.with_account_mweb(source_dir, |runtime| {
+            mweb::apply_signed_mweb_split(runtime, signed);
+            Ok(())
+        })?;
+        let _ = mweb_frozen::set_locked(source_dir, &signed.input_id, false);
+        Ok(result)
+    }
+
+    fn unfreeze_mweb_ids(&self, source_dir: &Path, input_ids: &[String]) {
+        for id in input_ids {
+            let _ = mweb_frozen::set_locked(source_dir, id, false);
+        }
+    }
+
+    fn commit_public_transfer(
+        &self,
+        source_dir: &Path,
+        tx: Transaction,
+        outpoint: OutPoint,
+        fee_sats: u64,
+        address: String,
+        to_account_index: u32,
+    ) -> Result<TransferCoinResult, WalletError> {
+        let txid = tx.compute_txid().to_string();
+        self.with_account_wallet(source_dir, |wallet, db| {
+            wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
+            wallet.unlock_outpoint(outpoint);
+            wallet
+                .persist(db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(())
+        })?;
+        Ok(TransferCoinResult {
+            txid,
+            fee_sats,
+            address,
+            to_account_index,
+        })
+    }
+
+    fn commit_private_transfer(
+        &self,
+        source_dir: &Path,
+        signed: &mweb::SignedMwebSend,
+        input_ids: &[String],
+        address: String,
+        to_account_index: u32,
+    ) -> Result<TransferCoinResult, WalletError> {
+        let result = signed.result();
+        self.with_account_mweb(source_dir, |runtime| {
+            Ok(mweb::apply_signed_mweb_send(runtime, signed))
+        })?;
+        self.unfreeze_mweb_ids(source_dir, input_ids);
+        Ok(TransferCoinResult {
+            txid: result.wtxid,
+            fee_sats: result.fee_sats,
+            address,
+            to_account_index,
+        })
+    }
+
+    /// Run `f` on the account at `data_dir`. Uses the loaded wallet when that
+    /// account is still active, otherwise opens the account files.
+    fn with_account_wallet<T>(
+        &self,
+        data_dir: &Path,
+        f: impl FnOnce(&mut PersistedWallet<Connection>, &mut Connection) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        if state.data_dir == data_dir {
+            return f(&mut state.wallet, &mut state.db);
+        }
+        let meta = meta::read_meta(data_dir)?;
+        let mut db = Connection::open(meta::db_path(data_dir))
+            .map_err(|e| WalletError::Persist(e.to_string()))?;
+        let params = load_params(&secret, meta.network, meta.account_index)?;
+        let mut wallet = PersistedWallet::load(&mut db, params)
+            .map_err(|e| WalletError::Persist(e.to_string()))?
+            .ok_or(WalletError::NotFound)?;
+        f(&mut wallet, &mut db)
+    }
+
+    /// Run `f` on the MWEB store at `data_dir`, then persist it.
+    fn with_account_mweb<T>(
+        &self,
+        data_dir: &Path,
+        f: impl FnOnce(&mut MwebRuntime) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let sealing = self.secrets.sealing_key();
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        if state.data_dir == data_dir {
+            let mweb = state
+                .mweb
+                .as_mut()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+            let out = f(mweb)?;
+            mweb.persist(data_dir)?;
+            return Ok(out);
+        }
+        let meta = meta::read_meta(data_dir)?;
+        let mut mweb = MwebRuntime::open(
+            data_dir,
+            &secret,
+            meta.network,
+            meta.mweb_scheme.to_master_scheme(),
+            meta.account_index,
+            sealing,
+        )?;
+        let out = f(&mut mweb)?;
+        mweb.persist(data_dir)?;
+        Ok(out)
     }
 
     pub fn preview_churn(&self, req: ChurnRequest) -> Result<ChurnPreview, WalletError> {
@@ -1902,8 +2340,8 @@ fn open_created_account(
     let db_path = meta::db_path(account_dir);
     let mut db = Connection::open(&db_path).map_err(|e| WalletError::Persist(e.to_string()))?;
     let params = create_params(secret, meta.network, meta.account_index)?;
-    let mut wallet =
-        PersistedWallet::create(&mut db, params).map_err(|e| WalletError::Persist(e.to_string()))?;
+    let mut wallet = PersistedWallet::create(&mut db, params)
+        .map_err(|e| WalletError::Persist(e.to_string()))?;
     let _ = wallet.next_unused_address(KeychainKind::External);
     wallet
         .persist(&mut db)
@@ -2900,14 +3338,44 @@ fn finish_transfer_preview(
     }
 }
 
-fn finish_transfer_broadcast(
+enum PreparedTransferBroadcast {
+    Public {
+        source_dir: PathBuf,
+        electrum_candidates: Vec<String>,
+        electrum_validate_domain: bool,
+        tx: Transaction,
+        outpoint: OutPoint,
+        fee_sats: u64,
+        address: String,
+        to_account_index: u32,
+    },
+    Private {
+        source_dir: PathBuf,
+        signed: mweb::SignedMwebSend,
+        rpc_url: Option<String>,
+        peers: Vec<String>,
+        network: WalletNetwork,
+        address: String,
+        to_account_index: u32,
+        input_ids: Vec<String>,
+    },
+}
+
+/// Sign a transfer and reserve its coin. Does not broadcast.
+fn prepare_transfer_broadcast(
+    root: &Path,
     state: &mut WalletState,
-    prepared: PreparedTransfer,
-) -> Result<TransferCoinResult, WalletError> {
+    secret: &MasterSecret,
+    sealing_key: Option<[u8; 32]>,
+    req: &TransferCoinRequest,
+) -> Result<PreparedTransferBroadcast, WalletError> {
+    let prepared = prepare_transfer(root, state, secret, sealing_key, req, true)?;
+    let source_dir = state.data_dir.clone();
     match prepared.chain {
         SplitChain::Public => {
             let send_req = prepared.send_req.expect("public transfer");
-            let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &send_req)?;
+            let (_fee_rate_sat_vb, mut psbt, _recipient_script) =
+                build_send_psbt(state, &send_req)?;
             sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
             let fee_sats = psbt
                 .fee_amount()
@@ -2916,19 +3384,18 @@ fn finish_transfer_broadcast(
             let tx = psbt
                 .extract_tx()
                 .map_err(|e| WalletError::BuildTx(e.to_string()))?;
-            let client = connect_electrum(state)?;
-            client.transaction_broadcast(&tx).map_err(|e| {
-                WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
-            })?;
-            state
-                .wallet
-                .apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
+            let outpoint = parse_outpoint(req.coin_id.trim())?;
+            state.wallet.lock_outpoint(outpoint);
             state
                 .wallet
                 .persist(&mut state.db)
                 .map_err(|e| WalletError::Persist(e.to_string()))?;
-            Ok(TransferCoinResult {
-                txid: tx.compute_txid().to_string(),
+            Ok(PreparedTransferBroadcast::Public {
+                electrum_candidates: electrum_candidates(state),
+                electrum_validate_domain: state.electrum_validate_domain,
+                source_dir,
+                tx,
+                outpoint,
                 fee_sats,
                 address: prepared.address,
                 to_account_index: prepared.to_account_index,
@@ -2940,26 +3407,25 @@ fn finish_transfer_broadcast(
             let rpc_url = state.litecoin_rpc_url.clone();
             let peers = state.mweb_peers.clone();
             let network = state.network;
-            let data_dir = state.data_dir.clone();
             let mweb = state
                 .mweb
                 .as_mut()
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-            let result = mweb::mweb_send(
-                &state.wallet,
-                mweb,
-                &data_dir,
-                rpc_url.as_deref(),
-                &peers,
-                resolved,
+            let signed =
+                mweb::sign_mweb_send(&state.wallet, mweb, &source_dir, &resolved, network)?;
+            let input_ids = signed.input_ids();
+            for id in &input_ids {
+                mweb_frozen::set_locked(&source_dir, id, true)?;
+            }
+            Ok(PreparedTransferBroadcast::Private {
+                source_dir,
+                signed,
+                rpc_url,
+                peers,
                 network,
-            )?;
-            mweb.persist(&data_dir)?;
-            Ok(TransferCoinResult {
-                txid: result.wtxid,
-                fee_sats: result.fee_sats,
                 address: prepared.address,
                 to_account_index: prepared.to_account_index,
+                input_ids,
             })
         }
     }
@@ -3100,6 +3566,93 @@ fn public_split_utxo(state: &WalletState, raw: &str) -> Result<(OutPoint, u64), 
         ));
     }
     Ok((op, utxo.txout.value.to_sat()))
+}
+
+enum PreparedSplit {
+    Public {
+        source_dir: PathBuf,
+        electrum_candidates: Vec<String>,
+        electrum_validate_domain: bool,
+        tx: Transaction,
+        outpoint: OutPoint,
+        fee_sats: u64,
+        output_count: u32,
+    },
+    Private {
+        source_dir: PathBuf,
+        signed: mweb::SignedMwebSplit,
+        rpc_url: Option<String>,
+        peers: Vec<String>,
+        network: WalletNetwork,
+    },
+}
+
+/// Sign a split and reserve its coin. Does not broadcast.
+fn prepare_split(
+    state: &mut WalletState,
+    req: &SplitRequest,
+) -> Result<PreparedSplit, WalletError> {
+    let preview = plan_split_request(state, req)?;
+    let source_dir = state.data_dir.clone();
+    match req.chain {
+        SplitChain::Public => {
+            let (psbt, fee_sats) = build_public_split_psbt(state, &req.input, &preview)?;
+            let mut psbt = psbt;
+            sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
+            let tx = psbt
+                .extract_tx()
+                .map_err(|e| WalletError::Sign(e.to_string()))?;
+            let outpoint = parse_outpoint(&req.input)?;
+            state.wallet.lock_outpoint(outpoint);
+            state
+                .wallet
+                .persist(&mut state.db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            let electrum_candidates = electrum_candidates(state);
+            let electrum_validate_domain = state.electrum_validate_domain;
+            Ok(PreparedSplit::Public {
+                source_dir,
+                electrum_candidates,
+                electrum_validate_domain,
+                tx,
+                outpoint,
+                fee_sats,
+                output_count: preview.outputs.len() as u32,
+            })
+        }
+        SplitChain::Private => {
+            let recipients: Vec<u64> = preview
+                .outputs
+                .iter()
+                .filter(|o| !o.is_change)
+                .map(|o| o.amount_sats)
+                .collect();
+            let rpc_url = state.litecoin_rpc_url.clone();
+            let peers = state.mweb_peers.clone();
+            let network = state.network;
+            let mweb = state
+                .mweb
+                .as_mut()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+            let signed = mweb::sign_mweb_split(
+                &state.wallet,
+                mweb,
+                &source_dir,
+                &req.input,
+                &recipients,
+                preview.fee_sats,
+                network,
+            )?;
+            mweb_frozen::set_locked(&source_dir, &signed.input_id, true)?;
+            Ok(PreparedSplit::Private {
+                source_dir,
+                signed,
+                rpc_url,
+                peers,
+                network,
+            })
+        }
+    }
 }
 
 fn plan_split_request(
@@ -4790,4 +5343,89 @@ fn current_receive_address(wallet: &mut PersistedWallet<Connection>) -> String {
     wallet
         .reveal_next_address(KeychainKind::External)
         .to_string()
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::WalletApp;
+    use crate::dto::{CreateWalletRequest, UpdateSettingsRequest};
+    use crate::error::WalletError;
+    use crate::meta::{self, WALLET_DB_FILE, WALLET_META_FILE};
+    use crate::network::WalletNetwork;
+
+    fn point_at_invalid_electrum(app: &WalletApp) {
+        let settings = app.settings().expect("settings");
+        app.update_settings(UpdateSettingsRequest {
+            electrum_url: "ssl://example.invalid:51002".into(),
+            electrum_validate_domain: settings.electrum_validate_domain,
+            electrum_use_public_fallback: false,
+            auto_lock_minutes: settings.auto_lock_minutes,
+            litecoin_rpc_url: settings.litecoin_rpc_url,
+            mweb_peers: settings.mweb_peers,
+            explorer_base_url: settings.explorer_base_url,
+            show_fiat: settings.show_fiat,
+            use_explorer_fee_hints: settings.use_explorer_fee_hints,
+            insights_enabled: settings.insights_enabled,
+        })
+        .expect("disable public electrum fallback");
+    }
+
+    #[test]
+    fn locked_watch_only_keeps_receive_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WalletApp::new(dir.path());
+        let created = app
+            .create(
+                dir.path(),
+                CreateWalletRequest {
+                    network: WalletNetwork::Testnet,
+                    electrum_url: None,
+                },
+                "correct horse battery staple",
+            )
+            .expect("create");
+        app.lock();
+        assert!(app.is_locked());
+
+        let peeked = WalletApp::watch_only_receive_address(dir.path()).expect("watch only");
+        assert_eq!(peeked, created.summary.receive_address);
+        assert!(app.is_locked(), "reading the public db must not unlock");
+    }
+
+    #[test]
+    fn failed_prefetch_stays_locked_and_leaves_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WalletApp::new(dir.path());
+        app.create(
+            dir.path(),
+            CreateWalletRequest {
+                network: WalletNetwork::Testnet,
+                electrum_url: Some("ssl://example.invalid:51002".into()),
+            },
+            "correct horse battery staple",
+        )
+        .expect("create");
+        point_at_invalid_electrum(&app);
+        app.lock();
+
+        let account = app.active_account_dir(dir.path()).expect("account dir");
+        let db_path = account.join(WALLET_DB_FILE);
+        let meta_path = account.join(WALLET_META_FILE);
+        let db_before = std::fs::read(&db_path).expect("db");
+        let meta_before = std::fs::read(&meta_path).expect("meta");
+        let meta = meta::read_meta(&account).expect("meta struct");
+        assert!(meta.needs_full_scan);
+
+        let err = app
+            .prefetch_transparent(dir.path())
+            .expect_err("invalid electrum host");
+        assert!(matches!(err, WalletError::Electrum(_)), "{err}");
+        assert!(app.is_locked());
+        assert!(
+            matches!(app.summary(), Err(WalletError::Locked)),
+            "prefetch must not leave a session loaded"
+        );
+        assert_eq!(std::fs::read(&db_path).expect("db after"), db_before);
+        assert_eq!(std::fs::read(&meta_path).expect("meta after"), meta_before);
+    }
 }

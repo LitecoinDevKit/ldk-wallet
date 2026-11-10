@@ -752,10 +752,7 @@ fn multi_wallet_accounts_diverge_and_switch() {
 
     let list = app.list_wallets(dir.path()).expect("list 2");
     assert_eq!(list.len(), 2);
-    assert_eq!(
-        list.iter().find(|w| w.is_active).map(|w| w.index),
-        Some(1)
-    );
+    assert_eq!(list.iter().find(|w| w.is_active).map(|w| w.index), Some(1));
 
     let back = app
         .switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
@@ -808,10 +805,7 @@ fn transfer_public_coin_preview_to_other_account() {
 
     // Source wallet stays active.
     let list = app.list_wallets(dir.path()).unwrap();
-    assert_eq!(
-        list.iter().find(|w| w.is_active).map(|w| w.index),
-        Some(0)
-    );
+    assert_eq!(list.iter().find(|w| w.is_active).map(|w| w.index), Some(0));
 }
 
 #[test]
@@ -849,10 +843,7 @@ fn transfer_rejects_active_account_and_frozen_coin() {
             },
         )
         .expect_err("self transfer");
-    assert!(
-        self_err.to_string().contains("active"),
-        "got {self_err}"
-    );
+    assert!(self_err.to_string().contains("active"), "got {self_err}");
 
     app.set_utxo_locked(SetUtxoLockedRequest {
         outpoint: outpoint.clone(),

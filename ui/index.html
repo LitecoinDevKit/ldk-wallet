@@ -69,6 +69,7 @@
             <button type="button" id="btn-unlock" class="btn btn-primary">Unlock</button>
             <button type="button" id="btn-wipe-unlock" class="btn btn-ghost">Reset wallet data</button>
           </div>
+          <p id="unlock-sync" class="hint" hidden></p>
           <p class="hint">
             Forgot your passphrase? The only recovery is reset plus restore from your mnemonic backup.
           </p>
@@ -482,7 +483,7 @@
 
                 <div class="hero-stats" id="hero-stats">
                   <div class="hero-stat">
-                    <span class="stat-label">Confirmed</span>
+                    <span class="stat-label">Public</span>
                     <span class="stat-value" id="balance-confirmed">—</span>
                   </div>
                   <div class="hero-stat" id="stat-mweb" hidden>
@@ -1209,6 +1210,15 @@
             <div class="card">
               <div class="sheet-head">
                 <h3>Activity</h3>
+              </div>
+              <div class="litvm-activity-note" id="litvm-tx-warning" hidden>
+                <div class="litvm-activity-copy">
+                  <p class="litvm-activity-title" id="litvm-tx-warning-title">Activity unavailable</p>
+                  <p class="hint" id="litvm-tx-warning-hint"></p>
+                </div>
+                <button type="button" id="btn-litvm-open-explorer" class="btn btn-ghost btn-sm" hidden>
+                  Open explorer
+                </button>
               </div>
               <ul id="litvm-tx-list" class="tx-list"></ul>
               <div class="empty" id="litvm-tx-empty">

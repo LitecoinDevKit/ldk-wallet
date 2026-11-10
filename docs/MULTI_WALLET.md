@@ -136,8 +136,10 @@ account under the same seed. Same chain only (no auto peg-in/out).
 - Destination address is revealed on the **target** account without switching the
   active wallet (preview peeks; broadcast commits).
 - The source wallet stays active after broadcast.
-- Disabled when frozen, unconfirmed/immature, fewer than two wallets, or (private)
-  an active self-spend job holds the coin.
+- Disabled when frozen, unconfirmed/immature, fewer than two wallets, or when an
+  active self-spend holds this coin. Send, Split, and Transfer stay disabled only
+  for that coin. Other coins can be broadcast while the hop is signed, waiting,
+  or unconfirmed.
 
 APIs: `preview_transfer_coin` / `transfer_coin`
 `{ chain, coin_id, to_account_index, fee_rate_sat_vb?, fee_sats }`.

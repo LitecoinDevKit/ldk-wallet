@@ -53,13 +53,23 @@ pub fn fetch_txlist(
         Err(e) => {
             return Ok(LitVmHistoryPage {
                 txs: Vec::new(),
-                warning: Some(format!(
-                    "Explorer index unavailable ({e}). Open the explorer for this address."
-                )),
+                warning: Some(history_unavailable(&e.to_string())),
             });
         }
     };
     parse_txlist(&body, address)
+}
+
+/// User-facing indexer failure. ureq's Display includes the request URL, which
+/// embeds the wallet address and blows out the activity pane.
+fn history_unavailable(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    let reason = if lower.contains("timed out") || lower.contains("timeout") {
+        "timed out"
+    } else {
+        "could not be reached"
+    };
+    format!("Explorer index {reason}. Open the explorer for this address.")
 }
 
 fn parse_txlist(body: &str, address: &str) -> Result<LitVmHistoryPage, LitVmError> {
@@ -186,6 +196,16 @@ mod tests {
         let page = parse_txlist(&row("1"), ME).unwrap();
         assert!(!page.txs[0].pending);
         assert!(!page.txs[0].failed);
+    }
+
+    #[test]
+    fn history_unavailable_drops_request_url() {
+        let raw = "https://liteforge.explorer.caldera.xyz/api?module=account&action=txlist&address=0xabc Network Error: timed out reading response";
+        let msg = history_unavailable(raw);
+        assert!(!msg.contains("http"));
+        assert!(!msg.contains("0xabc"));
+        assert!(msg.contains("timed out"));
+        assert!(msg.contains("explorer"));
     }
 
     #[test]

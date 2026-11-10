@@ -1320,7 +1320,6 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bdk_chain"
 version = "0.23.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a#ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a"
 dependencies = [
  "bdk_core",
  "litecoin",
@@ -1332,7 +1331,6 @@ dependencies = [
 [[package]]
 name = "bdk_core"
 version = "0.6.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a#ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a"
 dependencies = [
  "hashbrown 0.14.5",
  "litecoin",
@@ -1342,7 +1340,6 @@ dependencies = [
 [[package]]
 name = "bdk_electrum"
 version = "0.23.2"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a#ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a"
 dependencies = [
  "bdk_core",
  "electrum-client",
@@ -1351,7 +1348,6 @@ dependencies = [
 [[package]]
 name = "bdk_mweb"
 version = "0.1.0"
-source = "git+https://github.com/LitecoinDevKit/bdk.git?rev=ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a#ad95ccb2d2bc79ffabe19d7cfa4aed5f79cf665a"
 dependencies = [
  "bdk_core",
  "blake3",
@@ -1369,7 +1365,6 @@ dependencies = [
 [[package]]
 name = "bdk_wallet"
 version = "3.2.0-litecoin.0"
-source = "git+https://github.com/LitecoinDevKit/bdk_wallet.git?rev=92f710d4c1b179c1416122080870434987c1e86c#92f710d4c1b179c1416122080870434987c1e86c"
 dependencies = [
  "anyhow",
  "bdk_chain",
@@ -8366,3 +8361,15 @@ dependencies = [
  "syn 2.0.119",
  "winnow 1.0.4",
 ]
+
+[[patch.unused]]
+name = "bdk_esplora"
+version = "0.22.1"
+
+[[patch.unused]]
+name = "bdk_file_store"
+version = "0.22.0"
+
+[[patch.unused]]
+name = "bdk_testenv"
+version = "0.13.1"

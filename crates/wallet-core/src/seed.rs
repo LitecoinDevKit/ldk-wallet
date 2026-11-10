@@ -166,11 +166,9 @@ impl MasterSecret {
     pub fn litvm_account_secret(&self, account: u32) -> Result<[u8; 32], WalletError> {
         let master = self.master_xprv(Network::Bitcoin)?;
         let secp = Secp256k1::new();
-        let path: DerivationPath = format!("m/44'/60'/{account}'/0/0")
-            .parse()
-            .map_err(|e: bdk_wallet::bitcoin::bip32::Error| {
-                WalletError::Descriptor(e.to_string())
-            })?;
+        let path: DerivationPath = format!("m/44'/60'/{account}'/0/0").parse().map_err(
+            |e: bdk_wallet::bitcoin::bip32::Error| WalletError::Descriptor(e.to_string()),
+        )?;
         let child = master
             .derive_priv(&secp, &path)
             .map_err(|e| WalletError::Descriptor(e.to_string()))?;

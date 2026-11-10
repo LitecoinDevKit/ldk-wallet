@@ -586,6 +586,9 @@ const el = {
   litvmTxList: document.querySelector<HTMLElement>("#litvm-tx-list")!,
   litvmTxEmpty: document.querySelector<HTMLElement>("#litvm-tx-empty")!,
   litvmTxEmptyTitle: document.querySelector<HTMLElement>("#litvm-tx-empty-title")!,
+  litvmTxWarning: document.querySelector<HTMLElement>("#litvm-tx-warning")!,
+  litvmTxWarningHint: document.querySelector<HTMLElement>("#litvm-tx-warning-hint")!,
+  btnLitvmOpenExplorer: document.querySelector<HTMLButtonElement>("#btn-litvm-open-explorer")!,
   litvmNetworkBadge: document.querySelector<HTMLElement>("#litvm-network-badge")!,
   litvmStatusText: document.querySelector<HTMLElement>("#litvm-status-text")!,
   litvmSettings: document.querySelector<HTMLElement>("#litvm-settings")!,
@@ -679,6 +682,7 @@ const el = {
   onboardPassFill: document.querySelector<HTMLElement>("#onboard-pass-fill")!,
   onboardPassLabel: document.querySelector<HTMLElement>("#onboard-pass-label")!,
   unlockPassphrase: document.querySelector<HTMLInputElement>("#unlock-passphrase")!,
+  unlockSync: document.querySelector<HTMLElement>("#unlock-sync")!,
   migratePassphrase: document.querySelector<HTMLInputElement>("#migrate-passphrase")!,
   migratePassphrase2: document.querySelector<HTMLInputElement>("#migrate-passphrase2")!,
   migratePassMeter: document.querySelector<HTMLElement>("#migrate-pass-meter")!,
@@ -3514,8 +3518,16 @@ function renderCombined(c: CombinedSummary) {
   }
   el.balanceMweb.textContent = mwebText;
 
+  // Wallet-wide spendable: public confirmed + trusted pending + mature private.
+  // Maturing peg-ins, unconfirmed private, untrusted public, and immature coinbase stay out.
+  const spendable =
+    c.transparent.confirmed_sats +
+    c.transparent.trusted_pending_sats +
+    c.mweb_confirmed_sats;
   const detailParts: string[] = [];
-  detailParts.push(`Spendable ${formatAmount(c.mweb_confirmed_sats)}`);
+  if (spendable < grandTotal) {
+    detailParts.push(`Spendable ${formatAmount(spendable)}`);
+  }
   if (c.mweb_immature_sats > 0) {
     detailParts.push(
       `Maturing ${formatAmount(c.mweb_immature_sats)} (available after ~${MWEB_PEGIN_MATURITY_BLOCKS} confirmations)`,
@@ -3524,12 +3536,8 @@ function renderCombined(c: CombinedSummary) {
   if (c.mweb_unconfirmed_sats > 0) {
     detailParts.push(`Unconfirmed private ${formatAmount(c.mweb_unconfirmed_sats)}`);
   }
-  const showDetail =
-    c.mweb_immature_sats > 0 ||
-    c.mweb_unconfirmed_sats > 0 ||
-    c.mweb_total_sats > 0;
-  el.balanceMwebDetail.hidden = !showDetail;
-  el.balanceMwebDetail.textContent = showDetail ? detailParts.join(" · ") : "";
+  el.balanceMwebDetail.hidden = detailParts.length === 0;
+  el.balanceMwebDetail.textContent = detailParts.join(" · ");
 
   el.mwebStatus.hidden = false;
   el.mwebStatus.textContent = c.mweb_status;
@@ -4254,7 +4262,7 @@ function stopMwebProgressPolling() {
 function startAutoSync() {
   stopAutoSync();
   autoSyncTimer = window.setInterval(() => {
-    if (currentPhase !== "ready" || syncing || sending) return;
+    if (currentPhase !== "ready" || syncing || sending || coinBroadcastBusy()) return;
     void runSync({ quiet: true });
   }, AUTO_SYNC_MS);
   spotPriceTimer = window.setInterval(() => {
@@ -4454,6 +4462,7 @@ async function boot() {
     const locked = await invoke<boolean>("wallet_is_locked");
     if (locked) {
       setPhase("unlock");
+      void startTransparentPrefetch();
       return;
     }
     await enterReady();
@@ -4472,14 +4481,14 @@ async function enterReady(opts?: { sync?: boolean; summary?: WalletSummary }) {
   // flip to ready before any further IPC (avoids a second load_wallet gate).
   const s = opts?.summary ?? (await invoke<WalletSummary>("load_wallet"));
   renderSummary(s);
-  // Update the switcher label before slower refreshes so a wallet switch is
-  // visible even if combined history/LitVM calls lag or fail.
-  await refreshWalletSwitcher();
   // Legacy installs that already hold funds skip the first-receive modal.
   if (lastTotalSats > 0 && !isFirstReceiveSeen()) setFirstReceiveSeen(true);
   lastPendingSats = transparentPendingSats(s);
+  // Flip the shell as soon as the summary is in hand. Switcher, history, and
+  // LitVM fill in after so a slow IPC does not hold the unlock screen.
   setPhase("ready");
   setView("balance");
+  await refreshWalletSwitcher();
   await refreshCombined();
   await refreshHistory();
   await loadSettings();
@@ -4759,16 +4768,54 @@ el.btnWipeUnlock.addEventListener("click", () =>
   void wipeAndOnboard().catch((e) => setError(String(e))),
 );
 
-el.btnUnlock.addEventListener("click", async () => {
+let unlockBusy = false;
+
+async function submitUnlock() {
+  if (unlockBusy) return;
+  unlockBusy = true;
+  el.btnUnlock.disabled = true;
   setError(null);
+  showLoading("Unlocking…");
   try {
     await invoke("unlock_wallet", {
       req: { passphrase: el.unlockPassphrase.value },
     });
     el.unlockPassphrase.value = "";
-    await enterReady();
+    setLoadingLabel("Opening wallet…");
+    const summary = await invoke<WalletSummary>("load_wallet");
+    hideLoading();
+    await enterReady({ summary });
   } catch (e) {
+    hideLoading();
     setError(String(e));
+  } finally {
+    unlockBusy = false;
+    el.btnUnlock.disabled = false;
+  }
+}
+
+/** Electrum-only sync while the passphrase screen is up. Failures stay quiet. */
+async function startTransparentPrefetch() {
+  el.unlockSync.hidden = false;
+  el.unlockSync.textContent = "Syncing chain…";
+  try {
+    const synced = await invoke<boolean>("prefetch_transparent_sync");
+    if (currentPhase !== "unlock") return;
+    if (!synced) {
+      el.unlockSync.hidden = true;
+      return;
+    }
+    el.unlockSync.textContent = "Chain synced. MWEB syncs after unlock.";
+  } catch {
+    if (currentPhase === "unlock") el.unlockSync.hidden = true;
+  }
+}
+
+el.btnUnlock.addEventListener("click", () => void submitUnlock());
+el.unlockPassphrase.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void submitUnlock();
   }
 });
 
@@ -4796,6 +4843,12 @@ el.btnMigrate.addEventListener("click", async () => {
 });
 
 async function runSync(opts: { quiet: boolean }): Promise<boolean> {
+  if (coinBroadcastBusy()) {
+    if (!opts.quiet) {
+      setStatus("Sync will start after the coin broadcast finishes.", "info");
+    }
+    return false;
+  }
   if (syncing || sending) return false;
   syncing = true;
   if (!opts.quiet) setError(null);
@@ -4878,6 +4931,7 @@ async function lockWallet(statusMessage = "Wallet locked.") {
   updateBusyUi();
   try {
     await invoke("lock_wallet");
+    void startTransparentPrefetch();
   } catch (e) {
     setError(String(e));
   }
@@ -5524,7 +5578,7 @@ function renderCoinsList() {
   for (const utxo of utxoCache) {
     if (utxo.locked) frozen += 1;
     const expanded = publicCoinExpanded.has(utxo.outpoint);
-    const spendPending = isCoinSpendPending("public", utxo.outpoint);
+    const spendPending = pendingCoinSpend("public", utxo.outpoint);
     const li = document.createElement("li");
     li.dataset.outpoint = utxo.outpoint;
     const rowClass = ["utxo-row"];
@@ -5542,7 +5596,7 @@ function renderCoinsList() {
     if (spendPending) {
       const pill = document.createElement("span");
       pill.className = "pill pending";
-      pill.textContent = coinSpendPending!.pill;
+      pill.textContent = spendPending.pill;
       amtRow.append(pill);
     } else if (utxo.locked) {
       const pill = document.createElement("span");
@@ -5558,7 +5612,7 @@ function renderCoinsList() {
         : `${utxo.confirmations.toLocaleString("en-US")} conf`;
     const status = document.createElement("span");
     status.className = "utxo-status";
-    status.textContent = spendPending ? coinSpendPending!.status : `${kind} · ${conf}`;
+    status.textContent = spendPending ? spendPending.status : `${kind} · ${conf}`;
     main.append(amtRow, status);
     li.append(main);
 
@@ -5744,34 +5798,76 @@ const CHURN_BANNER_DISMISSED_KEY = "ltc-churn-banner-dismissed";
 let churnPending: "retry" | "cancel" | null = null;
 
 /**
- * In-flight coin spend (transfer or private send). Marks matching Coins rows
- * pending without a blocking full-screen overlay during multi-peer broadcast.
+ * In-flight transfer, split, or private send, keyed by coin id. Several coins
+ * can broadcast at once. Each row shows its own pending state. A full sync
+ * waits until none of these, and no self-spend start, still hold the wallet.
  */
-let coinSpendPending: {
+type CoinSpendFlight = {
+  chain: SplitChain;
+  pill: string;
+  status: string;
+};
+
+const coinSpendFlights = new Map<string, CoinSpendFlight>();
+let coinBroadcastSettle = false;
+let coinBroadcastSettleAgain = false;
+
+function coinBroadcastBusy(): boolean {
+  return coinSpendFlights.size > 0 || churnStartingId != null;
+}
+
+function pendingCoinSpend(chain: SplitChain, id: string): CoinSpendFlight | undefined {
+  const row = coinSpendFlights.get(id);
+  return row && row.chain === chain ? row : undefined;
+}
+
+function beginCoinSpendPending(pending: {
   chain: SplitChain;
   ids: string[];
   pill: string;
   status: string;
-} | null = null;
-
-function isCoinSpendPending(chain: SplitChain, id: string): boolean {
-  return (
-    !!coinSpendPending &&
-    coinSpendPending.chain === chain &&
-    coinSpendPending.ids.includes(id)
-  );
-}
-
-function beginCoinSpendPending(pending: NonNullable<typeof coinSpendPending>) {
-  coinSpendPending = pending;
+}) {
+  for (const id of pending.ids) {
+    if (!id) continue;
+    coinSpendFlights.set(id, {
+      chain: pending.chain,
+      pill: pending.pill,
+      status: pending.status,
+    });
+  }
   renderCoinsList();
   renderMwebCoinsList();
 }
 
-function endCoinSpendPending() {
-  coinSpendPending = null;
+function endCoinSpendPending(ids: string[], settle = false) {
+  for (const id of ids) coinSpendFlights.delete(id);
   renderCoinsList();
   renderMwebCoinsList();
+  if (settle) void settleCoinBroadcasts();
+}
+
+/** Refresh local coins, then sync once, after every coin broadcast has returned. */
+async function settleCoinBroadcasts() {
+  if (coinBroadcastBusy() || syncing || sending) return;
+  if (coinBroadcastSettle) {
+    coinBroadcastSettleAgain = true;
+    return;
+  }
+  coinBroadcastSettle = true;
+  try {
+    await refreshUtxos();
+    await refreshCombined();
+    await refreshHistory();
+    if (!coinBroadcastBusy() && !syncing && !sending) {
+      await runSync({ quiet: true });
+    }
+  } finally {
+    coinBroadcastSettle = false;
+    if (coinBroadcastSettleAgain) {
+      coinBroadcastSettleAgain = false;
+      void settleCoinBroadcasts();
+    }
+  }
 }
 let churnActionError: string | null = null;
 let churnSawActive = false;
@@ -6056,8 +6152,9 @@ type RowChip = { label: string; className: string };
 
 /** Exactly one status chip for the default Private row, or none when clean mature. */
 function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
-  if (isCoinSpendPending("private", coin.output_id)) {
-    return { label: coinSpendPending!.pill, className: "pill pending" };
+  const spendPending = pendingCoinSpend("private", coin.output_id);
+  if (spendPending) {
+    return { label: spendPending.pill, className: "pill pending" };
   }
   const pill = churnPill(coin);
   if (pill) return { label: pill.label, className: churnPillClass(pill.kind) };
@@ -6397,8 +6494,8 @@ function renderMwebCoinsList() {
     if (!coin.mature) immature += 1;
     if (userFrozen(coin)) frozenCount += 1;
     if (churnNeedsAttention(coin)) attentionCount += 1;
-    const spendPending = isCoinSpendPending("private", coin.output_id);
-    const jobHolds = churnPhaseActive(coin.churn_phase) || spendPending;
+    const spendPending = pendingCoinSpend("private", coin.output_id);
+    const jobHolds = churnPhaseActive(coin.churn_phase) || !!spendPending;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const tied = pegInStillTied(coin);
     const expanded = mwebCoinExpanded.has(coin.output_id);
@@ -6430,7 +6527,7 @@ function renderMwebCoinsList() {
       amtRow.append(pill);
     }
 
-    const statusLine = spendPending ? coinSpendPending!.status : mwebRowStatusLine(coin);
+    const statusLine = spendPending ? spendPending.status : mwebRowStatusLine(coin);
     const status = document.createElement("span");
     status.className = "utxo-status";
     status.hidden = !statusLine;
@@ -6839,6 +6936,12 @@ async function openChurnModal(coin: MwebUtxoRecord) {
   churnStartingCoverMin = coverMin;
   churnSettledId = null;
   churnSettledNeedsScroll = false;
+  beginCoinSpendPending({
+    chain: "private",
+    ids: [coin.output_id],
+    pill: "Broadcasting",
+    status: "Signing self-spend…",
+  });
   stampChurnStarting();
   renderMwebCoinsList();
   let startError: unknown = null;
@@ -6855,9 +6958,14 @@ async function openChurnModal(coin: MwebUtxoRecord) {
     startError = err;
   } finally {
     churnStartingId = null;
-    await refreshUtxos();
+    endCoinSpendPending([coin.output_id]);
   }
-  if (startError && !activeChurnCoin()) setStatus(String(startError), "error");
+  if (startError) {
+    await refreshUtxos();
+    if (!activeChurnCoin()) setStatus(String(startError), "error");
+    return;
+  }
+  void settleCoinBroadcasts();
 }
 
 const sendCoinPanel: CoinControlPanel = {
@@ -7363,31 +7471,32 @@ async function openTransferModal(coin: {
           }
         }
       },
-      actions: [
-        { id: "cancel", label: "Cancel", kind: "ghost" },
-        {
-          id: "transfer",
-          label: `Transfer to ${destName}`,
-          kind: "primary",
-        },
-      ],
+      actions: shown
+        ? [
+            { id: "cancel", label: "Cancel", kind: "ghost" },
+            {
+              id: "transfer",
+              label: `Transfer to ${destName}`,
+              kind: "primary",
+            },
+          ]
+        : [{ id: "cancel", label: "Cancel", kind: "ghost" }],
     });
 
     if (action === "repreview") continue;
     if (action !== "transfer" || !shown) return;
 
-    if (syncing || sending) return;
-    sending = true;
+    const privateTransfer = coin.chain === "private";
     beginCoinSpendPending({
       chain: coin.chain,
       ids: [coin.id],
       pill: "Broadcasting",
       status: `Broadcasting transfer to ${shown.to_wallet_name}…`,
     });
-    updateBusyUi();
     setStatus(`Broadcasting transfer to ${shown.to_wallet_name}…`, "info");
+    let result: TransferCoinResult;
     try {
-      const result = await invoke<TransferCoinResult>("transfer_coin", {
+      result = await invoke<TransferCoinResult>("transfer_coin", {
         req: {
           chain: coin.chain,
           coin_id: coin.id,
@@ -7396,22 +7505,20 @@ async function openTransferModal(coin: {
           fee_sats: 0,
         },
       });
-      setStatus(
-        `Transferred to ${shown.to_wallet_name}. ${truncateId(result.txid)}`,
-        "success",
-      );
-      await refreshUtxos();
-      await refreshCombined();
-      return;
     } catch (err) {
-      setStatus(String(err), "error");
-      // Re-open the sheet so the user can retry without rebuilding the selection.
+      endCoinSpendPending([coin.id]);
+      await showBroadcastFailure(err);
       continue;
-    } finally {
-      endCoinSpendPending();
-      sending = false;
-      updateBusyUi();
     }
+    endCoinSpendPending([coin.id], true);
+    setStatus(
+      privateTransfer
+        ? `Transferred to ${shown.to_wallet_name}. Kernel ${truncateId(result.txid)}. Switch to that wallet and sync to see the coin.`
+        : `Transferred to ${shown.to_wallet_name}. ${truncateId(result.txid)}. Switch to that wallet and sync to see the coin.`,
+      "success",
+    );
+    void persistTxLabel(result.txid, `Transfer to ${shown.to_wallet_name}`);
+    return;
   }
 }
 
@@ -7721,7 +7828,13 @@ async function openSplitModal(coin: {
     if (!confirmed) continue;
 
     const feeRate = preview.fee_rate_sat_vb || undefined;
-    showLoading("Broadcasting split…");
+    beginCoinSpendPending({
+      chain: coin.chain,
+      ids: [coin.id],
+      pill: "Broadcasting",
+      status: "Broadcasting split…",
+    });
+    setStatus("Broadcasting split…", "info");
     try {
       const splitResult = await invoke<SplitResult>("split_coin", {
         req: {
@@ -7733,26 +7846,14 @@ async function openSplitModal(coin: {
           fee_sats: preview.fee_sats,
         },
       });
-      hideLoading();
-      void runSync({ quiet: false });
-      await refreshUtxos();
-      await showResult({
-        title: "Coin split",
-        message: `Created ${splitResult.output_count} outputs in this wallet.`,
-        rows: [
-          ["Network fee", formatAmountPlain(splitResult.fee_sats)],
-          [coin.chain === "public" ? "Transaction ID" : "Kernel ID", splitResult.txid, true],
-        ],
-        copy: {
-          value: splitResult.txid,
-          label: "Copy ID",
-          toast: "ID copied.",
-        },
-        explorerTxid: coin.chain === "public" ? splitResult.txid : undefined,
-      });
+      endCoinSpendPending([coin.id], true);
+      setStatus(
+        `Split into ${splitResult.output_count} outputs. ${truncateId(splitResult.txid)}`,
+        "success",
+      );
       return;
     } catch (e) {
-      hideLoading();
+      endCoinSpendPending([coin.id]);
       setStatus(String(e), "error");
       continue;
     }
@@ -8190,14 +8291,37 @@ async function refreshLitvmHistory() {
   }
 }
 
+function litvmActivityHint(warning: string): string {
+  const text = warning.toLowerCase();
+  if (text.includes("timed out") || text.includes("timeout")) {
+    return "The explorer timed out, so recent transfers aren't listed here.";
+  }
+  if (text.includes("unexpected")) {
+    return "The explorer returned a response this wallet couldn't read.";
+  }
+  if (text.includes("just sent")) {
+    return "The explorer index is unavailable. A transfer you just sent may not show up yet.";
+  }
+  return "The explorer index is unavailable, so recent transfers aren't listed here.";
+}
+
+function litvmAddressExplorerUrl(): string | null {
+  const explorer = lastLitvmSummary?.explorer?.replace(/\/$/, "") ?? "";
+  const address = lastLitvmSummary?.address?.trim() ?? "";
+  if (!explorer || !address || address === "—") return null;
+  return `${explorer}/address/${encodeURIComponent(address)}`;
+}
+
 function renderLitvmHistory() {
   el.litvmTxList.textContent = "";
   const empty = litvmHistory.length === 0;
-  if (empty) {
-    el.litvmTxEmpty.hidden = false;
-    el.litvmTxEmptyTitle.textContent = litvmHistoryWarning || "No LitVM transactions yet.";
-  } else {
-    el.litvmTxEmpty.hidden = true;
+  const warning = litvmHistoryWarning?.trim() || "";
+  el.litvmTxEmpty.hidden = !empty || warning.length > 0;
+  el.litvmTxEmptyTitle.textContent = "No LitVM transactions yet.";
+  el.litvmTxWarning.hidden = warning.length === 0;
+  if (warning) {
+    el.litvmTxWarningHint.textContent = litvmActivityHint(warning);
+    el.btnLitvmOpenExplorer.hidden = litvmAddressExplorerUrl() == null;
   }
   for (const tx of litvmHistory) {
     const dir = tx.incoming ? "in" : "out";
@@ -8334,6 +8458,11 @@ el.btnCopyLitvm.addEventListener("click", () => {
 });
 el.btnLitvmFaucet.addEventListener("click", () => {
   void invoke("open_explorer_url", { url: litvmFaucetUrl });
+});
+el.btnLitvmOpenExplorer.addEventListener("click", () => {
+  const url = litvmAddressExplorerUrl();
+  if (!url) return;
+  void invoke("open_explorer_url", { url }).catch((e) => setStatus(String(e), "error"));
 });
 el.litvmSendAddress.addEventListener("input", updateLitvmAddressHint);
 el.btnTestLitvmRpc.addEventListener("click", async () => {
@@ -8925,7 +9054,7 @@ el.btnMwebSend.addEventListener("click", async () => {
     await showBroadcastFailure(e);
     return;
   } finally {
-    endCoinSpendPending();
+    endCoinSpendPending(pendingIds);
     sending = false;
     updateBusyUi();
   }

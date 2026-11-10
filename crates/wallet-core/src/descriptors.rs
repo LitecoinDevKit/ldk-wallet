@@ -56,11 +56,7 @@ pub fn create_params(
     let xprv = secret.master_xprv(bdk_network)?;
     let external = bip84_keychain_path(network, account, KeychainKind::External)?;
     let internal = bip84_keychain_path(network, account, KeychainKind::Internal)?;
-    Ok(Wallet::create(
-        P2Wpkh((xprv, external)),
-        P2Wpkh((xprv, internal)),
-    )
-    .network(bdk_network))
+    Ok(Wallet::create(P2Wpkh((xprv, external)), P2Wpkh((xprv, internal))).network(bdk_network))
 }
 
 /// Build [`LoadParams`] that check the BIP84 descriptors for `account`.

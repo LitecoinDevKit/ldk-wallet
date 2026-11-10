@@ -1488,6 +1488,110 @@ mod tests {
         }
     }
 
+    /// A signed self-spend holds only its own coin. Split and transfer of the
+    /// others still resolve. A second self-spend does not.
+    #[test]
+    fn other_coins_stay_spendable_while_a_self_spend_is_unbroadcast() {
+        use crate::churn::{self, StartCheck};
+        use crate::dto::ChurnPhase;
+        use crate::split::{self, PlanParams};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = crate::seed::MasterSecret::parse(
+            &crate::descriptors::generate_mnemonic().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut runtime = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            WalletNetwork::Testnet,
+            crate::dto::MwebScheme::default().to_master_scheme(),
+            0,
+            None,
+        )
+        .unwrap();
+        let mut coin_a = coin(1, Some(100), Some(1));
+        let mut coin_b = coin(2, Some(100), Some(2));
+        let mut coin_c = coin(3, Some(100), Some(3));
+        for coin in [&mut coin_a, &mut coin_b, &mut coin_c] {
+            coin.amount = 2_000_000;
+        }
+        runtime.store.db_mut().insert(coin_a);
+        runtime.store.db_mut().insert(coin_b);
+        runtime.store.db_mut().insert(coin_c);
+
+        let id_a = id_hex(1);
+        let id_b = id_hex(2);
+        let id_c = id_hex(3);
+        let mut job = churn::new_job(&id_a, false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::WaitingForCover;
+        churn::write_job(dir.path(), &job).unwrap();
+        mweb_frozen::set_locked(dir.path(), &id_a, true).unwrap();
+
+        let frozen = mweb_frozen::read_ids(dir.path()).unwrap().ids;
+        let split_coin =
+            select_split_coin(runtime.store.db(), &id_b, TIP, &frozen).expect("split coin B");
+        let preview = split::plan_split(&PlanParams {
+            input_sats: split_coin.amount,
+            equal_count: Some(2),
+            amounts: vec![],
+            fee_sats: 50_000,
+            fee_rate_sat_vb: 0,
+            public: false,
+            mweb_fee: 50_000,
+        })
+        .expect("plan split of B");
+        assert_eq!(preview.outputs.len(), 2);
+
+        let transfer = resolve_spend_coins(
+            runtime.store.db(),
+            TIP,
+            &frozen,
+            Some(&[id_c.clone()]),
+            2_000_000,
+            "spending",
+        )
+        .expect("transfer coin C");
+        assert_eq!(transfer.len(), 1);
+        assert_eq!(transfer[0].output_id, [3; 32]);
+
+        let held = select_split_coin(runtime.store.db(), &id_a, TIP, &frozen).unwrap_err();
+        assert!(
+            held.to_string().to_lowercase().contains("frozen"),
+            "coin A should stay held, got {held}"
+        );
+
+        let second = churn::check_start(&StartCheck {
+            mature: true,
+            frozen: false,
+            amount_sats: 2_000_000,
+            fee_sats: 50_000,
+            job_active: churn::read_job(dir.path())
+                .unwrap()
+                .is_some_and(|job| job.phase.is_active()),
+            target_depth: 1,
+        })
+        .unwrap_err();
+        assert!(second.to_string().contains("already in progress"));
+
+        assert!(churn::held_by_active_job(dir.path(), &id_a).unwrap());
+        assert!(!churn::held_by_active_job(dir.path(), &id_b).unwrap());
+        assert!(!churn::held_by_active_job(dir.path(), &id_c).unwrap());
+
+        let rows = list_mweb_unspent(&runtime, TIP, dir.path());
+        let phase = |id: &str| {
+            rows.iter()
+                .find(|row| row.output_id == id)
+                .and_then(|row| row.churn_phase)
+        };
+        assert_eq!(phase(&id_a), Some(ChurnPhase::WaitingForCover));
+        assert_eq!(phase(&id_b), None);
+        assert_eq!(phase(&id_c), None);
+        let job = churn::read_job(dir.path()).unwrap().unwrap();
+        assert_eq!(job.current_output_id, id_a);
+    }
+
     #[test]
     fn already_resolved_entry_is_not_rewritten() {
         let mut db = MwebCoinDatabase::default();
@@ -1511,7 +1615,8 @@ mod tests {
 
         // Start plaintext (legacy wallet), write a coin + history entry.
         let mut legacy =
-            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None).unwrap();
+            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None)
+                .unwrap();
         legacy
             .store
             .db_mut()
@@ -1581,7 +1686,8 @@ mod tests {
         .unwrap();
         let scheme = crate::dto::MwebScheme::default().to_master_scheme();
         let mut runtime =
-            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None).unwrap();
+            MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None)
+                .unwrap();
         let coin = persistable_coin(1, Some(100), Some(4));
         let id = coin.output_id;
         runtime.store.db_mut().insert(coin);
@@ -2189,7 +2295,7 @@ pub(crate) fn apply_pegin_transparent_spend(
 /// P2P goes first: a peer relays the tx through the Dandelion++ stem phase,
 /// while litecoind RPC submits it as our own and gives up that origin privacy.
 /// RPC is the fallback when no peer accepts it.
-fn broadcast_mweb_tx(
+pub(crate) fn broadcast_mweb_tx(
     tx: &bdk_wallet::bitcoin::Transaction,
     rpc_url: Option<&str>,
     peers: &[String],
@@ -2280,15 +2386,41 @@ fn broadcast_via_p2p(
     )))
 }
 
-pub fn mweb_send(
+/// Signed private send, not yet broadcast and not yet applied to the coin set.
+///
+/// The caller broadcasts outside the wallet lock, then [`apply_signed_mweb_send`].
+pub struct SignedMwebSend {
+    pub tx: Transaction,
+    pub wtxid: String,
+    pub fee_sats: u64,
+    pub amount_sats: u64,
+    spent_ids: Vec<[u8; 32]>,
+    change: Option<bdk_mweb::MwebCoin>,
+}
+
+impl SignedMwebSend {
+    /// Output ids this send spends. Freeze them until broadcast finishes.
+    pub fn input_ids(&self) -> Vec<String> {
+        self.spent_ids.iter().map(hex::encode).collect()
+    }
+
+    pub fn result(&self) -> MwebBroadcastResult {
+        MwebBroadcastResult {
+            wtxid: self.wtxid.clone(),
+            fee_sats: self.fee_sats,
+            addresses: Vec::new(),
+        }
+    }
+}
+
+/// Build and sign a private send. Does not broadcast or mark coins spent.
+pub fn sign_mweb_send(
     wallet: &PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
     data_dir: &Path,
-    rpc_url: Option<&str>,
-    peers: &[String],
-    req: MwebSendRequest,
+    req: &MwebSendRequest,
     network: WalletNetwork,
-) -> Result<MwebBroadcastResult, WalletError> {
+) -> Result<SignedMwebSend, WalletError> {
     let net = network.to_bitcoin_network();
     let dest = Address::from_str(&req.address)
         .map_err(|e| WalletError::InvalidAddress(e.to_string()))?
@@ -2325,32 +2457,41 @@ pub fn mweb_send(
     let (tx, change) = wallet
         .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
-    let wtxid = tx.compute_wtxid().to_string();
-    for id in &spent_ids {
+    Ok(SignedMwebSend {
+        wtxid: tx.compute_wtxid().to_string(),
+        tx,
+        fee_sats: req.fee_sats,
+        amount_sats: req.amount_sats,
+        spent_ids,
+        change,
+    })
+}
+
+/// Mark the spent coins, remember change, and record history. Does not broadcast.
+pub fn apply_signed_mweb_send(
+    runtime: &mut MwebRuntime,
+    signed: &SignedMwebSend,
+) -> MwebBroadcastResult {
+    for id in &signed.spent_ids {
         let _ = runtime.store.db_mut().mark_spent(id);
     }
     let mut output_ids = Vec::new();
-    if let Some(mut change) = change {
+    if let Some(mut change) = signed.change.clone() {
         change.block_height = None;
         output_ids.push(hex::encode(change.output_id));
         runtime.store.db_mut().insert(change);
     }
     runtime.history.record(MwebHistoryEntry {
-        id: wtxid.clone(),
+        id: signed.wtxid.clone(),
         kind: TxKind::MwebSend,
-        net_sats: -((req.amount_sats.saturating_add(req.fee_sats)) as i64),
-        fee_sats: Some(req.fee_sats),
+        net_sats: -((signed.amount_sats.saturating_add(signed.fee_sats)) as i64),
+        fee_sats: Some(signed.fee_sats),
         timestamp: now_ts(),
         output_ids,
-        input_ids: spent_ids.iter().map(hex::encode).collect(),
+        input_ids: signed.input_ids(),
         confirmed_height: None,
     });
-    Ok(MwebBroadcastResult {
-        wtxid,
-        fee_sats: req.fee_sats,
-        addresses: Vec::new(),
-    })
+    signed.result()
 }
 
 /// List unspent MWEB coins (including immature / unconfirmed) for the Coins screen.
@@ -2965,18 +3106,41 @@ fn owned_coin_from_staged(
     })
 }
 
-/// 1-in-N-out MWEB self-split. Persists `receive_index` before broadcast.
-pub fn mweb_split(
+/// Signed private split, not yet broadcast and not yet applied to the coin set.
+///
+/// The receive index is already persisted. The caller broadcasts outside the
+/// wallet lock, then [`apply_signed_mweb_split`].
+pub struct SignedMwebSplit {
+    pub tx: Transaction,
+    pub wtxid: String,
+    pub fee_sats: u64,
+    pub output_count: u32,
+    /// Output id of the coin this split spends. Frozen while the broadcast runs.
+    pub input_id: String,
+    spent_ids: Vec<[u8; 32]>,
+    outputs: Vec<bdk_mweb::MwebCoin>,
+}
+
+impl SignedMwebSplit {
+    pub fn result(&self) -> SplitResult {
+        SplitResult {
+            txid: self.wtxid.clone(),
+            fee_sats: self.fee_sats,
+            output_count: self.output_count,
+        }
+    }
+}
+
+/// 1-in-N-out MWEB self-split. Persists `receive_index` before the caller broadcasts.
+pub fn sign_mweb_split(
     wallet: &PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
     data_dir: &Path,
-    rpc_url: Option<&str>,
-    peers: &[String],
     output_id_hex: &str,
     recipient_amounts: &[u64],
     fee_sats: u64,
     network: WalletNetwork,
-) -> Result<SplitResult, WalletError> {
+) -> Result<SignedMwebSplit, WalletError> {
     let tip = wallet.latest_checkpoint().height();
     let frozen = mweb_frozen::read_ids(data_dir)?.ids;
     let coin = select_split_coin(runtime.store.db(), output_id_hex, tip, &frozen)?;
@@ -3023,12 +3187,7 @@ pub fn mweb_split(
     let (tx, _change) = wallet
         .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
-    let wtxid = tx.compute_wtxid().to_string();
-    for id in &spent_ids {
-        let _ = runtime.store.db_mut().mark_spent(id);
-    }
-    let mut output_ids = Vec::new();
+    let mut outputs = Vec::with_capacity(funded.staged_outputs.len());
     let mut recip_i = 0usize;
     for staged in &funded.staged_outputs {
         let index = if let Some(ci) = staged.change_index {
@@ -3042,24 +3201,40 @@ pub fn mweb_split(
         };
         let mut owned = owned_coin_from_staged(staged, index, &runtime.keys, &runtime.secp)?;
         owned.block_height = None;
-        output_ids.push(hex::encode(owned.output_id));
-        runtime.store.db_mut().insert(owned);
+        outputs.push(owned);
     }
-    runtime.history.record(MwebHistoryEntry {
-        id: wtxid.clone(),
-        kind: TxKind::MwebSplit,
-        net_sats: -(fee_sats as i64),
-        fee_sats: Some(fee_sats),
-        timestamp: now_ts(),
-        output_ids,
-        input_ids: spent_ids.iter().map(hex::encode).collect(),
-        confirmed_height: None,
-    });
-    Ok(SplitResult {
-        txid: wtxid,
+    let wtxid = tx.compute_wtxid().to_string();
+    Ok(SignedMwebSplit {
+        tx,
+        wtxid,
         fee_sats,
         output_count: recipient_amounts.len() as u32,
+        input_id: hex::encode(spent_ids[0]),
+        spent_ids,
+        outputs,
     })
+}
+
+/// Mark the spent coin and remember the new outputs. Does not broadcast.
+pub fn apply_signed_mweb_split(runtime: &mut MwebRuntime, signed: &SignedMwebSplit) {
+    for id in &signed.spent_ids {
+        let _ = runtime.store.db_mut().mark_spent(id);
+    }
+    let mut output_ids = Vec::with_capacity(signed.outputs.len());
+    for coin in &signed.outputs {
+        output_ids.push(hex::encode(coin.output_id));
+        runtime.store.db_mut().insert(coin.clone());
+    }
+    runtime.history.record(MwebHistoryEntry {
+        id: signed.wtxid.clone(),
+        kind: TxKind::MwebSplit,
+        net_sats: -(signed.fee_sats as i64),
+        fee_sats: Some(signed.fee_sats),
+        timestamp: now_ts(),
+        output_ids,
+        input_ids: signed.spent_ids.iter().map(hex::encode).collect(),
+        confirmed_height: None,
+    });
 }
 
 /// One signed 1-in-1 self-spend, not yet broadcast.

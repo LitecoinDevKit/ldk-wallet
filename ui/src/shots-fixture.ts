@@ -445,6 +445,7 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
   ],
   create_wallet_account: () => combined().transparent,
   switch_wallet: () => combined().transparent,
+  warm_wallets: () => null,
   rename_wallet: () => [
     { index: 0, name: "Personal", is_active: true },
     { index: 1, name: "Tip jar", is_active: false },

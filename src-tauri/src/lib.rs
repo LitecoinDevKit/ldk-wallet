@@ -30,6 +30,23 @@ pub(crate) fn map_err(err: wallet_core::WalletError) -> String {
     err.to_string()
 }
 
+/// LitVM open builds a tokio runtime. Account switches return the wallet
+/// summary first and attach in the background.
+fn spawn_litvm_attach(app: &AppHandle, state: &Arc<WalletApp>) {
+    #[cfg(feature = "litvm")]
+    {
+        let app = app.clone();
+        let state = Arc::clone(state);
+        tauri::async_runtime::spawn(async move {
+            let _ = litvm::attach_from_app(&app, &state).await;
+        });
+    }
+    #[cfg(not(feature = "litvm"))]
+    {
+        let _ = (app, state);
+    }
+}
+
 #[tauri::command]
 async fn wallet_exists(
     app: AppHandle,
@@ -191,10 +208,7 @@ async fn create_wallet_account(
     .await
     .map_err(|e| e.to_string())?;
     if result.is_ok() {
-        #[cfg(feature = "litvm")]
-        {
-            let _ = litvm::attach_from_app(&app, &state).await;
-        }
+        spawn_litvm_attach(&app, &state);
     }
     result
 }
@@ -213,12 +227,18 @@ async fn switch_wallet(
     .await
     .map_err(|e| e.to_string())?;
     if result.is_ok() {
-        #[cfg(feature = "litvm")]
-        {
-            let _ = litvm::attach_from_app(&app, &state).await;
-        }
+        spawn_litvm_attach(&app, &state);
     }
     result
+}
+
+#[tauri::command]
+async fn warm_wallets(app: AppHandle, state: State<'_, Arc<WalletApp>>) -> Result<(), String> {
+    let dir = data_dir(&app)?;
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.warm_other_accounts(&dir).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -248,10 +268,7 @@ async fn delete_wallet_account(
     .await
     .map_err(|e| e.to_string())?;
     if result.is_ok() {
-        #[cfg(feature = "litvm")]
-        {
-            let _ = litvm::attach_from_app(&app, &state).await;
-        }
+        spawn_litvm_attach(&app, &state);
     }
     result
 }
@@ -1020,6 +1037,7 @@ pub fn run() {
             list_wallets,
             create_wallet_account,
             switch_wallet,
+            warm_wallets,
             rename_wallet,
             delete_wallet_account,
             preview_transfer_coin,

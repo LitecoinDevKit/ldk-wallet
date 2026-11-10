@@ -93,7 +93,7 @@ as LitecoinCore).
 | --- | --- |
 | Create / restore | Write seed at root; create wallet **0** only; set active to 0 |
 | Add wallet | Next free index; new `accounts/N/`; copy settings from active; switch |
-| Switch | Drop in-memory state; load that account dir; reattach LitVM; no re-prompt while unlocked |
+| Switch | Keep the last few accounts resident and swap to the selected one; load from disk on a miss. LitVM reattaches without blocking the summary. No re-prompt while unlocked. Lock and wipe drop every resident account |
 | Rename | Update `accounts.json` display name |
 | Delete | Refuse if last wallet; remove `accounts/N/`; if deleting active, switch first |
 | Unlock / lock | Seed-level; lock clears all in-memory wallet state |
@@ -108,6 +108,7 @@ Restore does **not** scan for used accounts; the user adds wallets explicitly.
 - `list_wallets` → `{ index, name, is_active }[]`
 - `create_wallet_account(name)`
 - `switch_wallet(index)`
+- `warm_wallets` — background-load other accounts into the resident set
 - `rename_wallet(index, name)`
 - `delete_wallet(index)`
 - `preview_transfer_coin` / `transfer_coin` (see Inter-wallet transfer)

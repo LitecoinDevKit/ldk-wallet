@@ -18,12 +18,16 @@ use crate::{data_dir, map_err};
 /// Use [`attach_from_app`] / [`drop_from_app`] (async wrappers) from commands.
 pub struct LitVmHandle {
     client: Mutex<Option<LitVmClient>>,
+    /// One attach at a time. A switch that finishes while an older open is
+    /// still running must not let that older client replace the new one.
+    attach_gate: Mutex<()>,
 }
 
 impl LitVmHandle {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            attach_gate: Mutex::new(()),
         }
     }
 
@@ -46,14 +50,28 @@ fn map_litvm(err: wallet_litvm::LitVmError) -> String {
 
 /// Blocking: builds a client (and its runtime) and swaps it in. Call off the
 /// async runtime; see [`LitVmHandle`].
-pub fn attach(wallet: &WalletApp, handle: &LitVmHandle, data_dir: &Path) -> Result<(), String> {
+///
+/// `root` is the wallet data dir. The account directory is read under
+/// [`LitVmHandle`]'s attach gate, and again after open: if the active account
+/// changed, this client is dropped and the newer attach installs the right one.
+pub fn attach(wallet: &WalletApp, handle: &LitVmHandle, root: &Path) -> Result<(), String> {
+    let _gate = handle
+        .attach_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let account_dir = wallet.active_account_dir(root).map_err(map_err)?;
     let secret = wallet.litvm_account_secret().map_err(map_err)?;
-    let client = LitVmClient::open(data_dir, secret).map_err(map_litvm)?;
+    let client = LitVmClient::open(&account_dir, secret).map_err(map_litvm)?;
+    let now = wallet.active_account_dir(root).map_err(map_err)?;
+    if now != account_dir {
+        drop(client);
+        return Ok(());
+    }
     let old = {
         let mut guard = handle.slot();
         guard.replace(client)
     };
-    // Shut the previous runtime down outside the lock.
+    // Shut the previous runtime down outside the client slot.
     drop(old);
     Ok(())
 }
@@ -171,9 +189,8 @@ pub async fn litvm_explorer_tx_url(
 
 fn attach_from_app_blocking(app: &AppHandle, wallet: &WalletApp) -> Result<(), String> {
     let root = data_dir(app)?;
-    let account_dir = wallet.active_account_dir(&root).map_err(map_err)?;
     let handle = app.state::<Arc<LitVmHandle>>();
-    attach(wallet, &handle, &account_dir)
+    attach(wallet, &handle, &root)
 }
 
 fn drop_from_app_blocking(app: &AppHandle) {

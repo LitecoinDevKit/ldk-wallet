@@ -4488,15 +4488,32 @@ async function enterReady(opts?: { sync?: boolean; summary?: WalletSummary }) {
   // LitVM fill in after so a slow IPC does not hold the unlock screen.
   setPhase("ready");
   setView("balance");
-  await refreshWalletSwitcher();
-  await refreshCombined();
-  await refreshHistory();
-  await loadSettings();
-  await initLitvm();
+  if (opts?.summary) {
+    await Promise.all([
+      refreshWalletSwitcher(),
+      refreshCombined(),
+      refreshHistory(),
+      loadSettings(),
+      initLitvm(),
+    ]);
+  } else {
+    await refreshWalletSwitcher();
+    await refreshCombined();
+    await refreshHistory();
+    await loadSettings();
+    await initLitvm();
+  }
   void refreshSpotPrice();
   void refreshFeeLadder();
   if (shouldSync) void runSync({ quiet: false });
   maybeShowMwebCoach();
+  void warmOtherWallets();
+}
+
+function warmOtherWallets() {
+  void invoke("warm_wallets").catch(() => {
+    /* A cold switch still loads from disk. */
+  });
 }
 
 let cachedWallets: WalletListItem[] = [];
@@ -4628,10 +4645,18 @@ async function openWalletSwitcher() {
     const index = Number(action.slice("switch:".length));
     const current = wallets.find((w) => w.index === index);
     if (!current) return;
-    const summary = await invoke<WalletSummary>("switch_wallet", {
-      req: { index },
-    });
-    await applyActiveWallet(summary, current.name);
+    el.walletSwitcherLabel.textContent = current.name;
+    el.balanceTotal.classList.add("skeleton");
+    try {
+      const summary = await invoke<WalletSummary>("switch_wallet", {
+        req: { index },
+      });
+      await applyActiveWallet(summary, current.name);
+    } catch (e) {
+      el.balanceTotal.classList.remove("skeleton");
+      await refreshWalletSwitcher();
+      throw e;
+    }
     return;
   }
 
@@ -8253,10 +8278,27 @@ async function initLitvm() {
   if (litvmEnabled) void refreshLitvm();
 }
 
+async function litvmSummaryWhenReady(): Promise<LitVmSummary> {
+  const waitsMs = [0, 40, 80, 160, 320, 640];
+  let last = "LitVM is not ready";
+  for (const waitMs of waitsMs) {
+    if (waitMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    try {
+      return await invoke<LitVmSummary>("litvm_summary");
+    } catch (e) {
+      last = String(e);
+      if (!last.toLowerCase().includes("not ready")) throw e;
+    }
+  }
+  throw new Error(last);
+}
+
 async function refreshLitvm() {
   if (!litvmEnabled) return;
   try {
-    const summary = await invoke<LitVmSummary>("litvm_summary");
+    const summary = await litvmSummaryWhenReady();
     lastLitvmSummary = summary;
     el.litvmAddress.textContent = summary.address;
     el.litvmBalance.textContent = formatZkltcDisplay(summary.balance_zkltc);

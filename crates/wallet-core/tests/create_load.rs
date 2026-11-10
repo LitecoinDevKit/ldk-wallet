@@ -761,6 +761,40 @@ fn multi_wallet_accounts_diverge_and_switch() {
 }
 
 #[test]
+fn switch_back_uses_the_resident_account_when_its_db_file_is_replaced() {
+    let dir = tempdir().unwrap();
+    let app = with_secrets(Arc::new(MemoryStore::new()));
+    let created = app
+        .create(
+            dir.path(),
+            CreateWalletRequest {
+                network: WalletNetwork::Testnet,
+                electrum_url: None,
+            },
+        )
+        .expect("create");
+    let addr0 = created.summary.receive_address;
+    app.create_wallet_account(
+        dir.path(),
+        CreateAccountRequest {
+            name: "Tip jar".into(),
+        },
+    )
+    .expect("add account");
+
+    // Unlink the inode the parked connection still has open, and put garbage
+    // at the path. A disk reload would fail; a resident swap still has the wallet.
+    let sqlite = dir.path().join("accounts/0/wallet.sqlite");
+    std::fs::remove_file(&sqlite).unwrap();
+    std::fs::write(&sqlite, b"not a database").unwrap();
+
+    let back = app
+        .switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .expect("resident switch");
+    assert_eq!(back.receive_address, addr0);
+}
+
+#[test]
 fn transfer_public_coin_preview_to_other_account() {
     let dir = tempdir().unwrap();
     let app = with_secrets(Arc::new(MemoryStore::new()));

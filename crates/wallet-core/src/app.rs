@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -248,9 +249,122 @@ struct InsightsEndpoint {
     base_url: String,
 }
 
+/// Non-active accounts kept loaded. A switch back skips sqlite and the MWEB
+/// address book. Signing keys live here until lock, wipe, or eviction.
+const PARK_CAP: usize = 3;
+
+enum WarmSkip {
+    /// This index is already loaded.
+    This,
+    /// Park is full; further opens would be evicted.
+    Stop,
+    Open,
+}
+
+/// Least-recently-used at the front.
+struct AccountPark {
+    slots: VecDeque<(u32, WalletState)>,
+}
+
+impl AccountPark {
+    fn new() -> Self {
+        Self {
+            slots: VecDeque::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        self.slots.iter().any(|(i, _)| *i == index)
+    }
+
+    fn take(&mut self, index: u32) -> Option<WalletState> {
+        let pos = self.slots.iter().position(|(i, _)| *i == index)?;
+        self.slots.remove(pos).map(|(_, state)| state)
+    }
+
+    fn drop_index(&mut self, index: u32) {
+        self.slots.retain(|(i, _)| *i != index);
+    }
+
+    fn get_mut(&mut self, index: u32) -> Option<&mut WalletState> {
+        self.slots
+            .iter_mut()
+            .find(|(i, _)| *i == index)
+            .map(|(_, state)| state)
+    }
+
+    fn get_mut_by_dir(&mut self, data_dir: &Path) -> Option<&mut WalletState> {
+        self.slots
+            .iter_mut()
+            .find(|(_, state)| state.data_dir == data_dir)
+            .map(|(_, state)| state)
+    }
+
+    /// Most-recently used at the back. Drops the oldest past [`PARK_CAP`].
+    fn insert(&mut self, state: WalletState) {
+        let index = state.account_index;
+        self.drop_index(index);
+        self.slots.push_back((index, state));
+        while self.slots.len() > PARK_CAP {
+            self.slots.pop_front();
+        }
+    }
+}
+
+/// Install `state` as the active account. A different account that was active
+/// stays resident so switching back does not reload it.
+fn install_loaded(
+    guard: &mut Option<WalletState>,
+    park: &mut AccountPark,
+    mut state: WalletState,
+) -> Result<WalletSummary, WalletError> {
+    let summary = build_summary(&mut state)?;
+    if let Some(prev) = guard.take() {
+        if prev.account_index != state.account_index {
+            park.insert(prev);
+        }
+    }
+    *guard = Some(state);
+    Ok(summary)
+}
+
+/// Swap in a resident account. `None` means it still has to be read from disk.
+fn activate_parked(
+    guard: &mut Option<WalletState>,
+    park: &mut AccountPark,
+    index: u32,
+) -> Result<Option<WalletSummary>, WalletError> {
+    if guard.as_ref().is_some_and(|s| s.account_index == index) {
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        return Ok(Some(build_summary(state)?));
+    }
+    let Some(mut state) = park.take(index) else {
+        return Ok(None);
+    };
+    if let Some(prev) = guard.take() {
+        park.insert(prev);
+    }
+    let summary = build_summary(&mut state)?;
+    *guard = Some(state);
+    Ok(Some(summary))
+}
+
 /// Application-facing wallet handle. BDK types stay private.
 pub struct WalletApp {
     state: Mutex<Option<WalletState>>,
+    /// Accounts this session already opened, other than the active one.
+    parked: Mutex<AccountPark>,
+    /// One cold open at a time, so a switch and a background warm never open
+    /// the same sqlite twice. Not held while an already-loaded account swaps in.
+    account_load: Mutex<()>,
     secrets: Arc<EncryptedFileSecretStore>,
     /// Shared MWEB download progress; lives outside the state mutex so it can be
     /// polled while a sync (which holds that mutex) is in flight.
@@ -274,6 +388,8 @@ impl WalletApp {
     pub fn new(data_dir: &Path) -> Self {
         Self {
             state: Mutex::new(None),
+            parked: Mutex::new(AccountPark::new()),
+            account_load: Mutex::new(()),
             secrets: Arc::new(EncryptedFileSecretStore::new(
                 data_dir.join(MNEMONIC_ENC_FILE),
                 data_dir.join(MNEMONIC_FILE),
@@ -413,6 +529,8 @@ impl WalletApp {
     pub fn with_secrets(secrets: Arc<dyn SecretStore>) -> MemoryBackedApp {
         MemoryBackedApp {
             state: Mutex::new(None),
+            parked: Mutex::new(AccountPark::new()),
+            account_load: Mutex::new(()),
             secrets,
         }
     }
@@ -497,7 +615,21 @@ impl WalletApp {
         }
         reg.active_index = req.index;
         accounts::write_registry(root, &reg)?;
-        self.load(root)
+        let _gate = self.lock_account_load()?;
+        let mut guard = self.lock_state()?;
+        self.abort_if_locked(&mut guard)?;
+        let activated = {
+            let mut park = self.lock_park()?;
+            activate_parked(&mut guard, &mut park, req.index)?
+        };
+        if let Some(summary) = activated {
+            if let Some(state) = guard.as_ref() {
+                self.publish_insights(state);
+            }
+            return Ok(summary);
+        }
+        drop(guard);
+        self.load_locked(root)
     }
 
     pub fn delete_wallet(
@@ -521,6 +653,8 @@ impl WalletApp {
         if switching {
             reg.active_index = reg.accounts[0].index;
         }
+        // Close the sqlite connection before deleting the directory.
+        self.discard_resident(req.index)?;
         accounts::remove_account_dir(root, req.index)?;
         accounts::write_registry(root, &reg)?;
         if switching {
@@ -587,7 +721,10 @@ impl WalletApp {
         let sealing = self.secrets.sealing_key();
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let prepared = prepare_transfer(root, state, &secret, sealing, &req, false)?;
+        let prepared = {
+            let mut park = self.lock_park()?;
+            prepare_transfer(root, state, &secret, sealing, &req, false, &mut park)?
+        };
         finish_transfer_preview(state, prepared)
     }
 
@@ -611,7 +748,8 @@ impl WalletApp {
         let prepared = {
             let mut guard = self.lock_state()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-            prepare_transfer_broadcast(root, state, &secret, sealing, &req)?
+            let mut park = self.lock_park()?;
+            prepare_transfer_broadcast(root, state, &secret, sealing, &req, &mut park)?
         };
         match prepared {
             PreparedTransferBroadcast::Public {
@@ -717,6 +855,9 @@ impl WalletApp {
         self.secrets.lock();
         self.clear_insights();
         self.pending_lock.store(true, Ordering::Release);
+        // Parked accounts hold signing keys too. Drop them even when sync still
+        // has the active wallet; abort_if_locked drops that one on the way out.
+        self.clear_park();
         match self.state.try_lock() {
             Ok(mut guard) => {
                 *guard = None;
@@ -742,6 +883,7 @@ impl WalletApp {
             return Ok(());
         }
         **guard = None;
+        self.clear_park();
         self.clear_insights();
         self.secrets.lock();
         self.pending_lock.store(false, Ordering::Release);
@@ -754,7 +896,9 @@ impl WalletApp {
 
     /// Delete all accounts, registry, and mnemonic secret. Safe if already absent.
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
+        let _gate = self.lock_account_load()?;
         *self.lock_state()? = None;
+        self.clear_park();
         self.clear_insights();
         self.secrets.delete_mnemonic()?;
         accounts::remove_all_accounts(data_dir)?;
@@ -798,71 +942,78 @@ impl WalletApp {
     }
 
     pub fn load(&self, data_dir: &Path) -> Result<WalletSummary, WalletError> {
+        let _gate = self.lock_account_load()?;
+        self.load_locked(data_dir)
+    }
+
+    /// Load the registry's active account from disk.
+    ///
+    /// Caller holds [`Self::account_load`]. The wallet mutex is held across the
+    /// sqlite and MWEB open so a split commit, which writes those files after
+    /// broadcasting without the lock, cannot interleave. The account this
+    /// replaces stays parked when it is a different index.
+    fn load_locked(&self, data_dir: &Path) -> Result<WalletSummary, WalletError> {
         self.ensure_unlocked()?;
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
         accounts::ensure_layout(data_dir)?;
         let account_dir = accounts::active_account_dir(data_dir)?;
-        let meta = meta::read_meta(&account_dir)?;
-        let account = meta.account_index;
+        let mut guard = self.lock_state()?;
+        self.abort_if_locked(&mut guard)?;
+        let state = self.read_account_state(&account_dir)?;
+        self.abort_if_locked(&mut guard)?;
+        if self.pending_lock.load(Ordering::Acquire) || self.secrets.is_locked() {
+            *guard = None;
+            self.clear_park();
+            return Err(WalletError::Locked);
+        }
+        let summary = {
+            let mut park = self.lock_park()?;
+            install_loaded(&mut guard, &mut park, state)?
+        };
+        if let Some(active) = guard.as_ref() {
+            self.publish_insights(active);
+        }
+        Ok(summary)
+    }
+
+    /// Open every other account into the park, one at a time.
+    ///
+    /// Does not hold the active-wallet mutex while MWEB opens. A switch to an
+    /// account this is already opening waits on [`Self::account_load`] and
+    /// then uses the parked state instead of a second sqlite connection.
+    pub fn warm_other_accounts(&self, root: &Path) -> Result<(), WalletError> {
+        self.ensure_unlocked()?;
+        accounts::ensure_layout(root)?;
+        let reg = accounts::read_registry(root)?;
+        for entry in &reg.accounts {
+            if self.secrets.is_locked() {
+                return Ok(());
+            }
+            let _gate = self.lock_account_load()?;
+            if self.secrets.is_locked() {
+                return Ok(());
+            }
+            match self.warm_skip(entry.index)? {
+                WarmSkip::Stop => break,
+                WarmSkip::This => continue,
+                WarmSkip::Open => {}
+            }
+            let state = self.read_account_state(&accounts::account_dir(root, entry.index))?;
+            self.park_if_cold(state)?;
+        }
+        Ok(())
+    }
+
+    fn read_account_state(&self, account_dir: &Path) -> Result<WalletState, WalletError> {
+        let meta = meta::read_meta(account_dir)?;
         let stored = self
             .secrets
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
-        let sealing = self.secrets.sealing_key();
-        // Read the account under the wallet lock. A split commit writes those
-        // same files under this lock, after broadcasting without holding it.
-        let mut guard = self.lock_state()?;
-
-        let mut db = Connection::open(meta::db_path(&account_dir))
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = load_params(&secret, meta.network, account)?;
-        let wallet = PersistedWallet::load(&mut db, params)
-            .map_err(|e| WalletError::Persist(e.to_string()))?
-            .ok_or(WalletError::NotFound)?;
-
-        let mweb = MwebRuntime::open(
-            &account_dir,
-            &secret,
-            meta.network,
-            meta.mweb_scheme.to_master_scheme(),
-            account,
-            sealing,
-        )
-        .ok();
-
-        let mut state = WalletState {
-            last_tip_height: wallet.latest_checkpoint().height(),
-            tip_time: None,
-            tip_time_height: 0,
-            wallet,
-            signer: signer(&secret, meta.network, account)?,
-            db,
-            account_index: account,
-            network: meta.network,
-            electrum_url: meta.electrum_url,
-            electrum_validate_domain: meta.electrum_validate_domain,
-            electrum_use_public_fallback: meta.electrum_use_public_fallback,
-            auto_lock_minutes: meta.auto_lock_minutes,
-            active_electrum_url: None,
-            litecoin_rpc_url: meta.litecoin_rpc_url,
-            mweb_peers: meta.mweb_peers,
-            mweb_scheme: meta.mweb_scheme,
-            explorer_base_url: meta.explorer_base_url,
-            show_fiat: meta.show_fiat,
-            use_explorer_fee_hints: meta.use_explorer_fee_hints,
-            insights_enabled: meta.insights_enabled,
-            data_dir: account_dir,
-            needs_full_scan: meta.needs_full_scan,
-            needs_mweb_scan: meta.needs_mweb_scan,
-            mweb,
-        };
-        let summary = build_summary(&mut state)?;
-        self.publish_insights(&state);
-        *guard = Some(state);
-        Ok(summary)
+        open_wallet_state(account_dir, &meta, &secret, self.secrets.sealing_key())
     }
 
     pub fn summary(&self) -> Result<WalletSummary, WalletError> {
@@ -2045,15 +2196,26 @@ impl WalletApp {
         data_dir: &Path,
         f: impl FnOnce(&mut PersistedWallet<Connection>, &mut Connection) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
+        // Gate before the state lock: warm holds the gate, then the state lock.
+        let _gate = self.lock_account_load()?;
         let stored = self
             .secrets
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
         let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        if state.data_dir == data_dir {
+        let active = guard
+            .as_ref()
+            .is_some_and(|state| state.data_dir == data_dir);
+        if active {
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             return f(&mut state.wallet, &mut state.db);
+        }
+        {
+            let mut park = self.lock_park()?;
+            if let Some(state) = park.get_mut_by_dir(data_dir) {
+                return f(&mut state.wallet, &mut state.db);
+            }
         }
         let meta = meta::read_meta(data_dir)?;
         let mut db = Connection::open(meta::db_path(data_dir))
@@ -2071,6 +2233,7 @@ impl WalletApp {
         data_dir: &Path,
         f: impl FnOnce(&mut MwebRuntime) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
+        let _gate = self.lock_account_load()?;
         let stored = self
             .secrets
             .get_mnemonic()?
@@ -2078,8 +2241,11 @@ impl WalletApp {
         let secret = MasterSecret::from_stored(&stored)?;
         let sealing = self.secrets.sealing_key();
         let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        if state.data_dir == data_dir {
+        let active = guard
+            .as_ref()
+            .is_some_and(|state| state.data_dir == data_dir);
+        if active {
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let mweb = state
                 .mweb
                 .as_mut()
@@ -2087,6 +2253,19 @@ impl WalletApp {
             let out = f(mweb)?;
             mweb.persist(data_dir)?;
             return Ok(out);
+        }
+        {
+            let mut park = self.lock_park()?;
+            if let Some(state) = park.get_mut_by_dir(data_dir) {
+                let dir = state.data_dir.clone();
+                let mweb = state
+                    .mweb
+                    .as_mut()
+                    .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+                let out = f(mweb)?;
+                mweb.persist(&dir)?;
+                return Ok(out);
+            }
         }
         let meta = meta::read_meta(data_dir)?;
         let mut mweb = MwebRuntime::open(
@@ -2311,6 +2490,7 @@ impl WalletApp {
         };
         let summary = build_summary(&mut state)?;
         self.publish_insights(&state);
+        self.clear_park();
         *self.lock_state()? = Some(state);
         Ok(summary)
     }
@@ -2328,6 +2508,121 @@ impl WalletApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))
     }
+
+    fn lock_park(&self) -> Result<MutexGuard<'_, AccountPark>, WalletError> {
+        self.parked
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet park lock poisoned".into()))
+    }
+
+    fn lock_account_load(&self) -> Result<MutexGuard<'_, ()>, WalletError> {
+        self.account_load
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet load lock poisoned".into()))
+    }
+
+    fn clear_park(&self) {
+        if let Ok(mut park) = self.parked.lock() {
+            park.clear();
+        }
+    }
+
+    /// State lock, then park lock. `Stop` once the park is full so a warm does
+    /// not derive MWEB keys it would immediately evict.
+    fn warm_skip(&self, index: u32) -> Result<WarmSkip, WalletError> {
+        let guard = self.lock_state()?;
+        let park = self.lock_park()?;
+        if guard.as_ref().is_some_and(|s| s.account_index == index) || park.contains(index) {
+            return Ok(WarmSkip::This);
+        }
+        if park.len() >= PARK_CAP {
+            Ok(WarmSkip::Stop)
+        } else {
+            Ok(WarmSkip::Open)
+        }
+    }
+
+    /// Drop a loaded account without parking it. Used before its directory is removed.
+    ///
+    /// Takes the load gate first so a warm cannot be inside `MwebRuntime::open`
+    /// for this directory while it is deleted.
+    fn discard_resident(&self, index: u32) -> Result<(), WalletError> {
+        let _gate = self.lock_account_load()?;
+        let mut guard = self.lock_state()?;
+        if guard.as_ref().is_some_and(|s| s.account_index == index) {
+            *guard = None;
+        }
+        self.lock_park()?.drop_index(index);
+        Ok(())
+    }
+
+    /// Park `state` unless lock won, or this account is already the active one
+    /// (a switch waited out this warm and will install its own copy).
+    fn park_if_cold(&self, state: WalletState) -> Result<(), WalletError> {
+        let guard = self.lock_state()?;
+        let mut park = self.lock_park()?;
+        if self.pending_lock.load(Ordering::Acquire) || self.secrets.is_locked() {
+            return Ok(());
+        }
+        if guard
+            .as_ref()
+            .is_some_and(|active| active.account_index == state.account_index)
+        {
+            return Ok(());
+        }
+        park.insert(state);
+        Ok(())
+    }
+}
+
+fn open_wallet_state(
+    account_dir: &Path,
+    meta: &WalletMeta,
+    secret: &MasterSecret,
+    sealing: Option<[u8; 32]>,
+) -> Result<WalletState, WalletError> {
+    let account = meta.account_index;
+    let mut db = Connection::open(meta::db_path(account_dir))
+        .map_err(|e| WalletError::Persist(e.to_string()))?;
+    let params = load_params(secret, meta.network, account)?;
+    let wallet = PersistedWallet::load(&mut db, params)
+        .map_err(|e| WalletError::Persist(e.to_string()))?
+        .ok_or(WalletError::NotFound)?;
+    let mweb = MwebRuntime::open(
+        account_dir,
+        secret,
+        meta.network,
+        meta.mweb_scheme.to_master_scheme(),
+        account,
+        sealing,
+    )
+    .ok();
+    Ok(WalletState {
+        last_tip_height: wallet.latest_checkpoint().height(),
+        tip_time: None,
+        tip_time_height: 0,
+        wallet,
+        signer: signer(secret, meta.network, account)?,
+        db,
+        account_index: account,
+        network: meta.network,
+        electrum_url: meta.electrum_url.clone(),
+        electrum_validate_domain: meta.electrum_validate_domain,
+        electrum_use_public_fallback: meta.electrum_use_public_fallback,
+        auto_lock_minutes: meta.auto_lock_minutes,
+        active_electrum_url: None,
+        litecoin_rpc_url: meta.litecoin_rpc_url.clone(),
+        mweb_peers: meta.mweb_peers.clone(),
+        mweb_scheme: meta.mweb_scheme,
+        explorer_base_url: meta.explorer_base_url.clone(),
+        show_fiat: meta.show_fiat,
+        use_explorer_fee_hints: meta.use_explorer_fee_hints,
+        insights_enabled: meta.insights_enabled,
+        data_dir: account_dir.to_path_buf(),
+        needs_full_scan: meta.needs_full_scan,
+        needs_mweb_scan: meta.needs_mweb_scan,
+        mweb,
+    })
 }
 
 /// Create BIP84 sqlite + meta under an account directory (does not touch the registry).
@@ -2353,6 +2648,8 @@ fn open_created_account(
 /// Test-only wallet app backed by an arbitrary [`SecretStore`] (typically [`crate::secrets::MemoryStore`]).
 pub struct MemoryBackedApp {
     state: Mutex<Option<WalletState>>,
+    parked: Mutex<AccountPark>,
+    account_load: Mutex<()>,
     secrets: Arc<dyn SecretStore>,
 }
 
@@ -2425,7 +2722,17 @@ impl MemoryBackedApp {
         }
         reg.active_index = req.index;
         accounts::write_registry(root, &reg)?;
-        self.load(root)
+        let _gate = self.lock_account_load()?;
+        let mut guard = self.lock_mem_state()?;
+        let activated = {
+            let mut park = self.lock_park()?;
+            activate_parked(&mut guard, &mut park, req.index)?
+        };
+        if let Some(summary) = activated {
+            return Ok(summary);
+        }
+        drop(guard);
+        self.load_locked(root)
     }
 
     pub fn preview_transfer_coin(
@@ -2438,20 +2745,19 @@ impl MemoryBackedApp {
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
+        let mut guard = self.lock_mem_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let prepared = prepare_transfer(root, state, &secret, None, &req, false)?;
+        let prepared = {
+            let mut park = self.lock_park()?;
+            prepare_transfer(root, state, &secret, None, &req, false, &mut park)?
+        };
         finish_transfer_preview(state, prepared)
     }
 
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
-        *self
-            .state
-            .lock()
-            .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))? = None;
+        let _gate = self.lock_account_load()?;
+        *self.lock_mem_state()? = None;
+        self.lock_park()?.clear();
         self.secrets.delete_mnemonic()?;
         accounts::remove_all_accounts(data_dir)?;
         Ok(())
@@ -2490,6 +2796,11 @@ impl MemoryBackedApp {
     }
 
     pub fn load(&self, data_dir: &Path) -> Result<WalletSummary, WalletError> {
+        let _gate = self.lock_account_load()?;
+        self.load_locked(data_dir)
+    }
+
+    fn load_locked(&self, data_dir: &Path) -> Result<WalletSummary, WalletError> {
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
@@ -2508,7 +2819,7 @@ impl MemoryBackedApp {
         let wallet = PersistedWallet::load(&mut db, params)
             .map_err(|e| WalletError::Persist(e.to_string()))?
             .ok_or(WalletError::NotFound)?;
-        let mut state = WalletState {
+        let state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
             tip_time: None,
             tip_time_height: 0,
@@ -2534,12 +2845,27 @@ impl MemoryBackedApp {
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb: None,
         };
-        let summary = build_summary(&mut state)?;
-        *self
-            .state
+        let mut guard = self.lock_mem_state()?;
+        let mut park = self.lock_park()?;
+        install_loaded(&mut guard, &mut park, state)
+    }
+
+    fn lock_mem_state(&self) -> Result<MutexGuard<'_, Option<WalletState>>, WalletError> {
+        self.state
             .lock()
-            .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))? = Some(state);
-        Ok(summary)
+            .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))
+    }
+
+    fn lock_park(&self) -> Result<MutexGuard<'_, AccountPark>, WalletError> {
+        self.parked
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet park lock poisoned".into()))
+    }
+
+    fn lock_account_load(&self) -> Result<MutexGuard<'_, ()>, WalletError> {
+        self.account_load
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet load lock poisoned".into()))
     }
 
     pub fn summary(&self) -> Result<WalletSummary, WalletError> {
@@ -3177,6 +3503,7 @@ fn prepare_transfer(
     sealing_key: Option<[u8; 32]>,
     req: &TransferCoinRequest,
     commit_dest: bool,
+    park: &mut AccountPark,
 ) -> Result<PreparedTransfer, WalletError> {
     accounts::ensure_layout(root)?;
     let reg = accounts::read_registry(root)?;
@@ -3201,6 +3528,7 @@ fn prepare_transfer(
         state.network,
         state.mweb_scheme,
         commit_dest,
+        park,
     )?;
 
     match req.chain {
@@ -3235,6 +3563,57 @@ fn prepare_transfer(
     }
 }
 
+/// Use the resident destination when this session already has it open.
+/// A second sqlite connection would persist past the in-memory wallet.
+fn reveal_parked_dest(
+    park: &mut AccountPark,
+    to_account: u32,
+    chain: SplitChain,
+    network: WalletNetwork,
+    commit: bool,
+) -> Result<Option<String>, WalletError> {
+    match chain {
+        SplitChain::Public => {
+            let Some(state) = park.get_mut(to_account) else {
+                return Ok(None);
+            };
+            let address = if commit {
+                let addr = state
+                    .wallet
+                    .reveal_next_address(KeychainKind::External)
+                    .to_string();
+                state
+                    .wallet
+                    .persist(&mut state.db)
+                    .map_err(|e| WalletError::Persist(e.to_string()))?;
+                addr
+            } else {
+                current_receive_address(&mut state.wallet)
+            };
+            Ok(Some(address))
+        }
+        SplitChain::Private => {
+            let Some(state) = park.get_mut(to_account) else {
+                return Ok(None);
+            };
+            if state.mweb.is_none() {
+                return Ok(None);
+            }
+            let dir = state.data_dir.clone();
+            let mweb = state
+                .mweb
+                .as_mut()
+                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+            let address = mweb.receive_address(network)?;
+            if commit {
+                mweb.advance_receive_index();
+                mweb.persist(&dir)?;
+            }
+            Ok(Some(address))
+        }
+    }
+}
+
 fn reveal_dest_address(
     root: &Path,
     secret: &MasterSecret,
@@ -3244,7 +3623,11 @@ fn reveal_dest_address(
     network: WalletNetwork,
     mweb_scheme: MwebScheme,
     commit: bool,
+    park: &mut AccountPark,
 ) -> Result<String, WalletError> {
+    if let Some(address) = reveal_parked_dest(park, to_account, chain, network, commit)? {
+        return Ok(address);
+    }
     let account_dir = accounts::account_dir(root, to_account);
     if !meta::wallet_files_exist(&account_dir) {
         return Err(WalletError::NotFound);
@@ -3368,8 +3751,9 @@ fn prepare_transfer_broadcast(
     secret: &MasterSecret,
     sealing_key: Option<[u8; 32]>,
     req: &TransferCoinRequest,
+    park: &mut AccountPark,
 ) -> Result<PreparedTransferBroadcast, WalletError> {
-    let prepared = prepare_transfer(root, state, secret, sealing_key, req, true)?;
+    let prepared = prepare_transfer(root, state, secret, sealing_key, req, true, park)?;
     let source_dir = state.data_dir.clone();
     match prepared.chain {
         SplitChain::Public => {

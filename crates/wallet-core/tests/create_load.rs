@@ -760,6 +760,11 @@ fn multi_wallet_accounts_diverge_and_switch() {
     assert_eq!(back.receive_address, addr0);
 }
 
+// Windows cannot unlink a file rusqlite still has open: the default open
+// flags do not include FILE_SHARE_DELETE, so remove_file returns a sharing
+// violation. The resident swap is the same code on every OS; this probe only
+// runs where replacing the path leaves the open inode intact.
+#[cfg(unix)]
 #[test]
 fn switch_back_uses_the_resident_account_when_its_db_file_is_replaced() {
     let dir = tempdir().unwrap();

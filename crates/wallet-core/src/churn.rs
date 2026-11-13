@@ -129,6 +129,9 @@ pub struct ChurnJob {
     /// The armed hop must be signed again before it can be broadcast.
     #[serde(default)]
     pub needs_resign: bool,
+    /// Another transaction spent the coin before the hop went out. Only Cancel is left.
+    #[serde(default)]
+    pub input_spent_elsewhere: bool,
     /// Why a signed hop is still on disk.
     #[serde(default)]
     pub cover_hold: Option<CoverHold>,
@@ -402,6 +405,7 @@ pub fn new_job(
         last_check: None,
         header_cache: BTreeMap::new(),
         needs_resign: false,
+        input_spent_elsewhere: false,
         cover_hold: None,
         cover_min,
         spread_send,
@@ -848,6 +852,11 @@ pub fn commit_score(
 }
 
 pub fn request_retry(job: &mut ChurnJob) -> Result<(), WalletError> {
+    if job.input_spent_elsewhere {
+        return Err(WalletError::BuildTx(format!(
+            "{FOREIGN_SPEND} Cancel this self-spend."
+        )));
+    }
     match job.phase {
         ChurnPhase::PausedUnscored => {
             job.phase = ChurnPhase::WaitingConfirm;

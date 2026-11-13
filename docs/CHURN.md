@@ -26,6 +26,55 @@ The resulting amount is still the starting amount minus one public fee per hop. 
 
 Depth is local. Spent outputs leave the UTXO set, so a restore cannot reconstruct it. The metadata bundle carries `output_id → depth`. Without that file, the wallet shows the count as unknown.
 
+## Phase transitions
+
+`ChurnPhase` lives in `wallet-core/src/dto.rs`. Every change goes through a helper in `churn.rs` except the three direct writes in `app.rs` noted below.
+
+```mermaid
+stateDiagram-v2
+    [*] --> WaitingToBroadcast: new_job
+    WaitingToBroadcast --> WaitingForCover: prepare_churn / retry
+    WaitingForCover --> WaitingForCover: expire_armed / note_foreign_spend / retry
+    WaitingForCover --> WaitingConfirm: note_broadcast
+    WaitingToBroadcast --> WaitingConfirm: note_broadcast
+    WaitingForCover --> WaitingToBroadcast: note_broadcast_error
+    WaitingConfirm --> PausedUnscored: apply_score(Unscored)
+    WaitingConfirm --> PausedSolo: apply_score(Solo)
+    WaitingConfirm --> WaitingForCover: apply_score(Mixed), below target
+    WaitingConfirm --> Done: apply_score(Mixed), target reached
+    WaitingConfirm --> WaitingToBroadcast: note_not_included
+    PausedUnscored --> WaitingConfirm: retry / next sync
+    PausedUnscored --> PausedSolo: apply_score(Solo)
+    PausedUnscored --> WaitingForCover: apply_score(Mixed), below target
+    PausedUnscored --> Done: apply_score(Mixed), target reached
+    PausedUnscored --> WaitingToBroadcast: note_not_included
+    PausedSolo --> WaitingForCover: retry (re-sign) / arm next hop
+    WaitingForCover --> Done: finish_chain, no signed hop left
+    WaitingToBroadcast --> Cancelled: request_cancel
+    WaitingForCover --> Cancelled: request_cancel
+    PausedSolo --> Cancelled: request_cancel
+    PausedUnscored --> Cancelled: request_cancel
+    Done --> [*]
+    Cancelled --> [*]
+```
+
+| Function | From | To | Checks the phase |
+|---|---|---|---|
+| `churn::new_job` | — | WaitingToBroadcast | — |
+| `churn::mark_waiting_for_cover` (from `prepare_churn`, `resign_one_hop`, `promote_after_score`) | any | WaitingForCover | no |
+| `churn::note_broadcast` | WaitingForCover, WaitingToBroadcast | WaitingConfirm | yes |
+| `churn::note_broadcast_error` | any | WaitingToBroadcast | no; only called after the cover gate saw WaitingForCover |
+| `churn::apply_score` | WaitingConfirm, PausedUnscored | PausedUnscored, PausedSolo, WaitingForCover, Done | yes |
+| `churn::note_not_included` | WaitingConfirm, PausedUnscored | WaitingToBroadcast | yes |
+| `churn::request_retry` | any, with `input_spent_elsewhere` | refused | yes |
+| `churn::request_retry` | PausedUnscored | WaitingConfirm | yes |
+| `churn::request_retry` | PausedSolo, WaitingToBroadcast, WaitingForCover | WaitingForCover | yes |
+| `churn::request_cancel` | any active phase except WaitingConfirm | Cancelled | yes |
+| `churn::finish_chain` (from `promote_after_score`) | any | Done | no; callers check WaitingForCover |
+| `app::expire_armed` (direct write) | any | WaitingForCover | no; `undo_expired_local` calls it whenever the armed record is expired |
+| `app::note_foreign_spend` (direct write) | any | WaitingForCover | no; only called after the cover gate saw WaitingForCover. Sets `input_spent_elsewhere` and deletes `churn_armed.json`; after that only Cancel works |
+| `app::drive_churn` (direct write) | PausedUnscored | WaitingConfirm | inline `if` |
+
 ## Copy
 
 - Button: "Spend to self." History: "self-spend." The amount on that row is the fee.

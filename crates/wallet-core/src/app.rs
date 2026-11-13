@@ -5103,12 +5103,13 @@ fn note_foreign_spend(
             }
         }
     }
-    churn::wipe_raw_tail(record);
     job.needs_resign = false;
+    job.input_spent_elsewhere = true;
     job.last_error = Some(churn::FOREIGN_SPEND.into());
     job.cover_hold = None;
     job.phase = ChurnPhase::WaitingForCover;
-    churn::write_armed(&state.data_dir, record)?;
+    // An expired record would make the next pass report this as an expiry.
+    churn::remove_armed(&state.data_dir)?;
     churn::write_job(&state.data_dir, job)?;
     Ok(())
 }
@@ -5628,6 +5629,87 @@ mod tests {
         // The hop was not sent.
         let record = churn::read_armed(dir.path()).unwrap().unwrap();
         assert!(!record.hops[0].broadcast);
+    }
+
+    fn app_with_foreign_spent_job(dir: &Path) -> WalletApp {
+        let app = WalletApp::new(dir);
+        app.create(
+            dir,
+            crate::dto::CreateWalletRequest {
+                network: WalletNetwork::Testnet,
+                electrum_url: None,
+            },
+            "correct horse battery staple",
+        )
+        .expect("create");
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let spent = "ab".repeat(32);
+            let created = "cd".repeat(32);
+            let mut job = churn::new_job(&spent, false, 1, 50_000, 2, false).unwrap();
+            job.phase = ChurnPhase::WaitingForCover;
+            job.current_output_id = created.clone();
+            job.created_output_id = Some(created.clone());
+            let mut record = churn::ArmedRecord {
+                version: 1,
+                hops: vec![churn::ArmedHop {
+                    raw_hex: "aa".into(),
+                    txid: "txid".into(),
+                    wtxid: "wtxid".into(),
+                    spent_output_id: spent,
+                    created_output_id: created,
+                    receive_index: 0,
+                    fee_sats: 50_000,
+                    local_applied: true,
+                    broadcast: false,
+                    created_coin: None,
+                }],
+                armed_index: 0,
+                armed_at_unix: churn::unix_now(),
+                armed_height: 100,
+                cover_min: 2,
+                send_after: None,
+                own_ids: std::collections::BTreeSet::new(),
+                expired: false,
+            };
+            churn::write_job(&state.data_dir, &job).unwrap();
+            churn::write_armed(&state.data_dir, &record).unwrap();
+            note_foreign_spend(state, &mut job, &mut record).unwrap();
+        }
+        app
+    }
+
+    /// The next background pass must not turn a foreign spend into an expiry.
+    #[test]
+    fn foreign_spend_survives_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_foreign_spent_job(dir.path());
+        let mut guard = app.lock_state().unwrap();
+        let state = guard.as_mut().unwrap();
+
+        undo_expired_local(state).unwrap();
+
+        let job = churn::read_job(&state.data_dir).unwrap().unwrap();
+        assert_eq!(job.last_error.as_deref(), Some(churn::FOREIGN_SPEND));
+        assert!(!job.needs_resign);
+        assert!(job.input_spent_elsewhere);
+    }
+
+    /// The coin is gone, so Try again cannot sign a new hop from it.
+    #[test]
+    fn retry_after_foreign_spend_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_foreign_spent_job(dir.path());
+
+        let err = app.retry_churn().unwrap_err().to_string();
+        assert!(err.contains("spent by another transaction"), "{err}");
+
+        let status = app.churn_status().unwrap().unwrap();
+        assert_eq!(status.phase, ChurnPhase::WaitingForCover);
+        assert_eq!(status.last_error.as_deref(), Some(churn::FOREIGN_SPEND));
+
+        app.cancel_churn().expect("cancel still works");
     }
 }
 

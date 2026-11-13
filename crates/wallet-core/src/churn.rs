@@ -1425,6 +1425,146 @@ mod tests {
         job
     }
 
+    const ALL_PHASES: [ChurnPhase; 7] = [
+        ChurnPhase::WaitingToBroadcast,
+        ChurnPhase::WaitingForCover,
+        ChurnPhase::WaitingConfirm,
+        ChurnPhase::PausedSolo,
+        ChurnPhase::PausedUnscored,
+        ChurnPhase::Done,
+        ChurnPhase::Cancelled,
+    ];
+
+    /// Fails to compile when a phase is added, so `ALL_PHASES` gets updated too.
+    #[allow(dead_code)]
+    fn all_phases_is_exhaustive(phase: ChurnPhase) {
+        match phase {
+            ChurnPhase::WaitingToBroadcast
+            | ChurnPhase::WaitingForCover
+            | ChurnPhase::WaitingConfirm
+            | ChurnPhase::PausedSolo
+            | ChurnPhase::PausedUnscored
+            | ChurnPhase::Done
+            | ChurnPhase::Cancelled => {}
+        }
+    }
+
+    fn sample_event(kind: ChurnEventKind) -> ChurnEvent<'static> {
+        use ChurnEventKind as E;
+        let mixed = HopScore::Mixed {
+            other_kernels: 3,
+            other_outputs: 4,
+        };
+        match kind {
+            E::Signed => ChurnEvent::Signed,
+            E::ArmedNext => ChurnEvent::ArmedNext,
+            E::Broadcast => ChurnEvent::Broadcast {
+                wtxid: "wtxid",
+                new_output_id: "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+                height: 100,
+            },
+            E::BroadcastFailed => ChurnEvent::BroadcastFailed("boom".into()),
+            E::ScoredUnscored => ChurnEvent::Scored(HopScore::Unscored),
+            E::ScoredSolo => ChurnEvent::Scored(HopScore::Solo),
+            E::ScoredMixed | E::ScoredFinal => ChurnEvent::Scored(mixed),
+            E::NotIncluded => ChurnEvent::NotIncluded {
+                restored_output_id:
+                    "abababababababababababababababababababababababababababababababab",
+            },
+            E::StillUnscored => ChurnEvent::StillUnscored,
+            E::Retry => ChurnEvent::Retry,
+            E::Cancel => ChurnEvent::Cancel,
+            E::Expired => ChurnEvent::Expired,
+            E::ForeignSpend => ChurnEvent::ForeignSpend,
+            E::Finished => ChurnEvent::Finished,
+        }
+    }
+
+    /// `transition` accepts exactly the table rows, and a rejected event leaves the job untouched.
+    #[test]
+    fn transition_accepts_exactly_the_table() {
+        for from in ALL_PHASES {
+            for kind in ChurnEventKind::ALL {
+                // A mixed score finishes the job only when it reaches the target.
+                let target = if kind == ChurnEventKind::ScoredMixed {
+                    3
+                } else {
+                    1
+                };
+                let mut job = new_job(&"ab".repeat(32), false, target, 50_000, 2, false).unwrap();
+                job.phase = from;
+                let event = sample_event(kind);
+                assert_eq!(event.kind(&job), kind);
+                let before = job.clone();
+                let result = transition(&mut job, event);
+                match next_phase(from, kind) {
+                    Some(to) => {
+                        assert!(result.is_ok(), "{kind:?} from {from:?}: {result:?}");
+                        assert_eq!(job.phase, to, "{kind:?} from {from:?}");
+                    }
+                    None => {
+                        assert!(result.is_err(), "{kind:?} from {from:?} should be rejected");
+                        assert_eq!(job, before, "{kind:?} from {from:?} changed the job");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_has_one_row_per_key_and_no_exit_from_finished() {
+        for (i, (from, kind, _)) in TRANSITIONS.iter().enumerate() {
+            assert!(
+                !TRANSITIONS[i + 1..]
+                    .iter()
+                    .any(|(f, k, _)| f == from && k == kind),
+                "duplicate row for {kind:?} from {from:?}"
+            );
+            assert!(from.is_active(), "{from:?} must not have outgoing rows");
+        }
+    }
+
+    fn transition_mermaid() -> String {
+        let mut edges: Vec<(ChurnPhase, ChurnPhase, Vec<String>)> = Vec::new();
+        for (from, kind, to) in TRANSITIONS {
+            let label = format!("{kind:?}");
+            match edges.iter_mut().find(|(f, t, _)| f == from && t == to) {
+                Some((_, _, labels)) => labels.push(label),
+                None => edges.push((*from, *to, vec![label])),
+            }
+        }
+        let mut out = String::from("stateDiagram-v2\n");
+        out.push_str("    [*] --> WaitingToBroadcast: new_job\n");
+        for (from, to, labels) in edges {
+            out.push_str(&format!("    {from:?} --> {to:?}: {}\n", labels.join(", ")));
+        }
+        out.push_str("    Done --> [*]\n    Cancelled --> [*]\n");
+        out
+    }
+
+    /// The diagram in `docs/CHURN.md` is generated. Refresh it with
+    /// `UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs`.
+    #[test]
+    fn transition_table_matches_docs() {
+        const BEGIN: &str = "<!-- churn-transitions:begin (generated; do not edit) -->\n";
+        const END: &str = "<!-- churn-transitions:end -->";
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/CHURN.md");
+        let doc = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+        let start = doc.find(BEGIN).expect("begin marker in docs/CHURN.md") + BEGIN.len();
+        let end = doc.find(END).expect("end marker in docs/CHURN.md");
+        let expected = format!("```mermaid\n{}```\n", transition_mermaid());
+        if std::env::var_os("UPDATE_DIAGRAMS").is_some() {
+            let updated = format!("{}{}{}", &doc[..start], expected, &doc[end..]);
+            fs::write(&path, updated).unwrap();
+            return;
+        }
+        assert_eq!(
+            &doc[start..end],
+            expected,
+            "docs/CHURN.md is stale. Run UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs"
+        );
+    }
+
     #[test]
     fn cancelled_stays_cancelled_after_expired() {
         let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();

@@ -5,9 +5,9 @@
 ## State diagram diff
 
 <!--
-Required when `TRANSITIONS` in crates/wallet-core/src/churn.rs changes.
-Paste the before/after of the generated block in docs/CHURN.md and say which
-rows were added or removed and why. Write "No state changes" otherwise.
+Required when a flow table changes (see "Multi-step flows" in AGENTS.md).
+Paste the before/after of the generated diagram block and say which rows
+were added or removed and why. Write "No state changes" otherwise.
 -->
 
 ## How it was checked

@@ -482,7 +482,7 @@ impl WalletApp {
             recent_log_lines,
         };
 
-        let Ok(guard) = self.state.try_lock() else {
+        let Some(guard) = self.try_lock_state() else {
             bundle
                 .recent_log_lines
                 .push("note: wallet busy (sync in progress); meta snapshot skipped".into());
@@ -617,7 +617,6 @@ impl WalletApp {
         accounts::write_registry(root, &reg)?;
         let _gate = self.lock_account_load()?;
         let mut guard = self.lock_state()?;
-        self.abort_if_locked(&mut guard)?;
         let activated = {
             let mut park = self.lock_park()?;
             activate_parked(&mut guard, &mut park, req.index)?
@@ -847,8 +846,8 @@ impl WalletApp {
     }
 
     /// Lock immediately: wipe the decrypted mnemonic, then drop in-memory wallet
-    /// state if the state mutex is free. When sync (or another long op) holds the
-    /// mutex, set [`Self::pending_lock`] so that holder discards state before return.
+    /// state if the state mutex is free. When another operation holds the mutex,
+    /// set [`Self::pending_lock`]; its [`StateGuard`] drops the state on release.
     ///
     /// Does **not** block on an in-flight sync.
     pub fn lock(&self) {
@@ -856,7 +855,7 @@ impl WalletApp {
         self.clear_insights();
         self.pending_lock.store(true, Ordering::Release);
         // Parked accounts hold signing keys too. Drop them even when sync still
-        // has the active wallet; abort_if_locked drops that one on the way out.
+        // has the active wallet; its StateGuard drops that one on the way out.
         self.clear_park();
         match self.state.try_lock() {
             Ok(mut guard) => {
@@ -864,7 +863,7 @@ impl WalletApp {
                 self.pending_lock.store(false, Ordering::Release);
             }
             Err(TryLockError::WouldBlock) => {
-                // Sync/send holds the state; secrets are already cleared.
+                // A holder has the state and drops it on release; secrets are already cleared.
             }
             Err(TryLockError::Poisoned(poisoned)) => {
                 let mut guard = poisoned.into_inner();
@@ -874,20 +873,17 @@ impl WalletApp {
         }
     }
 
-    /// If the user locked while we held `guard`, drop wallet state and report locked.
-    fn abort_if_locked(
-        &self,
-        guard: &mut MutexGuard<'_, Option<WalletState>>,
-    ) -> Result<(), WalletError> {
-        if !self.pending_lock.load(Ordering::Acquire) && !self.secrets.is_locked() {
-            return Ok(());
-        }
-        **guard = None;
+    /// Lock was pressed (still pending) or the secrets are already locked.
+    fn lock_requested(&self) -> bool {
+        self.pending_lock.load(Ordering::Acquire) || self.secrets.is_locked()
+    }
+
+    /// Finish a lock after the state holder has dropped the active wallet.
+    fn finish_lock(&self) {
         self.clear_park();
         self.clear_insights();
         self.secrets.lock();
         self.pending_lock.store(false, Ordering::Release);
-        Err(WalletError::Locked)
     }
 
     pub fn migrate_encrypt(&self, req: MigrateEncryptRequest) -> Result<(), WalletError> {
@@ -897,7 +893,7 @@ impl WalletApp {
     /// Delete all accounts, registry, and mnemonic secret. Safe if already absent.
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
         let _gate = self.lock_account_load()?;
-        *self.lock_state()? = None;
+        *self.lock_state_raw()? = None;
         self.clear_park();
         self.clear_insights();
         self.secrets.delete_mnemonic()?;
@@ -960,14 +956,8 @@ impl WalletApp {
         accounts::ensure_layout(data_dir)?;
         let account_dir = accounts::active_account_dir(data_dir)?;
         let mut guard = self.lock_state()?;
-        self.abort_if_locked(&mut guard)?;
         let state = self.read_account_state(&account_dir)?;
-        self.abort_if_locked(&mut guard)?;
-        if self.pending_lock.load(Ordering::Acquire) || self.secrets.is_locked() {
-            *guard = None;
-            self.clear_park();
-            return Err(WalletError::Locked);
-        }
+        guard.check_lock()?;
         let summary = {
             let mut park = self.lock_park()?;
             install_loaded(&mut guard, &mut park, state)?
@@ -1438,7 +1428,7 @@ impl WalletApp {
         if !self.secrets.is_locked() || !self.exists(data_dir) {
             return Ok(false);
         }
-        let guard = self.lock_state()?;
+        let guard = self.lock_state_gate()?;
         if !self.secrets.is_locked() || guard.is_some() {
             return Ok(false);
         }
@@ -1525,7 +1515,6 @@ impl WalletApp {
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
-        self.abort_if_locked(&mut guard)?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
         let electrum_started = std::time::Instant::now();
@@ -1608,7 +1597,7 @@ impl WalletApp {
         }
 
         // Skip the long MWEB pass if the user locked during Electrum sync.
-        self.abort_if_locked(&mut guard)?;
+        guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
         // MWEB sync (best-effort; peer failure → stale, not hard error).
@@ -1649,13 +1638,13 @@ impl WalletApp {
             diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
         }
 
-        self.abort_if_locked(&mut guard)?;
+        guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         if state.mweb.is_some() {
             let _ = drive_churn(state, Some(&client));
         }
 
-        self.abort_if_locked(&mut guard)?;
+        guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
         // Repair peg-ins that credited MWEB without spending transparent UTXOs
@@ -1671,7 +1660,7 @@ impl WalletApp {
         let tx_count_after = state.wallet.transactions().count();
         let new_txs = tx_count_after.saturating_sub(tx_count_before) as u32;
         let summary = build_summary(state)?;
-        self.abort_if_locked(&mut guard)?;
+        guard.check_lock()?;
         self.set_sync_phase(SyncPhase::Done);
         diag::log(format!(
             "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs}"
@@ -1702,7 +1691,6 @@ impl WalletApp {
     fn resync_mweb_inner(&self, new_scheme: Option<MwebScheme>) -> Result<(), WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
-        self.abort_if_locked(&mut guard)?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         mweb::wipe_mweb_files(&state.data_dir)?;
         // A manual resync usually means something looked wrong, so re-crawl
@@ -1750,7 +1738,7 @@ impl WalletApp {
             });
             mweb.persist(&state.data_dir)?;
         }
-        self.abort_if_locked(&mut guard)?;
+        guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         state.needs_mweb_scan = false;
         self.set_sync_phase(SyncPhase::Done);
@@ -2351,10 +2339,8 @@ impl WalletApp {
     /// Look at the mempool and broadcast an armed hop when the cover gate opens.
     /// Safe while locked: the signed transaction is already on disk.
     pub fn pump_churn_broadcast(&self, data_dir: &Path) -> Result<(), WalletError> {
-        let mut guard = match self.state.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => return Ok(()),
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        let Some(mut guard) = self.try_lock_state() else {
+            return Ok(());
         };
         if let Some(state) = guard.as_mut() {
             let _ = undo_expired_local(state);
@@ -2503,7 +2489,44 @@ impl WalletApp {
         }
     }
 
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, Option<WalletState>>, WalletError> {
+    /// Take the wallet state for an operation that needs the wallet unlocked.
+    /// Refuses with [`WalletError::Locked`] once Lock was pressed.
+    fn lock_state(&self) -> Result<StateGuard<'_>, WalletError> {
+        let mut guard = StateGuard {
+            inner: self.lock_state_raw()?,
+            app: self,
+        };
+        guard.check_lock()?;
+        Ok(guard)
+    }
+
+    /// Like [`Self::lock_state`] but does not refuse while locked, for work that
+    /// runs before unlock and only needs the mutex as a gate. Releasing it still
+    /// drops any state if the wallet is locked.
+    fn lock_state_gate(&self) -> Result<StateGuard<'_>, WalletError> {
+        Ok(StateGuard {
+            inner: self.lock_state_raw()?,
+            app: self,
+        })
+    }
+
+    /// Like [`Self::lock_state`] without waiting, for background work that also
+    /// runs while locked. `None` when another holder has the mutex; after Lock
+    /// the guard holds no state.
+    fn try_lock_state(&self) -> Option<StateGuard<'_>> {
+        let inner = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        let mut guard = StateGuard { inner, app: self };
+        let _ = guard.check_lock();
+        Some(guard)
+    }
+
+    /// The bare mutex, skipping the lock check. Only for callers that must work
+    /// while locked and leave nothing loaded: `wipe` and `discard_resident`.
+    fn lock_state_raw(&self) -> Result<MutexGuard<'_, Option<WalletState>>, WalletError> {
         self.state
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))
@@ -2530,7 +2553,10 @@ impl WalletApp {
     /// State lock, then park lock. `Stop` once the park is full so a warm does
     /// not derive MWEB keys it would immediately evict.
     fn warm_skip(&self, index: u32) -> Result<WarmSkip, WalletError> {
-        let guard = self.lock_state()?;
+        let guard = match self.lock_state() {
+            Err(WalletError::Locked) => return Ok(WarmSkip::Stop),
+            guard => guard?,
+        };
         let park = self.lock_park()?;
         if guard.as_ref().is_some_and(|s| s.account_index == index) || park.contains(index) {
             return Ok(WarmSkip::This);
@@ -2548,7 +2574,7 @@ impl WalletApp {
     /// for this directory while it is deleted.
     fn discard_resident(&self, index: u32) -> Result<(), WalletError> {
         let _gate = self.lock_account_load()?;
-        let mut guard = self.lock_state()?;
+        let mut guard = self.lock_state_raw()?;
         if guard.as_ref().is_some_and(|s| s.account_index == index) {
             *guard = None;
         }
@@ -2559,11 +2585,11 @@ impl WalletApp {
     /// Park `state` unless lock won, or this account is already the active one
     /// (a switch waited out this warm and will install its own copy).
     fn park_if_cold(&self, state: WalletState) -> Result<(), WalletError> {
-        let guard = self.lock_state()?;
+        let guard = match self.lock_state() {
+            Err(WalletError::Locked) => return Ok(()),
+            guard => guard?,
+        };
         let mut park = self.lock_park()?;
-        if self.pending_lock.load(Ordering::Acquire) || self.secrets.is_locked() {
-            return Ok(());
-        }
         if guard
             .as_ref()
             .is_some_and(|active| active.account_index == state.account_index)
@@ -2572,6 +2598,49 @@ impl WalletApp {
         }
         park.insert(state);
         Ok(())
+    }
+}
+
+/// The wallet state mutex, held through [`WalletApp::lock_state`]. If Lock lands
+/// while it is held, releasing it drops the signer and wallet, so no holder can
+/// leave them in memory after Lock.
+struct StateGuard<'a> {
+    inner: MutexGuard<'a, Option<WalletState>>,
+    app: &'a WalletApp,
+}
+
+impl StateGuard<'_> {
+    /// Early exit for long operations: drop the state now if Lock was pressed.
+    fn check_lock(&mut self) -> Result<(), WalletError> {
+        if !self.app.lock_requested() {
+            return Ok(());
+        }
+        *self.inner = None;
+        self.app.finish_lock();
+        Err(WalletError::Locked)
+    }
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = Option<WalletState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if self.app.lock_requested() {
+            *self.inner = None;
+            self.app.finish_lock();
+        }
     }
 }
 
@@ -5862,9 +5931,9 @@ mod lock_lifecycle_tests {
     }
 
     /// Lock while a long operation holds the mutex: secrets go at once, state goes
-    /// when that holder calls `abort_if_locked`.
+    /// when that holder calls `check_lock` (or releases the guard).
     #[test]
-    fn lock_during_a_held_mutex_defers_to_abort_if_locked() {
+    fn lock_during_a_held_mutex_defers_to_check_lock() {
         let dir = tempfile::tempdir().unwrap();
         let app = unlocked_app(dir.path());
         let mut guard = app.lock_state().unwrap();
@@ -5874,10 +5943,7 @@ mod lock_lifecycle_tests {
         assert!(app.pending_lock.load(Ordering::Acquire));
         assert!(guard.is_some(), "state waits for the holder");
 
-        assert!(matches!(
-            app.abort_if_locked(&mut guard),
-            Err(WalletError::Locked)
-        ));
+        assert!(matches!(guard.check_lock(), Err(WalletError::Locked)));
         assert!(guard.is_none());
         assert!(!app.pending_lock.load(Ordering::Acquire));
     }
@@ -5914,10 +5980,9 @@ mod lock_lifecycle_tests {
         assert!(!state_loaded(&app));
     }
 
-    /// Known gap (see `docs/LOCK_LIFECYCLE.md`): Lock that races a short holder
-    /// which never calls `abort_if_locked` leaves the wallet loaded after Lock.
+    /// Lock that races a short holder: the holder never checks, but releasing
+    /// the guard drops the state before the next pump can reuse it.
     #[test]
-    #[ignore = "known gap: state survives a lock that races a short mutex holder"]
     fn lock_racing_a_short_holder_still_drops_state() {
         let dir = tempfile::tempdir().unwrap();
         let app = unlocked_app(dir.path());
@@ -5931,5 +5996,44 @@ mod lock_lifecycle_tests {
 
         assert!(app.is_locked());
         assert!(!state_loaded(&app), "signer and wallet are still in memory");
+    }
+
+    /// Releasing a guard taken before Lock is enough; nothing else has to run.
+    #[test]
+    fn lock_during_holder_drops_state_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let guard = app.lock_state().unwrap();
+
+        app.lock();
+        drop(guard);
+
+        assert!(app.is_locked());
+        assert!(!state_loaded(&app), "signer and wallet are still in memory");
+        assert!(!app.pending_lock.load(Ordering::Acquire));
+        assert!(app.parked.lock().unwrap().slots.is_empty());
+    }
+
+    /// Once locked, ordinary holders are refused instead of seeing an empty state.
+    #[test]
+    fn lock_state_refuses_while_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        app.lock();
+
+        assert!(matches!(app.lock_state(), Err(WalletError::Locked)));
+    }
+
+    /// Wipe is offered on the locked screen, so it must not need an unlock.
+    #[test]
+    fn wipe_works_while_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        app.lock();
+
+        app.wipe(dir.path()).expect("wipe");
+
+        assert!(!app.exists(dir.path()));
+        assert!(!state_loaded(&app));
     }
 }

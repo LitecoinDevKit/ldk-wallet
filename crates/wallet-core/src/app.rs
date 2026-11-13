@@ -5924,3 +5924,123 @@ mod prefetch_tests {
         assert_eq!(std::fs::read(&meta_path).expect("meta after"), meta_before);
     }
 }
+
+/// Pins the lock lifecycle described in `docs/LOCK_LIFECYCLE.md`.
+#[cfg(test)]
+mod lock_lifecycle_tests {
+    use super::WalletApp;
+    use crate::dto::{CreateWalletRequest, UnlockRequest};
+    use crate::error::WalletError;
+    use crate::network::WalletNetwork;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    const PASSPHRASE: &str = "correct horse battery staple";
+
+    fn unlocked_app(dir: &Path) -> WalletApp {
+        let app = WalletApp::new(dir);
+        app.create(
+            dir,
+            CreateWalletRequest {
+                network: WalletNetwork::Testnet,
+                electrum_url: None,
+            },
+            PASSPHRASE,
+        )
+        .expect("create");
+        assert!(!app.is_locked());
+        assert!(app.state.lock().unwrap().is_some());
+        app
+    }
+
+    fn state_loaded(app: &WalletApp) -> bool {
+        app.state.lock().unwrap().is_some()
+    }
+
+    /// Unlocked and loaded, then Lock with the mutex free: Locked and empty at once.
+    #[test]
+    fn lock_with_a_free_mutex_drops_state_and_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+
+        app.lock();
+
+        assert!(app.is_locked());
+        assert!(!state_loaded(&app));
+        assert!(!app.pending_lock.load(Ordering::Acquire));
+        assert!(app.parked.lock().unwrap().slots.is_empty());
+        assert!(matches!(app.summary(), Err(WalletError::Locked)));
+    }
+
+    /// Lock while a long operation holds the mutex: secrets go at once, state goes
+    /// when that holder calls `abort_if_locked`.
+    #[test]
+    fn lock_during_a_held_mutex_defers_to_abort_if_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let mut guard = app.lock_state().unwrap();
+
+        app.lock();
+        assert!(app.is_locked(), "the mnemonic is wiped without waiting");
+        assert!(app.pending_lock.load(Ordering::Acquire));
+        assert!(guard.is_some(), "state waits for the holder");
+
+        assert!(matches!(
+            app.abort_if_locked(&mut guard),
+            Err(WalletError::Locked)
+        ));
+        assert!(guard.is_none());
+        assert!(!app.pending_lock.load(Ordering::Acquire));
+    }
+
+    /// Unlock decrypts the mnemonic only. Loading the wallet is a separate step.
+    #[test]
+    fn unlock_does_not_load_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        app.lock();
+
+        app.unlock(UnlockRequest {
+            passphrase: PASSPHRASE.into(),
+        })
+        .expect("unlock");
+
+        assert!(!app.is_locked());
+        assert!(!state_loaded(&app));
+        app.load(dir.path()).expect("load");
+        assert!(state_loaded(&app));
+    }
+
+    /// The broadcast pump runs while locked. It must not unlock or load anything.
+    #[test]
+    fn pump_while_locked_stays_locked_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let account = app.active_account_dir(dir.path()).unwrap();
+        app.lock();
+
+        app.pump_churn_broadcast(&account).expect("pump");
+
+        assert!(app.is_locked());
+        assert!(!state_loaded(&app));
+    }
+
+    /// Known gap (see `docs/LOCK_LIFECYCLE.md`): Lock that races a short holder
+    /// which never calls `abort_if_locked` leaves the wallet loaded after Lock.
+    #[test]
+    #[ignore = "known gap: state survives a lock that races a short mutex holder"]
+    fn lock_racing_a_short_holder_still_drops_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let guard = app.lock_state().unwrap();
+        app.lock();
+        drop(guard);
+
+        // The next background pump is the first thing to touch the state.
+        let account = app.active_account_dir(dir.path()).unwrap();
+        app.pump_churn_broadcast(&account).expect("pump");
+
+        assert!(app.is_locked());
+        assert!(!state_loaded(&app), "signer and wallet are still in memory");
+    }
+}

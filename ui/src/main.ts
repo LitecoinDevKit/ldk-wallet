@@ -441,6 +441,19 @@ const PHASE_LABELS: Record<Phase, string> = {
   migrate: "Encryption required",
 };
 
+const ALL_PHASES: readonly Phase[] = Object.keys(PHASE_LABELS) as Phase[];
+
+/** Phases each phase may be entered from. `fatal` is reachable from anywhere. */
+const PHASE_FROM: Record<Phase, readonly Phase[]> = {
+  boot: ["boot"],
+  onboarding: ["boot", "fatal", "unlock"],
+  mnemonic: ["onboarding"],
+  migrate: ["boot"],
+  unlock: ["boot", "ready"],
+  ready: ["boot", "unlock", "migrate", "onboarding", "mnemonic", "ready"],
+  fatal: ALL_PHASES,
+};
+
 /** Top-level panes. Send/Receive/Private are cards inside the Balance sheet. */
 const VIEWS = ["balance", "history", "insights", "coins", "litvm", "settings"] as const;
 type View = (typeof VIEWS)[number];
@@ -1673,6 +1686,10 @@ function setDisplayUnit(unit: DisplayUnit, opts: { clearAmbiguous?: boolean; kee
 }
 
 function setPhase(next: Phase) {
+  if (!PHASE_FROM[next].includes(currentPhase)) {
+    console.error(`Ignored phase change ${currentPhase} -> ${next}`);
+    return;
+  }
   currentPhase = next;
   el.phase.textContent = PHASE_LABELS[next];
   el.authShell.hidden = next === "ready";

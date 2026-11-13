@@ -1524,44 +1524,20 @@ mod tests {
         }
     }
 
-    fn transition_mermaid() -> String {
-        let mut edges: Vec<(ChurnPhase, ChurnPhase, Vec<String>)> = Vec::new();
-        for (from, kind, to) in TRANSITIONS {
-            let label = format!("{kind:?}");
-            match edges.iter_mut().find(|(f, t, _)| f == from && t == to) {
-                Some((_, _, labels)) => labels.push(label),
-                None => edges.push((*from, *to, vec![label])),
-            }
-        }
-        let mut out = String::from("stateDiagram-v2\n");
-        out.push_str("    [*] --> WaitingToBroadcast: new_job\n");
-        for (from, to, labels) in edges {
-            out.push_str(&format!("    {from:?} --> {to:?}: {}\n", labels.join(", ")));
-        }
-        out.push_str("    Done --> [*]\n    Cancelled --> [*]\n");
-        out
-    }
-
     /// The diagram in `docs/CHURN.md` is generated. Refresh it with
     /// `UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs`.
     #[test]
     fn transition_table_matches_docs() {
-        const BEGIN: &str = "<!-- churn-transitions:begin (generated; do not edit) -->\n";
-        const END: &str = "<!-- churn-transitions:end -->";
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/CHURN.md");
-        let doc = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
-        let start = doc.find(BEGIN).expect("begin marker in docs/CHURN.md") + BEGIN.len();
-        let end = doc.find(END).expect("end marker in docs/CHURN.md");
-        let expected = format!("```mermaid\n{}```\n", transition_mermaid());
-        if std::env::var_os("UPDATE_DIAGRAMS").is_some() {
-            let updated = format!("{}{}{}", &doc[..start], expected, &doc[end..]);
-            fs::write(&path, updated).unwrap();
-            return;
-        }
-        assert_eq!(
-            &doc[start..end],
-            expected,
-            "docs/CHURN.md is stale. Run UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs"
+        let diagram = crate::diagram::mermaid(
+            (ChurnPhase::WaitingToBroadcast, "new_job"),
+            TRANSITIONS,
+            &[ChurnPhase::Done, ChurnPhase::Cancelled],
+        );
+        crate::diagram::check_doc(
+            "docs/CHURN.md",
+            "churn-transitions",
+            &diagram,
+            "UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs",
         );
     }
 

@@ -9,6 +9,8 @@ mod churn;
 mod contacts;
 mod descriptors;
 mod diag;
+#[cfg(test)]
+mod diagram;
 mod discovery;
 mod dto;
 mod electrum;

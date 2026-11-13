@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "screenshots": "node scripts/screenshots.mjs",
+    "check:diagrams": "node scripts/phase-diagram.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

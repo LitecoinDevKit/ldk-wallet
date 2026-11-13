@@ -2,12 +2,31 @@
 
 Rules for agents (and people) changing this wallet. `README.md` covers setup.
 
+## Multi-step flows
+
+Each flow with real phases has one table that is the only legal path, and a diagram generated from it that a check keeps in sync:
+
+| Flow | Table | Diagram | Regenerate |
+|------|-------|---------|------------|
+| Self-spend (churn) | `churn::TRANSITIONS` | `docs/CHURN.md` | `UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs` |
+| Lock / unlock | `lock::LOCK_TRANSITIONS` | `docs/LOCK_LIFECYCLE.md` | `UPDATE_DIAGRAMS=1 cargo test -p wallet-core lock_table_matches_docs` |
+| UI lifecycle phase | `PHASE_FROM` in `ui/src/phases.ts` | `docs/UI_PHASES.md` | `npm run check:diagrams -- --write` |
+
+Peg-in, peg-out and send are the next flows to move behind a table. Any change to one of these flows follows the same rules:
+
+- One `transition` entry point per flow and a private phase field. To allow a new change, add a row to the table first; never work around it with a setter outside tests.
+- Terminal states (Done, Cancelled, Failed, Locked) cannot be re-entered or left except by the rows the table lists. Add a test that pins this.
+- Regenerate the diagram after changing the table and commit it. CI fails when it is stale. Paste the diagram diff into the PR description (the PR template asks for it).
+- The backend decides which UI actions are legal and sends them as flags. The UI renders the flags; it never infers an action from a phase.
+- Do not diagram code without real phase changes, guards, or terminal states.
+
 ## State changes
 
 - Self-spend phases change only through `churn::transition` in `crates/wallet-core/src/churn.rs`. The `phase` field is private; to allow a new change, add a row to `TRANSITIONS`. Never work around it with a test-only setter outside tests.
 - After changing `TRANSITIONS`, run `UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs` and commit the regenerated diagram in `docs/CHURN.md`. CI fails when it is stale. Put the diagram diff in the PR description.
 - `Done` and `Cancelled` are final. `table_has_one_row_per_key_and_no_exit_from_finished` enforces it.
 - The UI never decides whether Retry, Cancel, or Open Settings is available. It renders `churn_actions`, which `churn::allowed_actions` derives from the table. Add a flag there rather than a phase check in `ui/src/main.ts`.
+- Code that holds the wallet state mutex takes it through `lock_state()`, whose guard drops the signer and wallet when the user locks while it is held. Only the documented exceptions in `docs/LOCK_LIFECYCLE.md` use `lock_state_raw()`.
 
 ## Bugs
 

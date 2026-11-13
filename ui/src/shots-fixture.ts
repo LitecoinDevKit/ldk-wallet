@@ -121,6 +121,8 @@ type Coin = {
   churn_spreading?: boolean | null;
   churn_target?: number | null;
   churn_counted?: number | null;
+  churn_actions?: { retry: boolean; cancel: boolean; open_settings: boolean } | null;
+  churn_error?: string | null;
 };
 
 function quietCoin(partial: Coin): Coin {
@@ -168,6 +170,14 @@ function privateCoins(): Coin[] {
   const cover = new URLSearchParams(window.location.search).get("cover");
   if (cover === "solo" && current !== "recovery" && current !== "balance") {
     tied.churn_phase = "paused-solo";
+    tied.churn_actions = { retry: true, cancel: true, open_settings: false };
+    tied.churn_target = 1;
+    tied.churn_counted = 0;
+    tied.locked = true;
+  } else if (cover === "spent" && current !== "recovery" && current !== "balance") {
+    tied.churn_phase = "waiting-for-cover";
+    tied.churn_error = "This coin was spent by another transaction.";
+    tied.churn_actions = { retry: false, cancel: true, open_settings: false };
     tied.churn_target = 1;
     tied.churn_counted = 0;
     tied.locked = true;
@@ -178,6 +188,7 @@ function privateCoins(): Coin[] {
   ) {
     tied.churn_phase = "waiting-for-cover";
     tied.churn_cover_hold = cover === "no-rpc" ? "no-rpc" : "waiting";
+    tied.churn_actions = { retry: false, cancel: true, open_settings: cover === "no-rpc" };
     tied.churn_target = 3;
     tied.churn_counted = 1;
     tied.locked = true;

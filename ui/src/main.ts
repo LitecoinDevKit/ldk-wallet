@@ -229,6 +229,14 @@ type MwebUtxoRecord = {
   churn_cover_outputs?: number | null;
   churn_cover_error?: string | null;
   churn_spreading?: boolean | null;
+  churn_actions?: ChurnActions | null;
+};
+
+/** Which self-spend buttons the backend allows. The UI never works this out itself. */
+type ChurnActions = {
+  retry: boolean;
+  cancel: boolean;
+  open_settings: boolean;
 };
 
 type ChurnPhase =
@@ -5925,6 +5933,11 @@ function stampChurnStarting() {
   const coin = mwebUtxoCache.find((row) => row.output_id === churnStartingId);
   if (!coin || churnPhaseActive(coin.churn_phase)) return;
   coin.churn_phase = "waiting-for-cover";
+  coin.churn_actions = {
+    retry: false,
+    cancel: true,
+    open_settings: churnStartingCoverHold === "no-rpc",
+  };
   coin.churn_cover_hold = churnStartingCoverHold;
   coin.churn_cover_min = churnStartingCoverMin;
   coin.churn_cover_seen = null;
@@ -6001,7 +6014,10 @@ function churnCompanySentence(coin: MwebUtxoRecord): string | null {
     (phase === "waiting-to-broadcast" || phase === "waiting-for-cover") &&
     (coin.churn_error || churnActionError)
   ) {
-    return "The spend can be sent again.";
+    // Without Retry (the coin was spent elsewhere) the error line below says why.
+    return coin.churn_actions?.retry
+      ? "The spend can be sent again."
+      : "This self-spend cannot continue.";
   }
   if (phase === "waiting-for-cover") {
     return coverWaitSentence(coin);
@@ -6462,13 +6478,8 @@ function renderChurnStatus() {
 
   const actions = document.createElement("div");
   actions.className = "churn-status-actions";
-  const phase = coin.churn_phase;
-  const canRetry =
-    phase === "paused-solo" ||
-    phase === "paused-unscored" ||
-    ((phase === "waiting-to-broadcast" || phase === "waiting-for-cover") &&
-      !!(coin.churn_error || churnActionError));
-  if (canRetry) {
+  const allowed = coin.churn_actions;
+  if (allowed?.retry) {
     const again = document.createElement("button");
     again.type = "button";
     again.className = "btn btn-primary btn-sm";
@@ -6477,7 +6488,7 @@ function renderChurnStatus() {
     again.addEventListener("click", () => void retryChurn());
     actions.append(again);
   }
-  if (coin.churn_cover_hold === "no-rpc") {
+  if (allowed?.open_settings) {
     const settings = document.createElement("button");
     settings.type = "button";
     settings.className = "btn btn-primary btn-sm";
@@ -6489,13 +6500,7 @@ function renderChurnStatus() {
     });
     actions.append(settings);
   }
-  // Cancel is available before the hop is broadcast, and after a pause or a failed send.
-  const canCancel =
-    phase === "waiting-for-cover" ||
-    (phase === "waiting-to-broadcast" && !!(coin.churn_error || churnActionError)) ||
-    phase === "paused-solo" ||
-    phase === "paused-unscored";
-  if (canCancel) {
+  if (allowed?.cancel) {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn btn-ghost btn-sm";

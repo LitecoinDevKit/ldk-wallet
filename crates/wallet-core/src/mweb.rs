@@ -2562,6 +2562,7 @@ pub fn list_mweb_unspent(
                 churn_cover_outputs: fields.churn_cover_outputs,
                 churn_cover_error: fields.churn_cover_error,
                 churn_spreading: fields.churn_spreading,
+                churn_actions: fields.churn_actions,
             }
         })
         .collect();
@@ -2593,6 +2594,7 @@ struct ChurnFields {
     churn_cover_outputs: Option<u64>,
     churn_cover_error: Option<String>,
     churn_spreading: Option<bool>,
+    churn_actions: Option<crate::dto::ChurnActions>,
 }
 
 /// The part of a job that belongs on the coin it currently holds.
@@ -2611,6 +2613,7 @@ struct LiveJobFields {
     cover_outputs: Option<u64>,
     cover_error: Option<String>,
     spreading: Option<bool>,
+    actions: Option<crate::dto::ChurnActions>,
 }
 
 fn churn_fields(
@@ -2644,6 +2647,7 @@ fn churn_fields(
                 cover_outputs: job.last_cover_outputs,
                 cover_error: job.last_cover_error.clone(),
                 spreading: Some(job.spreading),
+                actions: Some(crate::churn::allowed_actions(job)),
             }
         }
         Some(job)
@@ -2677,6 +2681,7 @@ fn churn_fields(
         churn_cover_outputs: live.cover_outputs,
         churn_cover_error: live.cover_error,
         churn_spreading: live.spreading,
+        churn_actions: live.actions,
     }
 }
 

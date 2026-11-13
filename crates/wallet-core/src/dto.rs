@@ -846,6 +846,9 @@ pub struct MwebUtxoRecord {
     /// The count was met and the opt-in spread is running.
     #[serde(default)]
     pub churn_spreading: Option<bool>,
+    /// Buttons for the live job. Set only while the job holds this coin.
+    #[serde(default)]
+    pub churn_actions: Option<ChurnActions>,
 }
 
 /// One output in a split plan (change is flagged).
@@ -926,6 +929,14 @@ pub enum CoverHold {
     NoRpc,
     /// The node is configured. The hop is waiting for other MWEB transactions.
     Waiting,
+}
+
+/// Buttons the self-spend card may show. Derived from the transition table so the UI cannot disagree with it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChurnActions {
+    pub retry: bool,
+    pub cancel: bool,
+    pub open_settings: bool,
 }
 
 /// Live self-spend job phase.
@@ -1025,6 +1036,8 @@ pub struct ChurnStatus {
     pub last_cover_error: Option<String>,
     #[serde(default)]
     pub spreading: bool,
+    #[serde(default)]
+    pub actions: ChurnActions,
 }
 
 /// Other kernels and outputs in one counted block.

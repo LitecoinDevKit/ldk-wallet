@@ -5735,6 +5735,8 @@ mod tests {
         let status = app.churn_status().unwrap().unwrap();
         assert_eq!(status.phase, ChurnPhase::WaitingForCover);
         assert_eq!(status.last_error.as_deref(), Some(churn::FOREIGN_SPEND));
+        assert!(!status.actions.retry);
+        assert!(status.actions.cancel);
 
         app.cancel_churn().expect("cancel still works");
     }

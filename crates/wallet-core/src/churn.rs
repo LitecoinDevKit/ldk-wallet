@@ -14,7 +14,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    ChurnDepthRecord, ChurnHop, ChurnPhase, ChurnStatus, CoverHold, CHURN_MAX_TARGET,
+    ChurnActions, ChurnDepthRecord, ChurnHop, ChurnPhase, ChurnStatus, CoverHold, CHURN_MAX_TARGET,
 };
 use crate::error::WalletError;
 use crate::mweb_frozen;
@@ -641,19 +641,23 @@ fn rejection(from: ChurnPhase, kind: ChurnEventKind) -> WalletError {
     WalletError::BuildTx(message.into())
 }
 
-/// Apply `event` if the table allows it from the current phase. A rejected event changes nothing.
-pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), WalletError> {
-    let kind = event.kind(job);
+/// The phase `kind` would move the job to, or why it may not happen now.
+fn check(job: &ChurnJob, kind: ChurnEventKind) -> Result<ChurnPhase, WalletError> {
     if kind == ChurnEventKind::Retry && job.input_spent_elsewhere {
         return Err(WalletError::BuildTx(format!(
             "{FOREIGN_SPEND} Cancel this self-spend."
         )));
     }
+    next_phase(job.phase, kind).ok_or_else(|| rejection(job.phase, kind))
+}
+
+/// Apply `event` if the table allows it from the current phase. A rejected event changes nothing.
+pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), WalletError> {
+    let kind = event.kind(job);
     let from = job.phase;
-    let Some(to) = next_phase(from, kind) else {
+    let to = check(job, kind).inspect_err(|_| {
         crate::diag::log(format!("self-spend: rejected {kind:?} in {from:?}"));
-        return Err(rejection(from, kind));
-    };
+    })?;
     match event {
         ChurnEvent::Signed | ChurnEvent::ArmedNext => {
             job.pending_wtxid = None;
@@ -1074,8 +1078,27 @@ pub fn request_cancel(job: &mut ChurnJob) -> Result<(), WalletError> {
     transition(job, ChurnEvent::Cancel)
 }
 
+/// Retry and Cancel are offered only when [`transition`] would accept them. Outside a
+/// pause they also need a saved error, so a hop that is simply waiting offers Cancel alone.
+pub fn allowed_actions(job: &ChurnJob) -> ChurnActions {
+    let paused = matches!(
+        job.phase,
+        ChurnPhase::PausedSolo | ChurnPhase::PausedUnscored
+    );
+    let has_error = job.last_error.is_some();
+    ChurnActions {
+        retry: check(job, ChurnEventKind::Retry).is_ok() && (paused || has_error),
+        cancel: check(job, ChurnEventKind::Cancel).is_ok()
+            && (job.phase != ChurnPhase::WaitingToBroadcast || has_error),
+        open_settings: job.phase == ChurnPhase::WaitingForCover
+            && job.cover_hold == Some(CoverHold::NoRpc)
+            && !job.input_spent_elsewhere,
+    }
+}
+
 pub fn status_view(job: &ChurnJob) -> ChurnStatus {
     ChurnStatus {
+        actions: allowed_actions(job),
         phase: job.phase,
         output_id: job.current_output_id.clone(),
         target_depth: job.target_depth,
@@ -1409,6 +1432,73 @@ mod tests {
         let before = job.clone();
         assert!(transition(&mut job, ChurnEvent::Expired).is_err());
         assert_eq!(job, before);
+    }
+
+    #[test]
+    fn allowed_actions_follow_the_table() {
+        let actions = |phase: ChurnPhase, error: bool, edit: fn(&mut ChurnJob)| {
+            let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();
+            job.phase = phase;
+            if error {
+                job.last_error = Some("boom".into());
+            }
+            edit(&mut job);
+            let a = allowed_actions(&job);
+            (a.retry, a.cancel, a.open_settings)
+        };
+        let none = |_: &mut ChurnJob| {};
+        assert_eq!(
+            actions(ChurnPhase::WaitingForCover, false, none),
+            (false, true, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::WaitingForCover, true, none),
+            (true, true, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::WaitingToBroadcast, false, none),
+            (false, false, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::WaitingToBroadcast, true, none),
+            (true, true, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::WaitingConfirm, true, none),
+            (false, false, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::PausedSolo, false, none),
+            (true, true, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::PausedUnscored, false, none),
+            (true, true, false)
+        );
+        assert_eq!(actions(ChurnPhase::Done, true, none), (false, false, false));
+        assert_eq!(
+            actions(ChurnPhase::Cancelled, true, none),
+            (false, false, false)
+        );
+        assert_eq!(
+            actions(ChurnPhase::WaitingForCover, false, |job| {
+                job.cover_hold = Some(CoverHold::NoRpc)
+            }),
+            (false, true, true)
+        );
+
+        let mut spent = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();
+        spent.phase = ChurnPhase::WaitingForCover;
+        spent.cover_hold = Some(CoverHold::NoRpc);
+        transition(&mut spent, ChurnEvent::ForeignSpend).unwrap();
+        assert_eq!(
+            allowed_actions(&spent),
+            ChurnActions {
+                retry: false,
+                cancel: true,
+                open_settings: false,
+            }
+        );
     }
 
     #[test]

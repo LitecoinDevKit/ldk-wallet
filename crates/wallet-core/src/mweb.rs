@@ -1525,7 +1525,7 @@ mod tests {
         let id_b = id_hex(2);
         let id_c = id_hex(3);
         let mut job = churn::new_job(&id_a, false, 1, 50_000, 2, false).unwrap();
-        job.phase = ChurnPhase::WaitingForCover;
+        job.set_phase_for_test(ChurnPhase::WaitingForCover);
         churn::write_job(dir.path(), &job).unwrap();
         mweb_frozen::set_locked(dir.path(), &id_a, true).unwrap();
 
@@ -1569,7 +1569,7 @@ mod tests {
             fee_sats: 50_000,
             job_active: churn::read_job(dir.path())
                 .unwrap()
-                .is_some_and(|job| job.phase.is_active()),
+                .is_some_and(|job| job.phase().is_active()),
             target_depth: 1,
         })
         .unwrap_err();
@@ -2629,23 +2629,26 @@ fn churn_fields(
         None
     };
     let live = match job {
-        Some(job) if job.current_output_id == output_id && job.phase.is_active() => LiveJobFields {
-            phase: Some(job.phase),
-            error: job.last_error.clone(),
-            target: Some(job.target_depth),
-            counted: Some(job.effective_depth),
-            cover_hold: job.cover_hold,
-            cover_min: Some(job.cover_min),
-            cover_seen: job.last_cover_count,
-            cover_checked_at: job.last_cover_check_unix,
-            cover_total: job.last_cover_total,
-            cover_kernels: job.last_cover_kernels,
-            cover_outputs: job.last_cover_outputs,
-            cover_error: job.last_cover_error.clone(),
-            spreading: Some(job.spreading),
-        },
+        Some(job) if job.current_output_id == output_id && job.phase().is_active() => {
+            LiveJobFields {
+                phase: Some(job.phase()),
+                error: job.last_error.clone(),
+                target: Some(job.target_depth),
+                counted: Some(job.effective_depth),
+                cover_hold: job.cover_hold,
+                cover_min: Some(job.cover_min),
+                cover_seen: job.last_cover_count,
+                cover_checked_at: job.last_cover_check_unix,
+                cover_total: job.last_cover_total,
+                cover_kernels: job.last_cover_kernels,
+                cover_outputs: job.last_cover_outputs,
+                cover_error: job.last_cover_error.clone(),
+                spreading: Some(job.spreading),
+            }
+        }
         Some(job)
-            if job.current_output_id == output_id && job.phase == crate::dto::ChurnPhase::Done =>
+            if job.current_output_id == output_id
+                && job.phase() == crate::dto::ChurnPhase::Done =>
         {
             LiveJobFields {
                 target: Some(job.target_depth),
@@ -3804,7 +3807,7 @@ mod churn_field_tests {
         let id = output_id();
         let mut job = churn::new_job(&id, true, 4, 50_000, 2, false).unwrap();
         job.effective_depth = 2;
-        job.phase = ChurnPhase::PausedSolo;
+        job.set_phase_for_test(ChurnPhase::PausedSolo);
         let fields = churn_fields(&id, true, &BTreeMap::new(), Some(&job));
         assert_eq!(fields.churn_phase, Some(ChurnPhase::PausedSolo));
         assert_eq!(fields.churn_target, Some(4));
@@ -3816,7 +3819,7 @@ mod churn_field_tests {
     fn finished_job_does_not_stamp_progress() {
         let id = output_id();
         let mut job = churn::new_job(&id, false, 1, 50_000, 2, false).unwrap();
-        job.phase = ChurnPhase::Done;
+        job.set_phase_for_test(ChurnPhase::Done);
         job.effective_depth = 1;
         let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
         assert!(fields.churn_phase.is_none());
@@ -3829,7 +3832,7 @@ mod churn_field_tests {
     fn waiting_job_stamps_the_last_mempool_read() {
         let id = output_id();
         let mut job = churn::new_job(&id, false, 1, 50_000, 2, false).unwrap();
-        job.phase = ChurnPhase::WaitingForCover;
+        job.set_phase_for_test(ChurnPhase::WaitingForCover);
         churn::note_cover_read(
             &mut job,
             &super::CoverRead {
@@ -3860,7 +3863,7 @@ mod churn_field_tests {
         // The last good counts stay so the card does not go blank.
         assert_eq!(fields.churn_cover_total, Some(309));
 
-        job.phase = ChurnPhase::Done;
+        job.set_phase_for_test(ChurnPhase::Done);
         let fields = churn_fields(&id, false, &BTreeMap::new(), Some(&job));
         assert!(fields.churn_cover_checked_at.is_none());
         assert!(fields.churn_cover_error.is_none());

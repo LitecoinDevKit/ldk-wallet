@@ -98,7 +98,8 @@ pub fn score_1in1_hop(parent: Option<MmrSizes>, inclusion: Option<MmrSizes>) -> 
 pub struct ChurnJob {
     #[serde(default = "default_version")]
     pub version: u32,
-    pub phase: ChurnPhase,
+    /// Private so every change goes through [`transition`].
+    phase: ChurnPhase,
     pub current_output_id: String,
     pub origin_output_id: String,
     pub target_depth: u32,
@@ -162,6 +163,18 @@ pub struct ChurnJob {
     /// A spread deadline is running on the armed record.
     #[serde(default)]
     pub spreading: bool,
+}
+
+impl ChurnJob {
+    pub fn phase(&self) -> ChurnPhase {
+        self.phase
+    }
+
+    /// Fixtures outside this module start a job in a given phase without replaying events.
+    #[cfg(test)]
+    pub(crate) fn set_phase_for_test(&mut self, phase: ChurnPhase) {
+        self.phase = phase;
+    }
 }
 
 fn default_cover_min() -> u32 {
@@ -463,6 +476,271 @@ pub fn grace_elapsed(broadcast_height: u32, tip_height: u32) -> bool {
     tip_height.saturating_sub(broadcast_height) >= INCLUSION_GRACE_BLOCKS
 }
 
+/// What happened to a self-spend job. [`transition`] is the only way to change its phase.
+#[derive(Debug, Clone)]
+pub enum ChurnEvent<'a> {
+    /// A hop was signed and applied locally: the first hop, or a re-sign.
+    Signed,
+    /// The next prepared hop became the armed hop after a score.
+    ArmedNext,
+    /// The armed hop reached the network.
+    Broadcast {
+        wtxid: &'a str,
+        new_output_id: &'a str,
+        /// Wallet tip at send time. The hop lands strictly after it.
+        height: u32,
+    },
+    BroadcastFailed(String),
+    Scored(HopScore),
+    /// The broadcast never landed. The job points back at the coin that can be sent again.
+    NotIncluded {
+        restored_output_id: &'a str,
+    },
+    /// A later sync may still read the header an unscored hop needs.
+    StillUnscored,
+    Retry,
+    Cancel,
+    /// The armed hop's raw transaction was deleted after its expiry.
+    Expired,
+    /// Another transaction spent the input before the hop was broadcast.
+    ForeignSpend,
+    /// The prepared chain is used up before the target count.
+    Finished,
+}
+
+/// The table key for a [`ChurnEvent`]. A mixed score splits on whether it reaches the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChurnEventKind {
+    Signed,
+    ArmedNext,
+    Broadcast,
+    BroadcastFailed,
+    ScoredUnscored,
+    ScoredSolo,
+    ScoredMixed,
+    ScoredFinal,
+    NotIncluded,
+    StillUnscored,
+    Retry,
+    Cancel,
+    Expired,
+    ForeignSpend,
+    Finished,
+}
+
+impl ChurnEventKind {
+    #[cfg(test)]
+    pub const ALL: [Self; 15] = [
+        Self::Signed,
+        Self::ArmedNext,
+        Self::Broadcast,
+        Self::BroadcastFailed,
+        Self::ScoredUnscored,
+        Self::ScoredSolo,
+        Self::ScoredMixed,
+        Self::ScoredFinal,
+        Self::NotIncluded,
+        Self::StillUnscored,
+        Self::Retry,
+        Self::Cancel,
+        Self::Expired,
+        Self::ForeignSpend,
+        Self::Finished,
+    ];
+}
+
+impl ChurnEvent<'_> {
+    pub fn kind(&self, job: &ChurnJob) -> ChurnEventKind {
+        match self {
+            Self::Signed => ChurnEventKind::Signed,
+            Self::ArmedNext => ChurnEventKind::ArmedNext,
+            Self::Broadcast { .. } => ChurnEventKind::Broadcast,
+            Self::BroadcastFailed(_) => ChurnEventKind::BroadcastFailed,
+            Self::Scored(HopScore::Unscored) => ChurnEventKind::ScoredUnscored,
+            Self::Scored(HopScore::Solo) => ChurnEventKind::ScoredSolo,
+            Self::Scored(HopScore::Mixed { .. }) => {
+                if job.effective_depth.saturating_add(1) >= job.target_depth {
+                    ChurnEventKind::ScoredFinal
+                } else {
+                    ChurnEventKind::ScoredMixed
+                }
+            }
+            Self::NotIncluded { .. } => ChurnEventKind::NotIncluded,
+            Self::StillUnscored => ChurnEventKind::StillUnscored,
+            Self::Retry => ChurnEventKind::Retry,
+            Self::Cancel => ChurnEventKind::Cancel,
+            Self::Expired => ChurnEventKind::Expired,
+            Self::ForeignSpend => ChurnEventKind::ForeignSpend,
+            Self::Finished => ChurnEventKind::Finished,
+        }
+    }
+}
+
+/// Every legal phase change. `Done` and `Cancelled` have no outgoing rows.
+/// `docs/CHURN.md` embeds a diagram generated from this table.
+pub const TRANSITIONS: &[(ChurnPhase, ChurnEventKind, ChurnPhase)] = {
+    use ChurnEventKind as E;
+    use ChurnPhase::*;
+    &[
+        (WaitingToBroadcast, E::Signed, WaitingForCover),
+        (WaitingForCover, E::Signed, WaitingForCover),
+        (WaitingForCover, E::ArmedNext, WaitingForCover),
+        (PausedSolo, E::ArmedNext, WaitingForCover),
+        (WaitingForCover, E::Broadcast, WaitingConfirm),
+        (WaitingToBroadcast, E::Broadcast, WaitingConfirm),
+        (WaitingForCover, E::BroadcastFailed, WaitingToBroadcast),
+        (WaitingToBroadcast, E::BroadcastFailed, WaitingToBroadcast),
+        (WaitingConfirm, E::ScoredUnscored, PausedUnscored),
+        (PausedUnscored, E::ScoredUnscored, PausedUnscored),
+        (WaitingConfirm, E::ScoredSolo, PausedSolo),
+        (PausedUnscored, E::ScoredSolo, PausedSolo),
+        (WaitingConfirm, E::ScoredMixed, WaitingForCover),
+        (PausedUnscored, E::ScoredMixed, WaitingForCover),
+        (WaitingConfirm, E::ScoredFinal, Done),
+        (PausedUnscored, E::ScoredFinal, Done),
+        (WaitingConfirm, E::NotIncluded, WaitingToBroadcast),
+        (PausedUnscored, E::NotIncluded, WaitingToBroadcast),
+        (PausedUnscored, E::StillUnscored, WaitingConfirm),
+        (PausedUnscored, E::Retry, WaitingConfirm),
+        (PausedSolo, E::Retry, WaitingForCover),
+        (WaitingToBroadcast, E::Retry, WaitingForCover),
+        (WaitingForCover, E::Retry, WaitingForCover),
+        (WaitingToBroadcast, E::Cancel, Cancelled),
+        (WaitingForCover, E::Cancel, Cancelled),
+        (PausedSolo, E::Cancel, Cancelled),
+        (PausedUnscored, E::Cancel, Cancelled),
+        (WaitingForCover, E::Expired, WaitingForCover),
+        (WaitingForCover, E::ForeignSpend, WaitingForCover),
+        (WaitingForCover, E::Finished, Done),
+    ]
+};
+
+pub fn next_phase(from: ChurnPhase, kind: ChurnEventKind) -> Option<ChurnPhase> {
+    TRANSITIONS
+        .iter()
+        .find(|(f, k, _)| *f == from && *k == kind)
+        .map(|(_, _, to)| *to)
+}
+
+fn rejection(from: ChurnPhase, kind: ChurnEventKind) -> WalletError {
+    use ChurnEventKind as E;
+    let message = match kind {
+        E::Broadcast => "This self-spend is not ready to broadcast.",
+        E::ScoredUnscored | E::ScoredSolo | E::ScoredMixed | E::ScoredFinal | E::NotIncluded => {
+            "This self-spend is not waiting on a block."
+        }
+        E::Retry => "There is no paused self-spend to try again.",
+        // Once broadcast, the hop is on the network. Cancel would only drop local
+        // tracking; it cannot unbroadcast.
+        E::Cancel if from == ChurnPhase::WaitingConfirm => {
+            "This self-spend is already on the network. Wait for the next block."
+        }
+        E::Cancel => "There is no self-spend to cancel.",
+        _ => "This self-spend cannot change from its current state.",
+    };
+    WalletError::BuildTx(message.into())
+}
+
+/// Apply `event` if the table allows it from the current phase. A rejected event changes nothing.
+pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), WalletError> {
+    let kind = event.kind(job);
+    if kind == ChurnEventKind::Retry && job.input_spent_elsewhere {
+        return Err(WalletError::BuildTx(format!(
+            "{FOREIGN_SPEND} Cancel this self-spend."
+        )));
+    }
+    let from = job.phase;
+    let Some(to) = next_phase(from, kind) else {
+        crate::diag::log(format!("self-spend: rejected {kind:?} in {from:?}"));
+        return Err(rejection(from, kind));
+    };
+    match event {
+        ChurnEvent::Signed | ChurnEvent::ArmedNext => {
+            job.pending_wtxid = None;
+            job.broadcast_height = None;
+            job.last_check = None;
+            job.last_error = None;
+            job.cover_hold = None;
+            job.needs_resign = false;
+            job.header_cache.clear();
+        }
+        ChurnEvent::Broadcast {
+            wtxid,
+            new_output_id,
+            height,
+        } => {
+            let new_id = mweb_frozen::normalize_output_id(new_output_id)?;
+            job.pending_wtxid = Some(wtxid.to_string());
+            job.created_output_id = Some(new_id.clone());
+            job.current_output_id = new_id;
+            job.last_error = None;
+            job.broadcast_height = Some(height);
+            job.last_check = None;
+            job.header_cache.clear();
+            job.cover_hold = None;
+            job.needs_resign = false;
+            clear_cover_read(job);
+            job.spreading = false;
+        }
+        ChurnEvent::BroadcastFailed(error) => {
+            job.last_error = Some(error);
+        }
+        ChurnEvent::Scored(score) => match score {
+            HopScore::Unscored => {}
+            HopScore::Solo => {
+                job.last_other_kernels = None;
+                job.last_other_outputs = None;
+            }
+            HopScore::Mixed {
+                other_kernels,
+                other_outputs,
+            } => {
+                job.effective_depth = job.effective_depth.saturating_add(1);
+                job.last_other_kernels = Some(other_kernels);
+                job.last_other_outputs = Some(other_outputs);
+            }
+        },
+        ChurnEvent::NotIncluded { restored_output_id } => {
+            let id = mweb_frozen::normalize_output_id(restored_output_id)?;
+            job.current_output_id = id;
+            job.pending_wtxid = None;
+            job.created_output_id = None;
+            job.broadcast_height = None;
+            job.header_cache.clear();
+            job.last_error = Some("This spend was not included in a block.".into());
+            job.needs_resign = true;
+        }
+        ChurnEvent::StillUnscored | ChurnEvent::Cancel => {}
+        ChurnEvent::Retry => {
+            job.last_error = None;
+            if from != ChurnPhase::PausedUnscored {
+                job.cover_hold = None;
+            }
+            if from == ChurnPhase::PausedSolo {
+                // The prepared chain is used up. The next hop is a new signature.
+                job.needs_resign = true;
+            }
+        }
+        ChurnEvent::Expired => {
+            job.needs_resign = true;
+            job.last_error = Some(EXPIRED_SPEND.into());
+            job.cover_hold = None;
+        }
+        ChurnEvent::ForeignSpend => {
+            job.needs_resign = false;
+            job.input_spent_elsewhere = true;
+            job.last_error = Some(FOREIGN_SPEND.into());
+            job.cover_hold = None;
+        }
+        ChurnEvent::Finished => {
+            job.cover_hold = None;
+            job.needs_resign = false;
+        }
+    }
+    job.phase = to;
+    Ok(())
+}
+
 /// Record a broadcast. The next hop must not be built until this one is scored.
 /// `broadcast_height` is the wallet tip at send time; the hop lands strictly after it.
 pub fn note_broadcast(
@@ -471,28 +749,14 @@ pub fn note_broadcast(
     new_output_id: &str,
     broadcast_height: u32,
 ) -> Result<(), WalletError> {
-    if !matches!(
-        job.phase,
-        ChurnPhase::WaitingForCover | ChurnPhase::WaitingToBroadcast
-    ) {
-        return Err(WalletError::BuildTx(
-            "This self-spend is not ready to broadcast.".into(),
-        ));
-    }
-    let new_id = mweb_frozen::normalize_output_id(new_output_id)?;
-    job.pending_wtxid = Some(wtxid.to_string());
-    job.created_output_id = Some(new_id.clone());
-    job.current_output_id = new_id;
-    job.phase = ChurnPhase::WaitingConfirm;
-    job.last_error = None;
-    job.broadcast_height = Some(broadcast_height);
-    job.last_check = None;
-    job.header_cache.clear();
-    job.cover_hold = None;
-    job.needs_resign = false;
-    clear_cover_read(job);
-    job.spreading = false;
-    Ok(())
+    transition(
+        job,
+        ChurnEvent::Broadcast {
+            wtxid,
+            new_output_id,
+            height: broadcast_height,
+        },
+    )
 }
 
 /// Where a hop can sit: `(broadcast_height, dated_height]`, capped at [`SCORE_WINDOW_CAP`] blocks.
@@ -730,29 +994,11 @@ pub fn undated_hop(
 /// The broadcast never landed. Point the job at the coin that can be sent again.
 /// A saved error keeps [`ready_to_broadcast`] false until the user retries.
 pub fn note_not_included(job: &mut ChurnJob, restored_output_id: &str) -> Result<(), WalletError> {
-    if !matches!(
-        job.phase,
-        ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
-    ) {
-        return Err(WalletError::BuildTx(
-            "This self-spend is not waiting on a block.".into(),
-        ));
-    }
-    let id = mweb_frozen::normalize_output_id(restored_output_id)?;
-    job.current_output_id = id;
-    job.pending_wtxid = None;
-    job.created_output_id = None;
-    job.broadcast_height = None;
-    job.header_cache.clear();
-    job.last_error = Some("This spend was not included in a block.".into());
-    job.needs_resign = true;
-    job.phase = ChurnPhase::WaitingToBroadcast;
-    Ok(())
+    transition(job, ChurnEvent::NotIncluded { restored_output_id })
 }
 
-pub fn note_broadcast_error(job: &mut ChurnJob, error: String) {
-    job.last_error = Some(error);
-    job.phase = ChurnPhase::WaitingToBroadcast;
+pub fn note_broadcast_error(job: &mut ChurnJob, error: String) -> Result<(), WalletError> {
+    transition(job, ChurnEvent::BroadcastFailed(error))
 }
 
 /// Move the depth record onto the new output without counting a block yet.
@@ -781,38 +1027,7 @@ pub fn inherit_depth(
 
 /// Apply a header score. Only legal in `WaitingConfirm` or `PausedUnscored`.
 pub fn apply_score(job: &mut ChurnJob, score: HopScore) -> Result<(), WalletError> {
-    if !matches!(
-        job.phase,
-        ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
-    ) {
-        return Err(WalletError::BuildTx(
-            "This self-spend is not waiting on a block.".into(),
-        ));
-    }
-    match score {
-        HopScore::Unscored => {
-            job.phase = ChurnPhase::PausedUnscored;
-        }
-        HopScore::Solo => {
-            job.last_other_kernels = None;
-            job.last_other_outputs = None;
-            job.phase = ChurnPhase::PausedSolo;
-        }
-        HopScore::Mixed {
-            other_kernels,
-            other_outputs,
-        } => {
-            job.effective_depth = job.effective_depth.saturating_add(1);
-            job.last_other_kernels = Some(other_kernels);
-            job.last_other_outputs = Some(other_outputs);
-            job.phase = if job.effective_depth >= job.target_depth {
-                ChurnPhase::Done
-            } else {
-                ChurnPhase::WaitingForCover
-            };
-        }
-    }
-    Ok(())
+    transition(job, ChurnEvent::Scored(score))
 }
 
 /// Fold a score into the depth map for the coin the hop created.
@@ -852,53 +1067,11 @@ pub fn commit_score(
 }
 
 pub fn request_retry(job: &mut ChurnJob) -> Result<(), WalletError> {
-    if job.input_spent_elsewhere {
-        return Err(WalletError::BuildTx(format!(
-            "{FOREIGN_SPEND} Cancel this self-spend."
-        )));
-    }
-    match job.phase {
-        ChurnPhase::PausedUnscored => {
-            job.phase = ChurnPhase::WaitingConfirm;
-            job.last_error = None;
-            Ok(())
-        }
-        ChurnPhase::PausedSolo => {
-            // The prepared chain is used up. The next hop is a new signature.
-            job.needs_resign = true;
-            job.phase = ChurnPhase::WaitingForCover;
-            job.last_error = None;
-            job.cover_hold = None;
-            Ok(())
-        }
-        ChurnPhase::WaitingToBroadcast | ChurnPhase::WaitingForCover => {
-            job.last_error = None;
-            job.cover_hold = None;
-            job.phase = ChurnPhase::WaitingForCover;
-            Ok(())
-        }
-        _ => Err(WalletError::BuildTx(
-            "There is no paused self-spend to try again.".into(),
-        )),
-    }
+    transition(job, ChurnEvent::Retry)
 }
 
 pub fn request_cancel(job: &mut ChurnJob) -> Result<(), WalletError> {
-    if !job.phase.is_active() {
-        return Err(WalletError::BuildTx(
-            "There is no self-spend to cancel.".into(),
-        ));
-    }
-    // Once broadcast, the hop is on the network. Cancel would only drop local
-    // tracking; it cannot unbroadcast. Wait for inclusion, solo pause, or a
-    // not-included recovery path instead.
-    if job.phase == ChurnPhase::WaitingConfirm {
-        return Err(WalletError::BuildTx(
-            "This self-spend is already on the network. Wait for the next block.".into(),
-        ));
-    }
-    job.phase = ChurnPhase::Cancelled;
-    Ok(())
+    transition(job, ChurnEvent::Cancel)
 }
 
 pub fn status_view(job: &ChurnJob) -> ChurnStatus {
@@ -957,24 +1130,6 @@ pub fn follow_score(phase: ChurnPhase, hops_remaining: bool) -> ScoreFollow {
         (ChurnPhase::WaitingForCover, false) => ScoreFollow::FinishShort,
         _ => ScoreFollow::Stay,
     }
-}
-
-/// Clear the in-flight hop so the next signed spend can be scored on its own.
-pub fn mark_waiting_for_cover(job: &mut ChurnJob) {
-    job.phase = ChurnPhase::WaitingForCover;
-    job.pending_wtxid = None;
-    job.broadcast_height = None;
-    job.last_check = None;
-    job.last_error = None;
-    job.cover_hold = None;
-    job.needs_resign = false;
-    job.header_cache.clear();
-}
-
-pub fn finish_chain(job: &mut ChurnJob) {
-    job.phase = ChurnPhase::Done;
-    job.cover_hold = None;
-    job.needs_resign = false;
 }
 
 pub fn unix_now() -> u64 {
@@ -1245,6 +1400,25 @@ mod tests {
         let mut job = new_job(&"ab".repeat(32), true, 2, 50_000, COVER_MIN_DEFAULT, false).unwrap();
         note_broadcast(&mut job, "wtxid", &"cd".repeat(32), 100).unwrap();
         job
+    }
+
+    #[test]
+    fn cancelled_stays_cancelled_after_expired() {
+        let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::Cancelled;
+        let before = job.clone();
+        assert!(transition(&mut job, ChurnEvent::Expired).is_err());
+        assert_eq!(job, before);
+    }
+
+    #[test]
+    fn done_ignores_retry() {
+        let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();
+        job.phase = ChurnPhase::Done;
+        let before = job.clone();
+        let err = request_retry(&mut job).unwrap_err().to_string();
+        assert!(err.contains("no paused self-spend"), "{err}");
+        assert_eq!(job, before);
     }
 
     #[test]

@@ -4806,7 +4806,7 @@ fn churn_start_facts(
     let info = mweb::churn_coin_info(mweb, tip, output_id)?;
     let id = mweb_frozen::normalize_output_id(output_id)?;
     let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids.contains(&id);
-    let job_active = churn::read_job(&state.data_dir)?.is_some_and(|job| job.phase.is_active());
+    let job_active = churn::read_job(&state.data_dir)?.is_some_and(|job| job.phase().is_active());
     let recorded = churn::depth_of(&state.data_dir, &id)?.is_some_and(|record| record.from_pegin);
     Ok((info, frozen, job_active, recorded))
 }
@@ -4859,6 +4859,7 @@ fn select_churn_coin(
 
 /// Sign the whole chain, apply only the first hop to the coin set, and arm it.
 fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(), WalletError> {
+    churn::transition(job, churn::ChurnEvent::Signed)?;
     let coin = select_churn_coin(state, &job.current_output_id)?;
     let spent_id = hex::encode(coin.output_id);
     let network = state.network;
@@ -4908,7 +4909,6 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
     };
     job.current_output_id = first.created_output_id.clone();
     job.created_output_id = Some(first.created_output_id);
-    churn::mark_waiting_for_cover(job);
     churn::write_armed(&data_dir, &armed)?;
     churn::write_job(&data_dir, job)?;
     Ok(())
@@ -4916,6 +4916,7 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
 
 /// One new signature after a solo pause, a missed block, or an expiry.
 fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(), WalletError> {
+    churn::transition(job, churn::ChurnEvent::Signed)?;
     let coin = select_churn_coin(state, &job.current_output_id)?;
     let spent_id = hex::encode(coin.output_id);
     let network = state.network;
@@ -4964,7 +4965,6 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
     };
     job.current_output_id = hop.created_output_id.clone();
     job.created_output_id = Some(hop.created_output_id);
-    churn::mark_waiting_for_cover(job);
     churn::write_armed(&data_dir, &armed)?;
     Ok(())
 }
@@ -5014,6 +5014,9 @@ fn undo_expired_local(state: &mut WalletState) -> Result<(), WalletError> {
     let Some(mut job) = churn::read_job(&state.data_dir)? else {
         return Ok(());
     };
+    if !job.phase().is_active() {
+        return churn::remove_armed(&state.data_dir);
+    }
     let data_dir = state.data_dir.clone();
     expire_armed(Some(state), &data_dir, &mut job, &mut record)
 }
@@ -5067,14 +5070,11 @@ fn expire_armed(
     job: &mut churn::ChurnJob,
     record: &mut churn::ArmedRecord,
 ) -> Result<(), WalletError> {
+    churn::transition(job, churn::ChurnEvent::Expired)?;
     let revert = record
         .current()
         .is_some_and(|hop| hop.local_applied && !hop.broadcast);
     churn::wipe_raw_tail(record);
-    job.needs_resign = true;
-    job.last_error = Some(churn::EXPIRED_SPEND.into());
-    job.cover_hold = None;
-    job.phase = ChurnPhase::WaitingForCover;
     if revert {
         if let Some(state) = state {
             revert_unbroadcast_hop(state, job)?;
@@ -5093,6 +5093,7 @@ fn note_foreign_spend(
     job: &mut churn::ChurnJob,
     record: &mut churn::ArmedRecord,
 ) -> Result<(), WalletError> {
+    churn::transition(job, churn::ChurnEvent::ForeignSpend)?;
     if let Some(hop) = record.current() {
         if hop.local_applied && !hop.broadcast {
             let wtxid = hop.wtxid.clone();
@@ -5103,11 +5104,6 @@ fn note_foreign_spend(
             }
         }
     }
-    job.needs_resign = false;
-    job.input_spent_elsewhere = true;
-    job.last_error = Some(churn::FOREIGN_SPEND.into());
-    job.cover_hold = None;
-    job.phase = ChurnPhase::WaitingForCover;
     // An expired record would make the next pass report this as an expiry.
     churn::remove_armed(&state.data_dir)?;
     churn::write_job(&state.data_dir, job)?;
@@ -5154,8 +5150,9 @@ fn send_armed_hop(
             Ok(())
         }
         Err(e) => {
-            churn::note_broadcast_error(job, e.to_string());
-            churn::write_job(data_dir, job)?;
+            if churn::note_broadcast_error(job, e.to_string()).is_ok() {
+                churn::write_job(data_dir, job)?;
+            }
             Err(e)
         }
     }
@@ -5167,29 +5164,29 @@ fn promote_after_score(
 ) -> Result<(), WalletError> {
     let data_dir = state.data_dir.clone();
     let Some(mut record) = churn::read_armed(&data_dir)? else {
-        if job.phase == ChurnPhase::WaitingForCover {
-            churn::finish_chain(job);
+        if job.phase() == ChurnPhase::WaitingForCover {
+            churn::transition(job, churn::ChurnEvent::Finished)?;
             mweb_frozen::set_locked(&data_dir, &job.current_output_id, false)?;
             churn::write_job(&data_dir, job)?;
         }
         return Ok(());
     };
     let tip = state.wallet.latest_checkpoint().height();
-    match churn::follow_score(job.phase, record.hops_remaining()) {
+    match churn::follow_score(job.phase(), record.hops_remaining()) {
         churn::ScoreFollow::Stay => {
-            if job.phase == ChurnPhase::Done {
+            if job.phase() == ChurnPhase::Done {
                 let _ = churn::remove_armed(&data_dir);
             }
         }
         churn::ScoreFollow::ArmNext => {
             if churn::arm_next(&mut record, churn::unix_now(), tip) {
-                churn::mark_waiting_for_cover(job);
+                churn::transition(job, churn::ChurnEvent::ArmedNext)?;
                 churn::write_armed(&data_dir, &record)?;
                 churn::write_job(&data_dir, job)?;
             }
         }
         churn::ScoreFollow::FinishShort => {
-            churn::finish_chain(job);
+            churn::transition(job, churn::ChurnEvent::Finished)?;
             mweb_frozen::set_locked(&data_dir, &job.current_output_id, false)?;
             let _ = churn::remove_armed(&data_dir);
             churn::write_job(&data_dir, job)?;
@@ -5347,7 +5344,7 @@ fn drive_churn(
         return Ok(());
     };
     if matches!(
-        job.phase,
+        job.phase(),
         ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
     ) {
         let output_id = job.current_output_id.clone();
@@ -5366,7 +5363,7 @@ fn drive_churn(
                     }
                     let from_pegin = job.from_pegin;
                     churn::commit_score(&state.data_dir, &output_id, from_pegin, score)?;
-                    if job.phase == ChurnPhase::Done {
+                    if job.phase() == ChurnPhase::Done {
                         mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
                     }
                     churn::write_job(&state.data_dir, &job)?;
@@ -5394,8 +5391,8 @@ fn drive_churn(
                     churn::write_job(&state.data_dir, &job)?;
                 }
             }
-            ResolvedHop::NotYet if job.phase == ChurnPhase::PausedUnscored => {
-                job.phase = ChurnPhase::WaitingConfirm;
+            ResolvedHop::NotYet if job.phase() == ChurnPhase::PausedUnscored => {
+                churn::transition(&mut job, churn::ChurnEvent::StillUnscored)?;
                 churn::write_job(&state.data_dir, &job)?;
             }
             ResolvedHop::NotYet => {}
@@ -5584,7 +5581,7 @@ mod tests {
 
         let output_id = "ab".repeat(32);
         let mut job = churn::new_job(&output_id, false, 1, 50_000, 2, false).unwrap();
-        job.phase = ChurnPhase::WaitingForCover;
+        job.set_phase_for_test(ChurnPhase::WaitingForCover);
         churn::write_job(dir.path(), &job).unwrap();
         let record = churn::ArmedRecord {
             version: 1,
@@ -5614,7 +5611,7 @@ mod tests {
         cover_gate_at(None, dir.path()).unwrap();
 
         let job = churn::read_job(dir.path()).unwrap().unwrap();
-        assert_eq!(job.phase, ChurnPhase::WaitingForCover);
+        assert_eq!(job.phase(), ChurnPhase::WaitingForCover);
         assert_eq!(job.cover_hold, Some(CoverHold::Waiting));
         assert!(job.last_cover_check_unix.is_some_and(|t| t >= before));
         assert!(
@@ -5631,7 +5628,8 @@ mod tests {
         assert!(!record.hops[0].broadcast);
     }
 
-    fn app_with_foreign_spent_job(dir: &Path) -> WalletApp {
+    /// A testnet wallet with a job on the "cd…" output, armed to spend "ab…".
+    fn app_with_job(dir: &Path, phase: ChurnPhase, expired: bool) -> WalletApp {
         let app = WalletApp::new(dir);
         app.create(
             dir,
@@ -5643,15 +5641,15 @@ mod tests {
         )
         .expect("create");
         {
-            let mut guard = app.lock_state().unwrap();
-            let state = guard.as_mut().unwrap();
+            let guard = app.lock_state().unwrap();
+            let state = guard.as_ref().unwrap();
             let spent = "ab".repeat(32);
             let created = "cd".repeat(32);
             let mut job = churn::new_job(&spent, false, 1, 50_000, 2, false).unwrap();
-            job.phase = ChurnPhase::WaitingForCover;
+            job.set_phase_for_test(phase);
             job.current_output_id = created.clone();
             job.created_output_id = Some(created.clone());
-            let mut record = churn::ArmedRecord {
+            let record = churn::ArmedRecord {
                 version: 1,
                 hops: vec![churn::ArmedHop {
                     raw_hex: "aa".into(),
@@ -5671,13 +5669,42 @@ mod tests {
                 cover_min: 2,
                 send_after: None,
                 own_ids: std::collections::BTreeSet::new(),
-                expired: false,
+                expired,
             };
             churn::write_job(&state.data_dir, &job).unwrap();
             churn::write_armed(&state.data_dir, &record).unwrap();
+        }
+        app
+    }
+
+    fn app_with_foreign_spent_job(dir: &Path) -> WalletApp {
+        let app = app_with_job(dir, ChurnPhase::WaitingForCover, false);
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let mut job = churn::read_job(&state.data_dir).unwrap().unwrap();
+            let mut record = churn::read_armed(&state.data_dir).unwrap().unwrap();
             note_foreign_spend(state, &mut job, &mut record).unwrap();
         }
         app
+    }
+
+    /// A stale expired record left behind a finished job must not bring it back.
+    #[test]
+    fn expired_record_does_not_revive_a_finished_job() {
+        for phase in [ChurnPhase::Cancelled, ChurnPhase::Done] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = app_with_job(dir.path(), phase, true);
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+
+            undo_expired_local(state).unwrap();
+
+            let job = churn::read_job(&state.data_dir).unwrap().unwrap();
+            assert_eq!(job.phase(), phase);
+            assert!(job.last_error.is_none());
+            assert!(churn::read_armed(&state.data_dir).unwrap().is_none());
+        }
     }
 
     /// The next background pass must not turn a foreign spend into an expiry.

@@ -19,6 +19,8 @@ pub mod explorer;
 mod history_export;
 mod insights;
 mod labels;
+#[cfg(test)]
+mod lock;
 mod meta;
 mod metadata;
 mod mweb;

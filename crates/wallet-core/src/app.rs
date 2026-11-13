@@ -5889,6 +5889,7 @@ mod lock_lifecycle_tests {
     use super::WalletApp;
     use crate::dto::{CreateWalletRequest, UnlockRequest};
     use crate::error::WalletError;
+    use crate::lock::{LockEvent, LockState, LOCK_TRANSITIONS};
     use crate::network::WalletNetwork;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -6022,6 +6023,71 @@ mod lock_lifecycle_tests {
         app.lock();
 
         assert!(matches!(app.lock_state(), Err(WalletError::Locked)));
+    }
+
+    /// The state `crate::lock::LockState` names for what the app holds now.
+    /// `held` is the guard a test is holding, since the mutex is then taken.
+    fn observe(app: &WalletApp, held: Option<&super::StateGuard<'_>>) -> LockState {
+        let loaded = match held {
+            Some(guard) => guard.is_some(),
+            None => state_loaded(app),
+        };
+        let pending = app.pending_lock.load(Ordering::Acquire);
+        match (app.is_locked(), pending, loaded) {
+            (true, false, false) => LockState::Locked,
+            (false, false, false) => LockState::UnlockedEmpty,
+            (false, false, true) => LockState::Loaded,
+            (true, true, true) => LockState::LockPending,
+            other => panic!("(locked, pending, loaded) = {other:?} is not in the lock table"),
+        }
+    }
+
+    /// Every row of `LOCK_TRANSITIONS`, reproduced on a real app.
+    #[test]
+    fn lock_table_matches_behavior() {
+        for (from, event, to) in LOCK_TRANSITIONS {
+            let dir = tempfile::tempdir().unwrap();
+            let app = unlocked_app(dir.path());
+            let mut held = None;
+            match from {
+                LockState::Locked => app.lock(),
+                LockState::UnlockedEmpty => {
+                    app.lock();
+                    app.unlock(UnlockRequest {
+                        passphrase: PASSPHRASE.into(),
+                    })
+                    .unwrap();
+                }
+                LockState::Loaded => {}
+                LockState::LockPending => {
+                    held = Some(app.lock_state().unwrap());
+                    app.lock();
+                }
+            }
+            assert_eq!(observe(&app, held.as_ref()), *from, "setup for {event:?}");
+
+            match event {
+                LockEvent::Unlock => app
+                    .unlock(UnlockRequest {
+                        passphrase: PASSPHRASE.into(),
+                    })
+                    .unwrap(),
+                LockEvent::Load => {
+                    app.load(dir.path()).unwrap();
+                }
+                LockEvent::Lock => app.lock(),
+                LockEvent::LockWhileHeld => {
+                    held = Some(app.lock_state().unwrap());
+                    app.lock();
+                }
+                LockEvent::CheckLock => {
+                    let guard = held.as_mut().expect("a held guard");
+                    assert!(matches!(guard.check_lock(), Err(WalletError::Locked)));
+                }
+                LockEvent::ReleaseGuard => held = None,
+            }
+            assert_eq!(observe(&app, held.as_ref()), *to, "{event:?} from {from:?}");
+        }
     }
 
     /// Wipe is offered on the locked screen, so it must not need an unlock.

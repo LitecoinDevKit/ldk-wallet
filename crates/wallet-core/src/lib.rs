@@ -9,6 +9,8 @@ mod churn;
 mod contacts;
 mod descriptors;
 mod diag;
+#[cfg(test)]
+mod diagram;
 mod discovery;
 mod dto;
 mod electrum;
@@ -17,6 +19,8 @@ pub mod explorer;
 mod history_export;
 mod insights;
 mod labels;
+#[cfg(test)]
+mod lock;
 mod meta;
 mod metadata;
 mod mweb;

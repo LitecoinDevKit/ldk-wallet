@@ -28,52 +28,43 @@ Depth is local. Spent outputs leave the UTXO set, so a restore cannot reconstruc
 
 ## Phase transitions
 
-`ChurnPhase` lives in `wallet-core/src/dto.rs`. Every change goes through a helper in `churn.rs` except the three direct writes in `app.rs` noted below.
+`ChurnPhase` lives in `wallet-core/src/dto.rs`. The phase field on `ChurnJob` is private: the only way to change it is `churn::transition`, which looks up the current phase and the event in `churn::TRANSITIONS` and rejects anything that is not a row. A rejected event changes nothing and is written to the diagnostic log. `Done` and `Cancelled` have no outgoing rows.
 
+Event names: `Signed` is the first hop or a re-sign after Try again. `ArmedNext` is the next prepared hop after a score. `ScoredMixed` is a mixed block below the target and `ScoredFinal` is the one that reaches it. `StillUnscored` is a sync that still cannot read the block an unscored hop needs. `Finished` is a chain used up before the target. `ForeignSpend` is another transaction spending the input before the hop went out; after it, only Cancel works.
+
+The diagram below is generated from the table by a test in `churn.rs`, and CI fails when it is stale. After changing a row, run `UPDATE_DIAGRAMS=1 cargo test -p wallet-core transition_table_matches_docs` and commit the diff.
+
+<!-- churn-transitions:begin (generated; do not edit) -->
 ```mermaid
 stateDiagram-v2
     [*] --> WaitingToBroadcast: new_job
-    WaitingToBroadcast --> WaitingForCover: prepare_churn / retry
-    WaitingForCover --> WaitingForCover: expire_armed / note_foreign_spend / retry
-    WaitingForCover --> WaitingConfirm: note_broadcast
-    WaitingToBroadcast --> WaitingConfirm: note_broadcast
-    WaitingForCover --> WaitingToBroadcast: note_broadcast_error
-    WaitingConfirm --> PausedUnscored: apply_score(Unscored)
-    WaitingConfirm --> PausedSolo: apply_score(Solo)
-    WaitingConfirm --> WaitingForCover: apply_score(Mixed), below target
-    WaitingConfirm --> Done: apply_score(Mixed), target reached
-    WaitingConfirm --> WaitingToBroadcast: note_not_included
-    PausedUnscored --> WaitingConfirm: retry / next sync
-    PausedUnscored --> PausedSolo: apply_score(Solo)
-    PausedUnscored --> WaitingForCover: apply_score(Mixed), below target
-    PausedUnscored --> Done: apply_score(Mixed), target reached
-    PausedUnscored --> WaitingToBroadcast: note_not_included
-    PausedSolo --> WaitingForCover: retry (re-sign) / arm next hop
-    WaitingForCover --> Done: finish_chain, no signed hop left
-    WaitingToBroadcast --> Cancelled: request_cancel
-    WaitingForCover --> Cancelled: request_cancel
-    PausedSolo --> Cancelled: request_cancel
-    PausedUnscored --> Cancelled: request_cancel
+    WaitingToBroadcast --> WaitingForCover: Signed, Retry
+    WaitingForCover --> WaitingForCover: Signed, ArmedNext, Retry, Expired, ForeignSpend
+    PausedSolo --> WaitingForCover: ArmedNext, Retry
+    WaitingForCover --> WaitingConfirm: Broadcast
+    WaitingToBroadcast --> WaitingConfirm: Broadcast
+    WaitingForCover --> WaitingToBroadcast: BroadcastFailed
+    WaitingToBroadcast --> WaitingToBroadcast: BroadcastFailed
+    WaitingConfirm --> PausedUnscored: ScoredUnscored
+    PausedUnscored --> PausedUnscored: ScoredUnscored
+    WaitingConfirm --> PausedSolo: ScoredSolo
+    PausedUnscored --> PausedSolo: ScoredSolo
+    WaitingConfirm --> WaitingForCover: ScoredMixed
+    PausedUnscored --> WaitingForCover: ScoredMixed
+    WaitingConfirm --> Done: ScoredFinal
+    PausedUnscored --> Done: ScoredFinal
+    WaitingConfirm --> WaitingToBroadcast: NotIncluded
+    PausedUnscored --> WaitingToBroadcast: NotIncluded
+    PausedUnscored --> WaitingConfirm: StillUnscored, Retry
+    WaitingToBroadcast --> Cancelled: Cancel
+    WaitingForCover --> Cancelled: Cancel
+    PausedSolo --> Cancelled: Cancel
+    PausedUnscored --> Cancelled: Cancel
+    WaitingForCover --> Done: Finished
     Done --> [*]
     Cancelled --> [*]
 ```
-
-| Function | From | To | Checks the phase |
-|---|---|---|---|
-| `churn::new_job` | — | WaitingToBroadcast | — |
-| `churn::mark_waiting_for_cover` (from `prepare_churn`, `resign_one_hop`, `promote_after_score`) | any | WaitingForCover | no |
-| `churn::note_broadcast` | WaitingForCover, WaitingToBroadcast | WaitingConfirm | yes |
-| `churn::note_broadcast_error` | any | WaitingToBroadcast | no; only called after the cover gate saw WaitingForCover |
-| `churn::apply_score` | WaitingConfirm, PausedUnscored | PausedUnscored, PausedSolo, WaitingForCover, Done | yes |
-| `churn::note_not_included` | WaitingConfirm, PausedUnscored | WaitingToBroadcast | yes |
-| `churn::request_retry` | any, with `input_spent_elsewhere` | refused | yes |
-| `churn::request_retry` | PausedUnscored | WaitingConfirm | yes |
-| `churn::request_retry` | PausedSolo, WaitingToBroadcast, WaitingForCover | WaitingForCover | yes |
-| `churn::request_cancel` | any active phase except WaitingConfirm | Cancelled | yes |
-| `churn::finish_chain` (from `promote_after_score`) | any | Done | no; callers check WaitingForCover |
-| `app::expire_armed` (direct write) | any | WaitingForCover | no; `undo_expired_local` calls it whenever the armed record is expired |
-| `app::note_foreign_spend` (direct write) | any | WaitingForCover | no; only called after the cover gate saw WaitingForCover. Sets `input_spent_elsewhere` and deletes `churn_armed.json`; after that only Cancel works |
-| `app::drive_churn` (direct write) | PausedUnscored | WaitingConfirm | inline `if` |
+<!-- churn-transitions:end -->
 
 ## Copy
 

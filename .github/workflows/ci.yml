@@ -125,3 +125,6 @@ jobs:
 
       - name: Type-check and build UI
         run: npm run build
+
+      - name: UI phase diagram is current
+        run: npm run check:diagrams

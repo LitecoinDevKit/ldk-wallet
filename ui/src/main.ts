@@ -371,6 +371,7 @@ type WalletSettings = {
   auto_lock_minutes: number;
   electrum_active_url: string | null;
   litecoin_rpc_url: string | null;
+  broadcast_via_own_node: boolean;
   mweb_peers: string[];
   mweb_scheme: MwebScheme;
   explorer_base_url: string;
@@ -756,6 +757,9 @@ const el = {
   settingsActiveServer: document.querySelector<HTMLElement>("#settings-active-server")!,
   settingsAutoLock: document.querySelector<HTMLInputElement>("#settings-auto-lock")!,
   settingsRpc: document.querySelector<HTMLInputElement>("#settings-rpc")!,
+  settingsOwnNodeBroadcast: document.querySelector<HTMLInputElement>(
+    "#settings-own-node-broadcast",
+  )!,
   settingsPeers: document.querySelector<HTMLInputElement>("#settings-peers")!,
   settingsMwebScheme: document.querySelector<HTMLSelectElement>("#settings-mweb-scheme")!,
   peginAmount: document.querySelector<HTMLInputElement>("#pegin-amount")!,
@@ -4196,6 +4200,8 @@ async function loadSettings() {
       el.settingsActiveServer.textContent = "";
     }
     el.settingsRpc.value = s.litecoin_rpc_url ?? "";
+    el.settingsOwnNodeBroadcast.checked = s.broadcast_via_own_node ?? false;
+    syncOwnNodeBroadcastField();
     el.settingsPeers.value = s.mweb_peers.join(", ");
     // lip0004 now stores the same keys as litecoin-core.
     const scheme = s.mweb_scheme === "lip0004" ? "litecoin-core" : s.mweb_scheme;
@@ -5337,6 +5343,11 @@ el.settingsUnitLitoshis.addEventListener("change", () => {
 el.settingsHideBalances.addEventListener("change", () => {
   setHideBalances(el.settingsHideBalances.checked);
 });
+
+function syncOwnNodeBroadcastField(): void {
+  el.settingsOwnNodeBroadcast.disabled = el.settingsRpc.value.trim() === "";
+}
+el.settingsRpc.addEventListener("input", syncOwnNodeBroadcastField);
 
 el.feeCustom.addEventListener("input", () => {
   const raw = el.feeCustom.value.trim();
@@ -8897,6 +8908,7 @@ el.btnSaveSettings.addEventListener("click", async () => {
         electrum_use_public_fallback: el.settingsPublicFallback.checked,
         auto_lock_minutes: autoLock,
         litecoin_rpc_url: el.settingsRpc.value.trim() || null,
+        broadcast_via_own_node: el.settingsOwnNodeBroadcast.checked,
         mweb_peers: el.settingsPeers.value
           .split(",")
           .map((s) => s.trim())

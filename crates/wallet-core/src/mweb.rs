@@ -2200,6 +2200,7 @@ pub fn wipe_mweb_files(data_dir: &Path) -> Result<(), WalletError> {
         meta::mweb_coins_enc_path(data_dir),
         meta::mweb_sync_enc_path(data_dir),
         meta::mweb_index_enc_path(data_dir),
+        crate::broadcast_peers::path(data_dir),
     ] {
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -2467,10 +2468,8 @@ pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
     signer: &KeyMapWrapper,
     runtime: &mut MwebRuntime,
-    rpc_url: Option<&str>,
-    peers: &[String],
+    route: &BroadcastRoute,
     req: PeginRequest,
-    network: WalletNetwork,
 ) -> Result<PeginResult, WalletError> {
     let selected = req
         .selected_outpoints
@@ -2510,7 +2509,7 @@ pub fn pegin(
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
     // A peg-in tx carries MWEB extension data that Electrum servers reject
     // ("TX decode failed"), so it must take the RPC/P2P path like other MWEB txs.
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
+    broadcast_mweb_tx(&tx, route)?;
     apply_pegin_locally(wallet, runtime, &tx, prepared.outputs, &req)
 }
 
@@ -2579,29 +2578,79 @@ pub(crate) fn apply_pegin_transparent_spend(
 ///
 /// P2P goes first: a peer relays the tx through the Dandelion++ stem phase,
 /// while litecoind RPC submits it as our own and gives up that origin privacy.
-/// RPC is the fallback when no peer accepts it.
+/// RPC is the fallback when no peer accepts it, unless the user opted in to
+/// [`BroadcastRoute::via_own_node`], which puts RPC first.
 pub(crate) fn broadcast_mweb_tx(
     tx: &bdk_wallet::bitcoin::Transaction,
-    rpc_url: Option<&str>,
-    peers: &[String],
-    network: WalletNetwork,
+    route: &BroadcastRoute,
 ) -> Result<(), WalletError> {
-    let p2p_err = match broadcast_via_p2p(tx, resolve_reachable_peers(peers)?, network) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
-    // Still prefer a stranger's node over our own RPC: relaying through a peer
-    // we did not author the tx on is the whole point of the P2P path.
-    let discovered = crate::discovery::discover_mweb_peers(network);
-    if !discovered.is_empty() {
-        match broadcast_via_p2p(tx, discovered, network) {
-            Ok(()) => return Ok(()),
-            Err(e) => crate::diag::log(format!(
-                "MWEB broadcast: discovered peers also failed ({e})"
-            )),
+    let rpc_first = route.rpc_first();
+    let mut own_node_err = None;
+    if let Some(url) = rpc_first {
+        match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
+            Ok(_) => {
+                crate::diag::log("MWEB broadcast: sent through your own node (Settings opt-in)");
+                return Ok(());
+            }
+            Err(e) => {
+                crate::diag::log(format!(
+                    "MWEB broadcast: your own node refused it ({e}); trying peers"
+                ));
+                own_node_err = Some(e.to_string());
+            }
         }
     }
-    let Some(url) = rpc_url else {
+
+    let configured = resolve_reachable_peers(&route.peers)?;
+    let remembered: Vec<std::net::SocketAddr> = crate::broadcast_peers::load(&route.data_dir)
+        .into_iter()
+        .filter(|addr| !configured.contains(addr))
+        .collect();
+    let reachable = probe_reachable(remembered.clone());
+    let first_pass = first_pass_peers(&configured, &reachable);
+
+    let bdk_net = route.network.to_bitcoin_network();
+    let started = std::time::Instant::now();
+    let mut run = run_p2p(
+        &first_pass,
+        || crate::discovery::discover_mweb_peers(route.network),
+        |addr| match TcpMwebPeer::connect(addr, bdk_net) {
+            Ok(mut peer) => peer
+                .broadcast_tx(tx)
+                .map_err(|e| crate::error::humanize_broadcast_error(&e.to_string())),
+            Err(e) => Err(e.to_string()),
+        },
+        || started.elapsed(),
+    );
+    run.failed
+        .extend(remembered.iter().filter(|addr| !reachable.contains(addr)));
+    if let Err(e) = crate::broadcast_peers::record(
+        &route.data_dir,
+        &crate::broadcast_peers::Outcome {
+            confirmed: run.confirmed,
+            failed: &run.failed,
+            configured: &configured,
+        },
+    ) {
+        crate::diag::log(format!("MWEB broadcast: could not save good peers ({e})"));
+    }
+
+    if run.confirmed.is_some() {
+        return Ok(());
+    }
+    if let Some(addr) = run.sent.first() {
+        crate::diag::log(format!(
+            "MWEB broadcast: no peer confirmed acceptance; keeping optimistic send via {addr}"
+        ));
+        return Ok(());
+    }
+    let p2p_err = run.error();
+    if let Some(rpc_err) = own_node_err {
+        return Err(WalletError::Mweb(format!(
+            "could not broadcast through your own node ({rpc_err}) or over P2P ({p2p_err})"
+        )));
+    }
+    let Some(url) = route.rpc_url.as_deref() else {
         return Err(WalletError::Mweb(format!(
             "could not reach any MWEB peer to broadcast this transaction ({p2p_err}) — \
              check your connection, or set a Litecoin RPC URL in Settings"
@@ -2620,55 +2669,129 @@ pub(crate) fn broadcast_mweb_tx(
     }
 }
 
-/// Offer the tx to each peer in turn until one confirms acceptance.
-///
-/// [`BroadcastAck::Sent`] is optimistic (peer may not have relayed). Keep
-/// trying other peers for a Confirmed ack before accepting a bare Sent.
-fn broadcast_via_p2p(
-    tx: &bdk_wallet::bitcoin::Transaction,
-    addrs: Vec<std::net::SocketAddr>,
-    network: WalletNetwork,
-) -> Result<(), WalletError> {
-    if addrs.is_empty() {
-        return Err(WalletError::Mweb("no MWEB P2P peers reachable".into()));
+/// Where a transaction that carries MWEB data may be broadcast.
+#[derive(Debug, Clone)]
+pub struct BroadcastRoute {
+    pub data_dir: std::path::PathBuf,
+    pub rpc_url: Option<String>,
+    pub peers: Vec<String>,
+    pub network: WalletNetwork,
+    /// The user opted in to sending through their own litecoind before any
+    /// peer, which makes their node the visible origin of the transaction.
+    pub via_own_node: bool,
+}
+
+impl BroadcastRoute {
+    fn rpc_first(&self) -> Option<&str> {
+        if !self.via_own_node {
+            return None;
+        }
+        self.rpc_url.as_deref().filter(|url| !url.trim().is_empty())
     }
-    let bdk_net = network.to_bitcoin_network();
-    let mut last_err = String::from("no MWEB peers reachable");
-    let mut sent_ok: Option<std::net::SocketAddr> = None;
-    for addr in addrs {
-        match TcpMwebPeer::connect(addr, bdk_net) {
-            Ok(mut peer) => match peer.broadcast_tx(tx) {
-                Ok(BroadcastAck::Confirmed) => {
-                    crate::diag::log(format!("MWEB broadcast: {addr} accepted the transaction"));
-                    return Ok(());
-                }
-                Ok(BroadcastAck::Sent) => {
-                    crate::diag::log(format!(
-                        "MWEB broadcast: sent to {addr}; acceptance not confirmed before deadline — trying more peers"
-                    ));
-                    if sent_ok.is_none() {
-                        sent_ok = Some(addr);
-                    }
-                }
-                Err(e) => {
-                    last_err = format!(
-                        "{addr}: {}",
-                        crate::error::humanize_broadcast_error(&e.to_string())
-                    )
-                }
-            },
-            Err(e) => last_err = format!("{addr}: {e}"),
+}
+
+/// Stop the peer search after this many unconfirmed `Sent` answers.
+const BROADCAST_MAX_SENT: usize = 2;
+/// Once some peer has answered `Sent`, stop starting new peers after this long.
+/// Without any `Sent` the search keeps going, since there is nothing to fall
+/// back on yet.
+const BROADCAST_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a P2P broadcast learned from the peers it tried.
+#[derive(Debug, Default)]
+struct PeerRun {
+    confirmed: Option<std::net::SocketAddr>,
+    sent: Vec<std::net::SocketAddr>,
+    failed: Vec<std::net::SocketAddr>,
+    tried: Vec<std::net::SocketAddr>,
+    last_err: Option<String>,
+}
+
+impl PeerRun {
+    fn done(&self, elapsed: std::time::Duration) -> bool {
+        self.confirmed.is_some()
+            || self.sent.len() >= BROADCAST_MAX_SENT
+            || (!self.sent.is_empty() && elapsed >= BROADCAST_MAX_WAIT)
+    }
+
+    fn error(&self) -> String {
+        match &self.last_err {
+            Some(e) => format!("P2P broadcast failed: {e}"),
+            None => "no MWEB P2P peers reachable".into(),
         }
     }
-    if let Some(addr) = sent_ok {
-        crate::diag::log(format!(
-            "MWEB broadcast: no peer confirmed acceptance; keeping optimistic send via {addr}"
-        ));
-        return Ok(());
+}
+
+/// The user's peers first, then public peers that confirmed a recent broadcast.
+fn first_pass_peers(
+    configured: &[std::net::SocketAddr],
+    remembered: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    let mut out = configured.to_vec();
+    for addr in remembered {
+        if !out.contains(addr) {
+            out.push(*addr);
+        }
     }
-    Err(WalletError::Mweb(format!(
-        "P2P broadcast failed: {last_err}"
-    )))
+    out
+}
+
+/// Offer the tx to `first_pass`, then to discovered peers if no peer in the
+/// first pass took it. One budget covers both passes.
+///
+/// [`BroadcastAck::Sent`] is optimistic (the peer may not have relayed), so a
+/// `Sent` keeps the search going for a Confirmed ack until [`PeerRun::done`].
+fn run_p2p(
+    first_pass: &[std::net::SocketAddr],
+    discover: impl FnOnce() -> Vec<std::net::SocketAddr>,
+    mut offer: impl FnMut(std::net::SocketAddr) -> Result<BroadcastAck, String>,
+    elapsed: impl Fn() -> std::time::Duration,
+) -> PeerRun {
+    let mut run = PeerRun::default();
+    offer_to_peers(&mut run, first_pass, &mut offer, &elapsed);
+    if run.confirmed.is_none() && run.sent.is_empty() {
+        // Still prefer a stranger's node over our own RPC: relaying through a
+        // peer we did not author the tx on is the whole point of the P2P path.
+        let discovered = discover();
+        offer_to_peers(&mut run, &discovered, &mut offer, &elapsed);
+    }
+    run
+}
+
+fn offer_to_peers(
+    run: &mut PeerRun,
+    addrs: &[std::net::SocketAddr],
+    offer: &mut impl FnMut(std::net::SocketAddr) -> Result<BroadcastAck, String>,
+    elapsed: &impl Fn() -> std::time::Duration,
+) {
+    for &addr in addrs {
+        if run.done(elapsed()) {
+            return;
+        }
+        if run.tried.contains(&addr) {
+            continue;
+        }
+        run.tried.push(addr);
+        match offer(addr) {
+            Ok(BroadcastAck::Confirmed) => {
+                crate::diag::log(format!("MWEB broadcast: {addr} accepted the transaction"));
+                run.confirmed = Some(addr);
+            }
+            Ok(BroadcastAck::Sent) => {
+                run.sent.push(addr);
+                let left = BROADCAST_MAX_WAIT.saturating_sub(elapsed()).as_secs();
+                crate::diag::log(format!(
+                    "MWEB broadcast: sent to {addr}; acceptance not confirmed before deadline \
+                     ({}/{BROADCAST_MAX_SENT} unconfirmed, {left}s left to find a confirming peer)",
+                    run.sent.len()
+                ));
+            }
+            Err(e) => {
+                run.failed.push(addr);
+                run.last_err = Some(format!("{addr}: {e}"));
+            }
+        }
+    }
 }
 
 /// Signed private send, not yet broadcast and not yet applied to the coin set.
@@ -3786,15 +3909,10 @@ pub fn apply_prepared_output(
 }
 
 /// Broadcast a transaction that was signed earlier.
-pub fn broadcast_prepared_raw(
-    raw_hex: &str,
-    rpc_url: Option<&str>,
-    peers: &[String],
-    network: WalletNetwork,
-) -> Result<(), WalletError> {
+pub fn broadcast_prepared_raw(raw_hex: &str, route: &BroadcastRoute) -> Result<(), WalletError> {
     let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
     let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)
+    broadcast_mweb_tx(&tx, route)
 }
 
 /// One successful read of the node mempool for the cover gate.
@@ -4454,5 +4572,181 @@ mod cover_tally_tests {
             }),
             is_hog_ex: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], 9333))
+    }
+
+    /// Runs `run_p2p` against scripted peer answers. Each offer advances the
+    /// fake clock by `per_offer`. Returns the run and the order peers were offered.
+    fn run(
+        first_pass: &[SocketAddr],
+        discovered: &[SocketAddr],
+        answers: &[(SocketAddr, Result<BroadcastAck, &str>)],
+        per_offer: Duration,
+    ) -> (PeerRun, Vec<SocketAddr>) {
+        let offered = RefCell::new(Vec::new());
+        let now = Cell::new(Duration::ZERO);
+        let run = run_p2p(
+            first_pass,
+            || discovered.to_vec(),
+            |a| {
+                offered.borrow_mut().push(a);
+                now.set(now.get() + per_offer);
+                answers
+                    .iter()
+                    .find(|(peer, _)| *peer == a)
+                    .map(|(_, answer)| (*answer).map_err(str::to_string))
+                    .unwrap_or_else(|| Err("no answer scripted".into()))
+            },
+            || now.get(),
+        );
+        (run, offered.into_inner())
+    }
+
+    const SENT: Result<BroadcastAck, &str> = Ok(BroadcastAck::Sent);
+    const CONFIRMED: Result<BroadcastAck, &str> = Ok(BroadcastAck::Confirmed);
+    const FAILED: Result<BroadcastAck, &str> = Err("refused");
+
+    #[test]
+    fn first_confirmed_stops_the_search() {
+        let (run, offered) = run(
+            &[addr(1), addr(2), addr(3)],
+            &[addr(9)],
+            &[
+                (addr(1), FAILED),
+                (addr(2), CONFIRMED),
+                (addr(3), CONFIRMED),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(run.confirmed, Some(addr(2)));
+        assert_eq!(offered, vec![addr(1), addr(2)]);
+        assert_eq!(run.failed, vec![addr(1)]);
+    }
+
+    #[test]
+    fn two_sent_answers_stop_the_search() {
+        let (run, offered) = run(
+            &[addr(1), addr(2), addr(3)],
+            &[addr(9)],
+            &[(addr(1), SENT), (addr(2), SENT), (addr(3), CONFIRMED)],
+            Duration::from_secs(1),
+        );
+        assert_eq!(offered, vec![addr(1), addr(2)]);
+        assert_eq!(run.confirmed, None);
+        assert_eq!(run.sent, vec![addr(1), addr(2)]);
+    }
+
+    #[test]
+    fn time_limit_stops_new_peers_once_a_sent_is_held() {
+        let (run, offered) = run(
+            &[addr(1), addr(2), addr(3)],
+            &[],
+            &[(addr(1), SENT), (addr(2), SENT), (addr(3), SENT)],
+            BROADCAST_MAX_WAIT + Duration::from_secs(1),
+        );
+        assert_eq!(offered, vec![addr(1)]);
+        assert_eq!(run.sent, vec![addr(1)]);
+    }
+
+    #[test]
+    fn time_limit_does_not_stop_a_search_with_nothing_to_fall_back_on() {
+        let (run, offered) = run(
+            &[addr(1), addr(2)],
+            &[addr(3)],
+            &[(addr(1), FAILED), (addr(2), FAILED), (addr(3), CONFIRMED)],
+            BROADCAST_MAX_WAIT + Duration::from_secs(1),
+        );
+        assert_eq!(offered, vec![addr(1), addr(2), addr(3)]);
+        assert_eq!(run.confirmed, Some(addr(3)));
+    }
+
+    #[test]
+    fn every_peer_failing_is_an_error_so_rpc_fallback_runs() {
+        let (run, _) = run(
+            &[addr(1)],
+            &[addr(2)],
+            &[(addr(1), FAILED), (addr(2), FAILED)],
+            Duration::from_secs(1),
+        );
+        assert!(run.confirmed.is_none() && run.sent.is_empty());
+        assert_eq!(run.failed, vec![addr(1), addr(2)]);
+        assert!(
+            run.error().contains("10.0.0.2:9333: refused"),
+            "{}",
+            run.error()
+        );
+    }
+
+    #[test]
+    fn no_peers_at_all_reports_unreachable() {
+        let (run, offered) = run(&[], &[], &[], Duration::from_secs(1));
+        assert!(offered.is_empty());
+        assert_eq!(run.error(), "no MWEB P2P peers reachable");
+    }
+
+    #[test]
+    fn a_sent_in_the_first_pass_skips_discovery() {
+        let discovered_called = Cell::new(false);
+        let run = run_p2p(
+            &[addr(1)],
+            || {
+                discovered_called.set(true);
+                vec![addr(9)]
+            },
+            |_| Ok(BroadcastAck::Sent),
+            || Duration::ZERO,
+        );
+        assert_eq!(run.sent, vec![addr(1)]);
+        assert!(!discovered_called.get());
+    }
+
+    #[test]
+    fn order_is_configured_then_remembered_then_discovered_without_repeats() {
+        let configured = [addr(1), addr(2)];
+        let remembered = [addr(2), addr(5)];
+        let first_pass = first_pass_peers(&configured, &remembered);
+        assert_eq!(first_pass, vec![addr(1), addr(2), addr(5)]);
+        let (_, offered) = run(
+            &first_pass,
+            &[addr(5), addr(1), addr(8)],
+            &[],
+            Duration::from_secs(1),
+        );
+        assert_eq!(offered, vec![addr(1), addr(2), addr(5), addr(8)]);
+    }
+
+    fn route(rpc_url: Option<&str>, via_own_node: bool) -> BroadcastRoute {
+        BroadcastRoute {
+            data_dir: std::path::PathBuf::new(),
+            rpc_url: rpc_url.map(str::to_string),
+            peers: Vec::new(),
+            network: WalletNetwork::Testnet,
+            via_own_node,
+        }
+    }
+
+    #[test]
+    fn rpc_goes_first_only_when_opted_in_with_a_url() {
+        assert_eq!(
+            route(Some("http://127.0.0.1:9332"), true).rpc_first(),
+            Some("http://127.0.0.1:9332")
+        );
+        assert_eq!(
+            route(Some("http://127.0.0.1:9332"), false).rpc_first(),
+            None
+        );
+        assert_eq!(route(None, true).rpc_first(), None);
+        assert_eq!(route(Some("  "), true).rpc_first(), None);
     }
 }

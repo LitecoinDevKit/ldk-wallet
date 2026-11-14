@@ -334,6 +334,9 @@ pub struct WalletSettings {
     pub electrum_active_url: Option<String>,
     #[serde(default)]
     pub litecoin_rpc_url: Option<String>,
+    /// Send private transactions through `litecoin_rpc_url` before any peer.
+    #[serde(default)]
+    pub broadcast_via_own_node: bool,
     #[serde(default)]
     pub mweb_peers: Vec<String>,
     /// Active MWEB key-derivation scheme (changing it requires an MWEB resync).
@@ -369,6 +372,9 @@ pub struct UpdateSettingsRequest {
     pub auto_lock_minutes: u32,
     #[serde(default)]
     pub litecoin_rpc_url: Option<String>,
+    /// Send private transactions through `litecoin_rpc_url` before any peer.
+    #[serde(default)]
+    pub broadcast_via_own_node: bool,
     #[serde(default)]
     pub mweb_peers: Vec<String>,
     #[serde(default = "default_explorer_base_url")]

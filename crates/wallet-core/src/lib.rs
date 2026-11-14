@@ -5,6 +5,7 @@
 mod accounts;
 mod aezeed;
 mod app;
+mod broadcast_peers;
 mod churn;
 mod contacts;
 mod descriptors;

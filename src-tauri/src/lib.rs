@@ -6,7 +6,7 @@ use tauri::{AppHandle, Manager, State};
 use wallet_core::{
     AddressReuseHint, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary, ContactRecord,
     CreateAccountRequest, CreateWalletRequest, CreateWalletResponse, DeleteContactRequest,
-    DeleteWalletRequest, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder,
+    DeleteWalletRequest, DiagLogPage, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder,
     HistoryExportFormat, MetadataImportResult, MetricSeries, MigrateEncryptRequest,
     MwebBroadcastResult, MwebSendPreview, MwebSendRequest, MwebSyncProgress, MwebUtxoRecord,
     NetworkPulse, PeginPreview, PeginRequest, PeginResult, PegoutPreview, PegoutRequest,
@@ -819,6 +819,12 @@ async fn get_diagnostics(
         .map_err(|e| e.to_string())?)
 }
 
+/// Diagnostic log lines newer than `since`, for the Developer live log view.
+#[tauri::command]
+fn diag_log_since(state: State<'_, Arc<WalletApp>>, since: u64) -> DiagLogPage {
+    state.diag_log_since(since)
+}
+
 /// Export diagnostics to a user-chosen text file. Returns the path, or `None` if cancelled.
 #[tauri::command]
 async fn export_diagnostics(
@@ -1086,6 +1092,7 @@ pub fn run() {
             set_mweb_scheme,
             mweb_sync_progress,
             get_diagnostics,
+            diag_log_since,
             export_diagnostics,
             get_settings,
             update_settings,

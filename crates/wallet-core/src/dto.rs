@@ -572,6 +572,15 @@ pub struct DiagnosticsBundle {
     pub recent_log_lines: Vec<String>,
 }
 
+/// Diagnostic log lines newer than the caller's cursor, for the live log view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagLogPage {
+    /// Pass this back as `since` on the next call.
+    pub next: u64,
+    /// `<unix seconds> <message>`, oldest first. Same lines as the export.
+    pub lines: Vec<String>,
+}
+
 /// Default MWEB kernel fee (0.0005 LTC). Used when the request leaves fee as 0.
 pub const DEFAULT_MWEB_FEE_SATS: u64 = 50_000;
 

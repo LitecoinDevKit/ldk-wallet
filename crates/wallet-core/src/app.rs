@@ -453,6 +453,13 @@ impl WalletApp {
         }
     }
 
+    /// Diagnostic log lines after `since`, for the live log view. Does not touch
+    /// wallet state, so it is safe to poll while locked or syncing.
+    pub fn diag_log_since(&self, since: u64) -> crate::dto::DiagLogPage {
+        let (next, lines) = diag::since(since);
+        crate::dto::DiagLogPage { next, lines }
+    }
+
     /// Redacted support bundle for Export diagnostics (no secrets, no Unstoppable API key).
     pub fn diagnostics(&self, app_version: &str) -> DiagnosticsBundle {
         let generated_unix = SystemTime::now()

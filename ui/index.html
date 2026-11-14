@@ -1434,16 +1434,8 @@
               </div>
               <label class="check" id="dev-mode-row" hidden>
                 <input id="dev-mode-toggle" type="checkbox" />
-                <span>Developer mode: show the live log</span>
+                <span>Developer mode: Logs button on every screen, including sign-in</span>
               </label>
-              <div class="live-log" id="live-log" hidden>
-                <div class="live-log-head">
-                  <span class="field-label">Live log</span>
-                  <button type="button" id="btn-live-log-pause" class="btn btn-ghost btn-sm">Pause</button>
-                  <button type="button" id="btn-live-log-clear" class="btn btn-ghost btn-sm">Clear</button>
-                </div>
-                <pre class="live-log-body" id="live-log-body" tabindex="0"></pre>
-              </div>
             </div>
 
             <div class="card" id="privacy-disclosure">
@@ -1634,6 +1626,20 @@
         </div>
       </div>
     </div>
+
+    <!-- Developer live log: outside both shells so it works before sign-in. -->
+    <button type="button" id="btn-live-log" class="live-log-fab" aria-controls="live-log" hidden>
+      Logs
+    </button>
+    <section class="live-log" id="live-log" aria-label="Live log" hidden>
+      <div class="live-log-head">
+        <span class="field-label">Live log</span>
+        <button type="button" id="btn-live-log-pause" class="btn btn-ghost btn-sm">Pause</button>
+        <button type="button" id="btn-live-log-clear" class="btn btn-ghost btn-sm">Clear</button>
+        <button type="button" id="btn-live-log-close" class="btn btn-ghost btn-sm">Close</button>
+      </div>
+      <pre class="live-log-body" id="live-log-body" tabindex="0"></pre>
+    </section>
 
     <div class="toast-region" aria-live="polite">
       <div class="toast" id="toast" data-kind="info" hidden>

@@ -70,6 +70,7 @@ struct WalletState {
     /// re-paying a connect timeout on a dead configured server).
     active_electrum_url: Option<String>,
     litecoin_rpc_url: Option<String>,
+    broadcast_via_own_node: bool,
     mweb_peers: Vec<String>,
     mweb_scheme: MwebScheme,
     explorer_base_url: String,
@@ -99,12 +100,23 @@ fn meta_from_state(state: &WalletState) -> WalletMeta {
         needs_full_scan: state.needs_full_scan,
         needs_mweb_scan: state.needs_mweb_scan,
         litecoin_rpc_url: state.litecoin_rpc_url.clone(),
+        broadcast_via_own_node: state.broadcast_via_own_node,
         mweb_peers: state.mweb_peers.clone(),
         mweb_scheme: state.mweb_scheme,
         explorer_base_url: state.explorer_base_url.clone(),
         show_fiat: state.show_fiat,
         use_explorer_fee_hints: state.use_explorer_fee_hints,
         insights_enabled: state.insights_enabled,
+    }
+}
+
+fn broadcast_route(state: &WalletState) -> mweb::BroadcastRoute {
+    mweb::BroadcastRoute {
+        data_dir: state.data_dir.clone(),
+        rpc_url: state.litecoin_rpc_url.clone(),
+        peers: state.mweb_peers.clone(),
+        network: state.network,
+        via_own_node: state.broadcast_via_own_node,
     }
 }
 
@@ -797,14 +809,12 @@ impl WalletApp {
             PreparedTransferBroadcast::Private {
                 source_dir,
                 signed,
-                rpc_url,
-                peers,
-                network,
+                route,
                 address,
                 to_account_index,
                 hold,
             } => {
-                mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+                mweb::broadcast_mweb_tx(&signed.tx, &route)?;
                 let result =
                     self.commit_private_transfer(&source_dir, &signed, address, to_account_index);
                 drop(hold);
@@ -1139,6 +1149,7 @@ impl WalletApp {
             auto_lock_minutes: state.auto_lock_minutes,
             electrum_active_url: state.active_electrum_url.clone(),
             litecoin_rpc_url: state.litecoin_rpc_url.clone(),
+            broadcast_via_own_node: state.broadcast_via_own_node,
             mweb_peers: state.mweb_peers.clone(),
             mweb_scheme: state.mweb_scheme,
             explorer_base_url: state.explorer_base_url.clone(),
@@ -1322,6 +1333,7 @@ impl WalletApp {
             .litecoin_rpc_url
             .map(|s| crate::rpc::normalize_rpc_url(&s))
             .filter(|s| !s.is_empty());
+        state.broadcast_via_own_node = req.broadcast_via_own_node;
         state.mweb_peers = req
             .mweb_peers
             .into_iter()
@@ -1863,9 +1875,7 @@ impl WalletApp {
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let req = resolve_pegin_request(state, req)?;
-        let rpc_url = state.litecoin_rpc_url.clone();
-        let peers = state.mweb_peers.clone();
-        let network = state.network;
+        let route = broadcast_route(state);
         let mweb = state
             .mweb
             .as_mut()
@@ -1880,15 +1890,7 @@ impl WalletApp {
         for op in &masked {
             state.wallet.lock_outpoint(*op);
         }
-        let result = mweb::pegin(
-            &mut state.wallet,
-            &state.signer,
-            mweb,
-            rpc_url.as_deref(),
-            &peers,
-            req,
-            network,
-        );
+        let result = mweb::pegin(&mut state.wallet, &state.signer, mweb, &route, req);
         for op in masked {
             state.wallet.unlock_outpoint(op);
         }
@@ -1917,12 +1919,11 @@ impl WalletApp {
         self.ensure_unlocked()?;
         // Sign under the lock, then broadcast without it so a transfer or split
         // of a different coin can start while peers are still being tried.
-        let (data_dir, signed, rpc_url, peers, network, hold) = {
+        let (data_dir, signed, route, hold) = {
             let mut guard = self.lock_state()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let req = resolve_mweb_send_request(state, req)?;
-            let rpc_url = state.litecoin_rpc_url.clone();
-            let peers = state.mweb_peers.clone();
+            let route = broadcast_route(state);
             let network = state.network;
             let data_dir = state.data_dir.clone();
             let mweb = state
@@ -1931,9 +1932,9 @@ impl WalletApp {
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let signed = mweb::sign_mweb_send(&state.wallet, mweb, &data_dir, &req, network)?;
             let hold = CoinHold::take(&data_dir, signed.input_ids(), &self.session)?;
-            (data_dir, signed, rpc_url, peers, network, hold)
+            (data_dir, signed, route, hold)
         };
-        mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+        mweb::broadcast_mweb_tx(&signed.tx, &route)?;
         let result = self.with_account_mweb(&data_dir, |runtime| {
             Ok(mweb::apply_signed_mweb_send(runtime, &signed))
         });
@@ -1953,8 +1954,8 @@ impl WalletApp {
         self.ensure_unlocked()?;
         // Sign under the lock, then broadcast without it: the peer loop can take
         // minutes, and sync, coin lists and other spends must not wait on it.
-        let (data_dir, signed, rpc_url, peers, network, hold) = self.sign_pegout(req)?;
-        mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+        let (data_dir, signed, route, hold) = self.sign_pegout(req)?;
+        mweb::broadcast_mweb_tx(&signed.tx, &route)?;
         let result = self.with_account_mweb(&data_dir, |runtime| {
             Ok(mweb::apply_signed_pegout(runtime, &signed))
         });
@@ -1962,21 +1963,10 @@ impl WalletApp {
         result
     }
 
-    #[allow(clippy::type_complexity)]
     fn sign_pegout(
         &self,
         req: PegoutRequest,
-    ) -> Result<
-        (
-            PathBuf,
-            mweb::SignedPegout,
-            Option<String>,
-            Vec<String>,
-            WalletNetwork,
-            CoinHold,
-        ),
-        WalletError,
-    > {
+    ) -> Result<(PathBuf, mweb::SignedPegout, mweb::BroadcastRoute, CoinHold), WalletError> {
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let (mut req, _) = resolve_pegout_request(state, req)?;
@@ -2006,8 +1996,7 @@ impl WalletApp {
                 "peg-out destination address required".into(),
             ));
         }
-        let rpc_url = state.litecoin_rpc_url.clone();
-        let peers = state.mweb_peers.clone();
+        let route = broadcast_route(state);
         let network = state.network;
         let data_dir = state.data_dir.clone();
         let mweb = state
@@ -2016,7 +2005,7 @@ impl WalletApp {
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let signed = mweb::sign_pegout(&state.wallet, mweb, &data_dir, req, network)?;
         let hold = CoinHold::take(&data_dir, signed.input_ids(), &self.session)?;
-        Ok((data_dir, signed, rpc_url, peers, network, hold))
+        Ok((data_dir, signed, route, hold))
     }
 
     pub fn list_mweb_unspent(&self) -> Result<Vec<MwebUtxoRecord>, WalletError> {
@@ -2087,12 +2076,10 @@ impl WalletApp {
             PreparedSplit::Private {
                 source_dir,
                 signed,
-                rpc_url,
-                peers,
-                network,
+                route,
                 hold,
             } => {
-                mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+                mweb::broadcast_mweb_tx(&signed.tx, &route)?;
                 let result = self.commit_private_split(&source_dir, &signed);
                 drop(hold);
                 result
@@ -2465,6 +2452,7 @@ impl WalletApp {
             auto_lock_minutes: meta.auto_lock_minutes,
             active_electrum_url: None,
             litecoin_rpc_url: meta.litecoin_rpc_url,
+            broadcast_via_own_node: meta.broadcast_via_own_node,
             mweb_peers: meta.mweb_peers,
             mweb_scheme,
             explorer_base_url: meta.explorer_base_url,
@@ -2683,6 +2671,7 @@ fn open_wallet_state(
         auto_lock_minutes: meta.auto_lock_minutes,
         active_electrum_url: None,
         litecoin_rpc_url: meta.litecoin_rpc_url.clone(),
+        broadcast_via_own_node: meta.broadcast_via_own_node,
         mweb_peers: meta.mweb_peers.clone(),
         mweb_scheme: meta.mweb_scheme,
         explorer_base_url: meta.explorer_base_url.clone(),
@@ -2905,6 +2894,7 @@ impl MemoryBackedApp {
             auto_lock_minutes: meta.auto_lock_minutes,
             active_electrum_url: None,
             litecoin_rpc_url: meta.litecoin_rpc_url,
+            broadcast_via_own_node: meta.broadcast_via_own_node,
             mweb_peers: meta.mweb_peers,
             mweb_scheme: meta.mweb_scheme,
             explorer_base_url: meta.explorer_base_url,
@@ -3261,6 +3251,7 @@ impl MemoryBackedApp {
             auto_lock_minutes: meta.auto_lock_minutes,
             active_electrum_url: None,
             litecoin_rpc_url: meta.litecoin_rpc_url,
+            broadcast_via_own_node: meta.broadcast_via_own_node,
             mweb_peers: meta.mweb_peers,
             mweb_scheme,
             explorer_base_url: meta.explorer_base_url,
@@ -3829,10 +3820,8 @@ enum PreparedTransferBroadcast {
     },
     Private {
         source_dir: PathBuf,
-        signed: mweb::SignedMwebSend,
-        rpc_url: Option<String>,
-        peers: Vec<String>,
-        network: WalletNetwork,
+        signed: Box<mweb::SignedMwebSend>,
+        route: mweb::BroadcastRoute,
         address: String,
         to_account_index: u32,
         hold: CoinHold,
@@ -3880,8 +3869,7 @@ fn prepare_transfer_broadcast(
         SplitChain::Private => {
             let mweb_req = prepared.mweb_req.expect("private transfer");
             let resolved = resolve_mweb_send_request(state, mweb_req)?;
-            let rpc_url = state.litecoin_rpc_url.clone();
-            let peers = state.mweb_peers.clone();
+            let route = broadcast_route(state);
             let network = state.network;
             let mweb = state
                 .mweb
@@ -3892,10 +3880,8 @@ fn prepare_transfer_broadcast(
             let hold = CoinHold::take(&source_dir, signed.input_ids(), session)?;
             Ok(PreparedTransferBroadcast::Private {
                 source_dir,
-                signed,
-                rpc_url,
-                peers,
-                network,
+                signed: Box::new(signed),
+                route,
                 address: prepared.address,
                 to_account_index: prepared.to_account_index,
                 hold,
@@ -4063,9 +4049,7 @@ enum PreparedSplit {
     Private {
         source_dir: PathBuf,
         signed: mweb::SignedMwebSplit,
-        rpc_url: Option<String>,
-        peers: Vec<String>,
-        network: WalletNetwork,
+        route: mweb::BroadcastRoute,
         hold: CoinHold,
     },
 }
@@ -4107,8 +4091,7 @@ fn prepare_split(
                 .filter(|o| !o.is_change)
                 .map(|o| o.amount_sats)
                 .collect();
-            let rpc_url = state.litecoin_rpc_url.clone();
-            let peers = state.mweb_peers.clone();
+            let route = broadcast_route(state);
             let network = state.network;
             let mweb = state
                 .mweb
@@ -4127,9 +4110,7 @@ fn prepare_split(
             Ok(PreparedSplit::Private {
                 source_dir,
                 signed,
-                rpc_url,
-                peers,
-                network,
+                route,
                 hold,
             })
         }
@@ -5284,9 +5265,7 @@ fn send_armed_hop(
     data_dir: &Path,
     job: &mut churn::ChurnJob,
     record: &mut churn::ArmedRecord,
-    rpc_url: Option<&str>,
-    peers: &[String],
-    network: crate::network::WalletNetwork,
+    route: &mweb::BroadcastRoute,
     height: u32,
 ) -> Result<(), WalletError> {
     let Some(hop) = record.current() else {
@@ -5300,7 +5279,7 @@ fn send_armed_hop(
     let txid = hop.txid.clone();
     let created = hop.created_output_id.clone();
     let local_applied = hop.local_applied;
-    match mweb::broadcast_prepared_raw(&raw, rpc_url, peers, network) {
+    match mweb::broadcast_prepared_raw(&raw, route) {
         Ok(()) => {
             churn::note_broadcast(job, &wtxid, &created, height)?;
             if let Some(hop) = record.current_mut() {
@@ -5395,18 +5374,24 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
         return Ok(());
     }
 
-    let (rpc_url, peers, network, wallet_tip) = match state.as_ref() {
+    let (route, wallet_tip) = match state.as_ref() {
         Some(loaded) => (
-            loaded.litecoin_rpc_url.clone(),
-            loaded.mweb_peers.clone(),
-            loaded.network,
+            broadcast_route(loaded),
             Some(loaded.wallet.latest_checkpoint().height()),
         ),
         None => {
             let meta = meta::read_meta(data_dir)?;
-            (meta.litecoin_rpc_url, meta.mweb_peers, meta.network, None)
+            let route = mweb::BroadcastRoute {
+                data_dir: data_dir.to_path_buf(),
+                rpc_url: meta.litecoin_rpc_url,
+                peers: meta.mweb_peers,
+                network: meta.network,
+                via_own_node: meta.broadcast_via_own_node,
+            };
+            (route, None)
         }
     };
+    let rpc_url = route.rpc_url.clone();
     let tip = match wallet_tip {
         Some(height) => Some(height),
         None => rpc_url
@@ -5486,16 +5471,7 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
         churn::CoverStep::Send => {
             job.spreading = false;
             let height = tip.unwrap_or(record.armed_height);
-            let _ = send_armed_hop(
-                state,
-                data_dir,
-                &mut job,
-                &mut record,
-                Some(url),
-                &peers,
-                network,
-                height,
-            );
+            let _ = send_armed_hop(state, data_dir, &mut job, &mut record, &route, height);
         }
     }
     Ok(())
@@ -6325,6 +6301,7 @@ mod prefetch_tests {
             electrum_use_public_fallback: false,
             auto_lock_minutes: settings.auto_lock_minutes,
             litecoin_rpc_url: settings.litecoin_rpc_url,
+            broadcast_via_own_node: settings.broadcast_via_own_node,
             mweb_peers: settings.mweb_peers,
             explorer_base_url: settings.explorer_base_url,
             show_fiat: settings.show_fiat,

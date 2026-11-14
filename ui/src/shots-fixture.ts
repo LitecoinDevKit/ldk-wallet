@@ -339,6 +339,7 @@ function settings() {
     litecoin_rpc_url: new URLSearchParams(window.location.search).get("rpc") === "1"
       ? "http://127.0.0.1:9332"
       : null,
+    broadcast_via_own_node: false,
     mweb_peers: ["peer.example.com:9333"],
     mweb_scheme: "litecoin-core",
     explorer_base_url: "https://litview.space",

@@ -23,6 +23,7 @@ pub const MWEB_HISTORY_ENC_FILE: &str = "mweb_history.enc";
 /// only how many times the wallet has written, and its value is already visible
 /// in the cleartext header of each envelope.
 pub const MWEB_SEAL_COUNTER_FILE: &str = "mweb_seal_counter.txt";
+pub use crate::broadcast_peers::BROADCAST_PEERS_FILE;
 pub use crate::churn::{CHURN_DEPTH_FILE, CHURN_JOB_FILE};
 pub use crate::contacts::CONTACTS_FILE;
 pub use crate::labels::TX_LABELS_FILE;
@@ -78,6 +79,10 @@ pub struct WalletMeta {
     /// Optional litecoind RPC for pure MWEB broadcast.
     #[serde(default)]
     pub litecoin_rpc_url: Option<String>,
+    /// Send MWEB transactions through `litecoin_rpc_url` before any peer.
+    /// Off by default: it makes the user's node their visible origin.
+    #[serde(default)]
+    pub broadcast_via_own_node: bool,
     /// LIP-0006 P2P peers (`host:port`).
     #[serde(default = "default_mweb_peers")]
     pub mweb_peers: Vec<String>,
@@ -112,6 +117,7 @@ impl WalletMeta {
             needs_full_scan: true,
             needs_mweb_scan: true,
             litecoin_rpc_url: None,
+            broadcast_via_own_node: false,
             mweb_peers: default_mweb_peers(),
             mweb_scheme: crate::dto::MwebScheme::default(),
             explorer_base_url: default_explorer_base_url(),
@@ -254,6 +260,7 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
         data_dir.join(CHURN_DEPTH_FILE),
         data_dir.join(crate::churn::CHURN_ARMED_FILE),
         data_dir.join(CONTACTS_FILE),
+        data_dir.join(BROADCAST_PEERS_FILE),
         mweb_seal_counter_path(data_dir),
         data_dir.join("litvm.json"),
         // Legacy Insights LLM key file (feature removed; delete on wipe if present).
@@ -298,5 +305,16 @@ mod tests {
     fn new_wallets_default_to_empty_mweb_peers() {
         let meta = WalletMeta::new(WalletNetwork::Mainnet, None);
         assert!(meta.mweb_peers.is_empty());
+    }
+
+    #[test]
+    fn older_meta_reads_with_own_node_broadcast_off() {
+        let mut json = serde_json::to_value(WalletMeta::new(WalletNetwork::Mainnet, None)).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("broadcast_via_own_node")
+            .expect("field is serialized");
+        let meta: WalletMeta = serde_json::from_value(json).unwrap();
+        assert!(!meta.broadcast_via_own_node);
     }
 }

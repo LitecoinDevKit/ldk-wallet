@@ -1514,6 +1514,15 @@
                   sends use it when peers cannot take the transaction.
                 </span>
               </label>
+              <label class="check">
+                <input id="settings-own-node-broadcast" type="checkbox" />
+                <span>Broadcast private transactions through my own node</span>
+              </label>
+              <span class="hint">
+                Sends through your Litecoin RPC before any peer. Your node becomes the visible
+                origin of every private transaction, instead of being hidden behind a peer's
+                Dandelion relay. Off by default. Needs a Litecoin RPC URL.
+              </span>
               <label class="field">
                 <span class="field-label">MWEB P2P peers</span>
                 <input

@@ -2863,7 +2863,7 @@ function updateBusyUi() {
   el.peginNote.disabled = busy;
   el.mwebSendAmount.disabled = busy;
   el.mwebSendNote.disabled = busy;
-  el.pegoutAmount.disabled = busy || pegoutLocksAmount();
+  el.pegoutAmount.disabled = busy;
   el.pegoutNote.disabled = busy;
   for (const group of [
     el.sendAmountPresets,
@@ -2873,17 +2873,18 @@ function updateBusyUi() {
     el.litvmSendAmountPresets,
   ]) {
     for (const btn of group.querySelectorAll<HTMLButtonElement>("button")) {
-      const pegoutPctLocked =
-        group === el.pegoutAmountPresets &&
-        pegoutSelectedIds.size > 0 &&
-        btn.dataset.pct !== "max";
-      btn.disabled = busy || pegoutPctLocked;
+      btn.disabled = busy;
     }
   }
   el.btnPegin.disabled = busy;
   el.btnMwebSend.disabled = busy;
   el.btnPegout.disabled = busy;
   el.btnPegout.textContent = pegoutBroadcasting ? "Swapping…" : "Move to public";
+  el.btnPegout.title = syncing
+    ? "Wait for the sync to finish."
+    : sending
+      ? "Wait for the current send or swap to finish."
+      : "";
   el.btnResyncMweb.disabled = busy;
   el.btnRevealMnemonic.disabled = busy;
 
@@ -7117,7 +7118,8 @@ function renderMwebControlList(panel: CoinControlPanel) {
         const preset = pressedAmountPreset(el.mwebSendAmountPresets);
         if (preset != null) applyMwebSendAmountPreset(preset);
       } else if (panel === pegoutCoinPanel) {
-        syncPegoutSelectionMode();
+        const preset = pressedAmountPreset(el.pegoutAmountPresets);
+        if (preset != null) applyPegoutAmountPreset(preset);
       }
     });
 
@@ -8084,7 +8086,6 @@ function applyPeginAmountPreset(preset: AmountPreset, quiet = false) {
 }
 
 function applyPegoutAmountPreset(preset: AmountPreset, quiet = false) {
-  if (pegoutSelectedIds.size > 0 && preset !== "max") return;
   applyAmountPreset({
     balance: privateSpendableSats(pegoutSelectedIds),
     emptyError:
@@ -8166,23 +8167,6 @@ function applyLitvmAmountPreset(preset: AmountPreset, quiet = false) {
     el.litvmSendDrain.checked = false;
   }
   setAmountPresetPressed(el.litvmSendAmountPresets, preset);
-  updateBusyUi();
-}
-
-function pegoutLocksAmount(): boolean {
-  return el.pegoutDrain.checked || pegoutSelectedIds.size > 0;
-}
-
-/** Choosing coins or Max empties those coins one-to-one; the amount field cannot imply consolidation. */
-function syncPegoutSelectionMode() {
-  if (pegoutSelectedIds.size > 0) {
-    applyPegoutAmountPreset("max");
-    return;
-  }
-  if (el.pegoutDrain.checked) {
-    clearPegoutAmountPreset();
-    el.pegoutAmount.value = "";
-  }
   updateBusyUi();
 }
 
@@ -9144,7 +9128,7 @@ el.btnPegout.addEventListener("click", async () => {
   if (syncing || sending) return;
   const drain = el.pegoutDrain.checked;
   const selected_output_ids = selectedOutpointsFor(pegoutCoinPanel);
-  const perCoin = drain || (selected_output_ids?.length ?? 0) > 0;
+  const perCoin = drain;
   let amount_sats = 0;
   if (!perCoin) {
     const parsed = parseAmountToSats(el.pegoutAmount.value);

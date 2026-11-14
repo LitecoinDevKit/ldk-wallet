@@ -931,9 +931,9 @@
                     <div class="send-form">
                       <p class="lede">
                         Return private funds to your public balance. A typed amount arrives on one
-                        fresh <code>ltc1</code> address. Max or chosen coins arrive on one
-                        <code>ltc1</code> each, so a private split is not consolidated on the way
-                        out.
+                        fresh <code>ltc1</code> address, and any remainder stays private. Max
+                        sends each coin to its own <code>ltc1</code>, so a private split is not
+                        consolidated on the way out.
                       </p>
                       <label class="field">
                         <span class="field-label" id="pegout-amount-label">Amount (LTC)</span>
@@ -954,9 +954,10 @@
                       <details class="coin-control" id="pegout-coin-control">
                         <summary>Choose coins (advanced)</summary>
                         <p class="hint">
-                          Optional. Each selected coin goes to its own fresh public address (the
-                          private fee comes out of the largest). Frozen coins are skipped by
-                          automatic selection.
+                          Optional. A typed amount is funded only from the selected coins, which
+                          appear together in one transaction. Max sends each selected coin to its
+                          own fresh public address (the private fee comes out of the largest).
+                          Frozen coins are skipped by automatic selection.
                         </p>
                         <p class="hint mono" id="pegout-coin-control-sum" hidden></p>
                         <ul id="pegout-utxo-list" class="utxo-list"></ul>

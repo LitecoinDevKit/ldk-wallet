@@ -3502,7 +3502,7 @@ fn resolve_pegout_request(
     let tip = state.wallet.latest_checkpoint().height();
     let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
     let selected = mweb::normalize_selected_ids(req.selected_output_ids.as_deref());
-    let per_coin = req.drain || selected.is_some();
+    let per_coin = req.drain;
     let dust_sats = if !per_coin && !req.address.trim().is_empty() {
         let net = state.network.to_bitcoin_network();
         let dest = Address::from_str(&req.address)
@@ -3556,8 +3556,18 @@ fn resolve_pegout_request(
         ));
     }
 
-    let spendable = mweb::spendable_mweb_sats(mweb, tip, &frozen);
     let amount_sats = req.amount_sats;
+    if let Some(ref ids) = selected {
+        mweb::resolve_spend_coins(
+            mweb.store.db(),
+            tip,
+            &frozen,
+            Some(ids.as_slice()),
+            amount_sats.saturating_add(fee_sats),
+            "swapping",
+        )?;
+    }
+    let spendable = mweb::spendable_mweb_sats(mweb, tip, &frozen);
     if amount_sats < dust_sats {
         return Err(WalletError::BuildTx(format!(
             "peg-out amount {} litoshis is below the dust limit ({} litoshis for this address)",
@@ -5787,6 +5797,95 @@ mod tests {
             note_foreign_spend(state, &mut job, &mut record).unwrap();
         }
         app
+    }
+
+    /// A testnet wallet holding confirmed private coins of these amounts, with their output ids.
+    fn app_with_private_coins(dir: &Path, amounts: &[u64]) -> (WalletApp, Vec<String>) {
+        let app = app_with_job(dir, ChurnPhase::Cancelled, false);
+        let mut ids = Vec::new();
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let mweb = state.mweb.as_mut().expect("mweb runtime");
+            for (i, amount) in amounts.iter().enumerate() {
+                let id = [0x40 + i as u8; 32];
+                mweb.store.db_mut().insert(bdk_mweb::MwebCoin {
+                    output_id: id,
+                    commitment: [0; 33],
+                    amount: *amount,
+                    address_index: 0,
+                    blind: [0; 32],
+                    shared_secret: [0; 32],
+                    spend_key: Some([1; 32]),
+                    block_height: Some(0),
+                    is_pegin: false,
+                    leaf_index: Some(i as u64),
+                });
+                ids.push(hex::encode(id));
+            }
+        }
+        (app, ids)
+    }
+
+    fn pegout_req(address: &str, amount_sats: u64, drain: bool, ids: &[String]) -> PegoutRequest {
+        PegoutRequest {
+            address: address.into(),
+            amount_sats,
+            fee_sats: 0,
+            drain,
+            selected_output_ids: Some(ids.to_vec()),
+            output_amounts: Vec::new(),
+            addresses: Vec::new(),
+            per_coin: false,
+            fee_output_index: None,
+        }
+    }
+
+    /// Picking 2 of 3 coins and typing an amount sends that amount to one address from those coins.
+    #[test]
+    fn typed_pegout_from_selected_coins_is_one_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000, 2_000_000, 9_000_000]);
+        let address = app.receive_address().unwrap();
+        let guard = app.lock_state().unwrap();
+        let state = guard.as_ref().unwrap();
+
+        let (resolved, _) =
+            resolve_pegout_request(state, pegout_req(&address, 4_000_000, false, &ids[..2]))
+                .unwrap();
+        assert!(!resolved.per_coin);
+        assert_eq!(resolved.output_amounts, vec![4_000_000]);
+        assert_eq!(resolved.address, address);
+        assert_eq!(resolved.selected_output_ids.as_deref(), Some(&ids[..2]));
+    }
+
+    /// The other coins in the wallet do not count toward a typed amount from a selection.
+    #[test]
+    fn typed_pegout_cannot_exceed_the_selected_coins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000, 2_000_000, 9_000_000]);
+        let address = app.receive_address().unwrap();
+        let guard = app.lock_state().unwrap();
+        let state = guard.as_ref().unwrap();
+
+        let err = resolve_pegout_request(state, pegout_req(&address, 6_000_000, false, &ids[..2]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("selected"), "{err}");
+    }
+
+    /// Max with a selection still empties each selected coin to its own address.
+    #[test]
+    fn max_pegout_from_selected_coins_stays_per_coin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000, 2_000_000, 9_000_000]);
+        let guard = app.lock_state().unwrap();
+        let state = guard.as_ref().unwrap();
+
+        let (resolved, _) =
+            resolve_pegout_request(state, pegout_req("", 0, true, &ids[..2])).unwrap();
+        assert!(resolved.per_coin);
+        assert_eq!(resolved.output_amounts.len(), 2);
     }
 
     /// A stale expired record left behind a finished job must not bring it back.

@@ -678,7 +678,7 @@ pub struct PegoutRequest {
     /// [`Self::per_coin`] is true; the wallet reveals fresh receive addresses.
     #[serde(default)]
     pub address: String,
-    /// Ignored when [`Self::drain`] is true or coins are selected (per-coin).
+    /// Ignored when [`Self::drain`] is true (per-coin).
     #[serde(default)]
     pub amount_sats: u64,
     #[serde(default)]
@@ -688,8 +688,9 @@ pub struct PegoutRequest {
     #[serde(default)]
     pub drain: bool,
     /// When non-empty, spend only these MWEB output ids (hex). Combined with
-    /// [`Self::drain`], empties the selected coins (minus the kernel fee).
-    /// Non-empty selection is always per-coin (one HogEx output each).
+    /// [`Self::drain`], empties each selected coin to its own address (minus the
+    /// kernel fee). With a typed amount, funds that one output from these coins
+    /// and returns the rest as private change.
     #[serde(default)]
     pub selected_output_ids: Option<Vec<String>>,
     /// Filled by the resolver: one HogEx amount per spent coin when per-coin.

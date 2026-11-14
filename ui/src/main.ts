@@ -803,6 +803,8 @@ const el = {
   liveLogBody: document.querySelector<HTMLElement>("#live-log-body")!,
   btnLiveLogPause: document.querySelector<HTMLButtonElement>("#btn-live-log-pause")!,
   btnLiveLogClear: document.querySelector<HTMLButtonElement>("#btn-live-log-clear")!,
+  btnLiveLogClose: document.querySelector<HTMLButtonElement>("#btn-live-log-close")!,
+  btnLiveLog: document.querySelector<HTMLButtonElement>("#btn-live-log")!,
 };
 
 const views = Object.fromEntries(
@@ -830,6 +832,7 @@ let sending = false;
 let currentPhase: Phase = "boot";
 let currentView: View = "balance";
 const DEV_MODE_KEY = "ltc-dev-mode";
+const LIVE_LOG_OPEN_KEY = "ltc-live-log-open";
 const LIVE_LOG_POLL_MS = 1000;
 const LIVE_LOG_MAX_LINES = 1000;
 const DEV_REVEAL_CLICKS = 5;
@@ -1695,7 +1698,6 @@ function setPhase(next: Phase) {
   }
   if (next === "unlock" || next === "ready") startCoverPump();
   else stopCoverPump();
-  syncLiveLog();
   if (next !== "mnemonic") showMnemonicStep("show");
   updateBackupBanner();
   updateMaturityBanner(0);
@@ -1742,7 +1744,6 @@ function setView(next: View) {
   if (next === "settings") void loadElectrumPresets();
   if (next === "insights") void refreshInsightsView();
   if (next === "litvm") void refreshLitvm();
-  syncLiveLog();
 }
 
 function setCard(next: Card | null) {
@@ -9369,8 +9370,24 @@ function appendLiveLog(lines: string[]) {
   if (atBottom) body.scrollTop = body.scrollHeight;
 }
 
+function liveLogOpen(): boolean {
+  return devModeOn() && localStorage.getItem(LIVE_LOG_OPEN_KEY) === "1";
+}
+
+function setLiveLogOpen(open: boolean) {
+  if (open) localStorage.setItem(LIVE_LOG_OPEN_KEY, "1");
+  else localStorage.removeItem(LIVE_LOG_OPEN_KEY);
+  syncLiveLog();
+}
+
+function setDevMode(on: boolean) {
+  if (on) localStorage.setItem(DEV_MODE_KEY, "1");
+  else localStorage.removeItem(DEV_MODE_KEY);
+  syncLiveLog();
+}
+
 function liveLogWanted(): boolean {
-  return devModeOn() && currentPhase === "ready" && currentView === "settings" && !document.hidden;
+  return liveLogOpen() && !document.hidden;
 }
 
 async function pollLiveLog() {
@@ -9390,12 +9407,15 @@ async function pollLiveLog() {
   }
 }
 
-/** Start or stop polling to match dev mode, phase, view, and window visibility. */
+/** Show the Logs button and drawer, and start or stop polling, to match dev mode, the drawer, and window visibility. */
 function syncLiveLog() {
   const on = devModeOn();
+  const open = liveLogOpen();
   el.devModeToggle.checked = on;
   if (on) el.devModeRow.hidden = false;
-  el.liveLog.hidden = !on;
+  el.btnLiveLog.hidden = !on || open;
+  el.liveLog.hidden = !open;
+  document.body.classList.toggle("live-log-open", open);
   if (liveLogWanted()) {
     if (liveLogTimer == null) void pollLiveLog();
   } else if (liveLogTimer != null) {
@@ -9410,10 +9430,21 @@ el.diagnosticsTitle.addEventListener("click", () => {
   if (devTitleClicks.length >= DEV_REVEAL_CLICKS) el.devModeRow.hidden = false;
 });
 
-el.devModeToggle.addEventListener("change", () => {
-  if (el.devModeToggle.checked) localStorage.setItem(DEV_MODE_KEY, "1");
-  else localStorage.removeItem(DEV_MODE_KEY);
-  syncLiveLog();
+el.devModeToggle.addEventListener("change", () => setDevMode(el.devModeToggle.checked));
+
+el.btnLiveLog.addEventListener("click", () => setLiveLogOpen(true));
+el.btnLiveLogClose.addEventListener("click", () => setLiveLogOpen(false));
+
+// ⌘⇧L / Ctrl+Shift+L works on every screen, so testers can turn the log on before signing in.
+document.addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== "l") return;
+  event.preventDefault();
+  if (!devModeOn()) {
+    setDevMode(true);
+    setLiveLogOpen(true);
+  } else {
+    setLiveLogOpen(!liveLogOpen());
+  }
 });
 
 el.btnLiveLogPause.addEventListener("click", () => {

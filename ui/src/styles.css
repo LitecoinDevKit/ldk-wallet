@@ -1176,8 +1176,61 @@ textarea {
   margin-top: 0.85rem;
 }
 
+.live-log-fab {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  /* Above modals and the loading overlay: the log matters most while those are up. */
+  z-index: 130;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font: 500 0.75rem var(--font-mono);
+  cursor: pointer;
+}
+
+.live-log-fab:hover {
+  color: var(--text-1);
+  border-color: var(--border-strong);
+}
+
+:root {
+  --live-log-h: min(40vh, 22rem);
+}
+
+body.live-log-open .app {
+  height: calc(100% - var(--live-log-h));
+}
+
+body.live-log-open .auth {
+  min-height: 0;
+  height: calc(100% - var(--live-log-h));
+}
+
 .live-log {
-  margin-top: 0.75rem;
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 130;
+  display: flex;
+  flex-direction: column;
+  height: var(--live-log-h);
+  padding: 0.6rem 1rem 0.8rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-1);
+  box-shadow: 0 -12px 30px -18px rgba(0, 0, 0, 0.6);
+}
+
+body.live-log-open .overlay,
+body.live-log-open .loading-overlay {
+  bottom: var(--live-log-h);
+}
+
+body.live-log-open .toast-region {
+  bottom: calc(var(--live-log-h) + 0.75rem);
 }
 
 .live-log-head {
@@ -1192,8 +1245,9 @@ textarea {
 }
 
 .live-log-body {
+  flex: 1;
+  min-height: 0;
   margin: 0;
-  height: 16rem;
   overflow: auto;
   padding: 0.6rem 0.75rem;
   border: 1px solid var(--border);

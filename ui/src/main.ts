@@ -9249,7 +9249,7 @@ el.btnPegout.addEventListener("click", async () => {
   const pendingIds = selected_output_ids?.length
     ? [...selected_output_ids]
     : drain
-      ? mwebUtxoCache.filter((coin) => coin.mature && !coin.locked).map((coin) => coin.output_id)
+      ? mwebUtxoCache.filter((coin) => coin.actions.select).map((coin) => coin.output_id)
       : [];
   beginCoinSpendPending({
     chain: "private",

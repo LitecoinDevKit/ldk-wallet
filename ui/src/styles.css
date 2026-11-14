@@ -1172,6 +1172,42 @@ textarea {
   cursor: pointer;
 }
 
+#dev-mode-row {
+  margin-top: 0.85rem;
+}
+
+.live-log {
+  margin-top: 0.75rem;
+}
+
+.live-log-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.live-log-head .field-label {
+  margin-right: auto;
+}
+
+.live-log-body {
+  margin: 0;
+  height: 16rem;
+  overflow: auto;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
 .send-form {
   display: flex;
   flex-direction: column;

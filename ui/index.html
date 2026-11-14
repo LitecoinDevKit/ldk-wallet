@@ -1419,7 +1419,7 @@
             </div>
 
             <div class="card" id="diagnostics-card">
-              <h3>Diagnostics</h3>
+              <h3 id="diagnostics-title">Diagnostics</h3>
               <p class="hint">
                 Share this with support when sync is stuck. It includes connection settings, sync
                 phase, and recent non-secret log lines — never your recovery phrase or passphrase.
@@ -1431,6 +1431,18 @@
                 <button type="button" id="btn-copy-diagnostics" class="btn btn-ghost">
                   Copy to clipboard
                 </button>
+              </div>
+              <label class="check" id="dev-mode-row" hidden>
+                <input id="dev-mode-toggle" type="checkbox" />
+                <span>Developer mode: show the live log</span>
+              </label>
+              <div class="live-log" id="live-log" hidden>
+                <div class="live-log-head">
+                  <span class="field-label">Live log</span>
+                  <button type="button" id="btn-live-log-pause" class="btn btn-ghost btn-sm">Pause</button>
+                  <button type="button" id="btn-live-log-clear" class="btn btn-ghost btn-sm">Clear</button>
+                </div>
+                <pre class="live-log-body" id="live-log-body" tabindex="0"></pre>
               </div>
             </div>
 

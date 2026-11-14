@@ -796,6 +796,13 @@ const el = {
   btnImportMetadata: document.querySelector<HTMLButtonElement>("#btn-import-metadata")!,
   btnExportDiagnostics: document.querySelector<HTMLButtonElement>("#btn-export-diagnostics")!,
   btnCopyDiagnostics: document.querySelector<HTMLButtonElement>("#btn-copy-diagnostics")!,
+  diagnosticsTitle: document.querySelector<HTMLElement>("#diagnostics-title")!,
+  devModeRow: document.querySelector<HTMLElement>("#dev-mode-row")!,
+  devModeToggle: document.querySelector<HTMLInputElement>("#dev-mode-toggle")!,
+  liveLog: document.querySelector<HTMLElement>("#live-log")!,
+  liveLogBody: document.querySelector<HTMLElement>("#live-log-body")!,
+  btnLiveLogPause: document.querySelector<HTMLButtonElement>("#btn-live-log-pause")!,
+  btnLiveLogClear: document.querySelector<HTMLButtonElement>("#btn-live-log-clear")!,
 };
 
 const views = Object.fromEntries(
@@ -822,6 +829,15 @@ let syncing = false;
 let sending = false;
 let currentPhase: Phase = "boot";
 let currentView: View = "balance";
+const DEV_MODE_KEY = "ltc-dev-mode";
+const LIVE_LOG_POLL_MS = 1000;
+const LIVE_LOG_MAX_LINES = 1000;
+const DEV_REVEAL_CLICKS = 5;
+let liveLogCursor = 0;
+let liveLogLines: string[] = [];
+let liveLogPaused = false;
+let liveLogTimer: number | null = null;
+let devTitleClicks: number[] = [];
 let activeCard: Card | null = null;
 let syncState: SyncState = "idle";
 let lastTxid: string | null = null;
@@ -1679,6 +1695,7 @@ function setPhase(next: Phase) {
   }
   if (next === "unlock" || next === "ready") startCoverPump();
   else stopCoverPump();
+  syncLiveLog();
   if (next !== "mnemonic") showMnemonicStep("show");
   updateBackupBanner();
   updateMaturityBanner(0);
@@ -1725,6 +1742,7 @@ function setView(next: View) {
   if (next === "settings") void loadElectrumPresets();
   if (next === "insights") void refreshInsightsView();
   if (next === "litvm") void refreshLitvm();
+  syncLiveLog();
 }
 
 function setCard(next: Card | null) {
@@ -9325,7 +9343,93 @@ el.btnCopyDiagnostics.addEventListener("click", async () => {
   }
 });
 
+// --- Developer live log -----------------------------------------------------
+
+type DiagLogPage = { next: number; lines: string[] };
+
+function devModeOn(): boolean {
+  return localStorage.getItem(DEV_MODE_KEY) === "1";
+}
+
+/** `<unix seconds> <message>` → `HH:MM:SS <message>` in local time. */
+function formatLogLine(line: string): string {
+  const space = line.indexOf(" ");
+  const secs = Number(line.slice(0, space));
+  if (space < 0 || !Number.isFinite(secs)) return line;
+  const time = new Date(secs * 1000).toLocaleTimeString("en-GB", { hour12: false });
+  return `${time} ${line.slice(space + 1)}`;
+}
+
+function appendLiveLog(lines: string[]) {
+  if (lines.length === 0) return;
+  const body = el.liveLogBody;
+  const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 8;
+  liveLogLines = liveLogLines.concat(lines.map(formatLogLine)).slice(-LIVE_LOG_MAX_LINES);
+  body.textContent = liveLogLines.join("\n");
+  if (atBottom) body.scrollTop = body.scrollHeight;
+}
+
+function liveLogWanted(): boolean {
+  return devModeOn() && currentPhase === "ready" && currentView === "settings" && !document.hidden;
+}
+
+async function pollLiveLog() {
+  liveLogTimer = null;
+  if (!liveLogWanted()) return;
+  if (!liveLogPaused) {
+    try {
+      const page = await invoke<DiagLogPage>("diag_log_since", { since: liveLogCursor });
+      liveLogCursor = page.next;
+      appendLiveLog(page.lines);
+    } catch {
+      // A missed poll is harmless; the next one picks up from the same cursor.
+    }
+  }
+  if (liveLogWanted() && liveLogTimer == null) {
+    liveLogTimer = window.setTimeout(() => void pollLiveLog(), LIVE_LOG_POLL_MS);
+  }
+}
+
+/** Start or stop polling to match dev mode, phase, view, and window visibility. */
+function syncLiveLog() {
+  const on = devModeOn();
+  el.devModeToggle.checked = on;
+  if (on) el.devModeRow.hidden = false;
+  el.liveLog.hidden = !on;
+  if (liveLogWanted()) {
+    if (liveLogTimer == null) void pollLiveLog();
+  } else if (liveLogTimer != null) {
+    window.clearTimeout(liveLogTimer);
+    liveLogTimer = null;
+  }
+}
+
+el.diagnosticsTitle.addEventListener("click", () => {
+  const now = Date.now();
+  devTitleClicks = devTitleClicks.filter((t) => now - t < 3000).concat(now);
+  if (devTitleClicks.length >= DEV_REVEAL_CLICKS) el.devModeRow.hidden = false;
+});
+
+el.devModeToggle.addEventListener("change", () => {
+  if (el.devModeToggle.checked) localStorage.setItem(DEV_MODE_KEY, "1");
+  else localStorage.removeItem(DEV_MODE_KEY);
+  syncLiveLog();
+});
+
+el.btnLiveLogPause.addEventListener("click", () => {
+  liveLogPaused = !liveLogPaused;
+  el.btnLiveLogPause.textContent = liveLogPaused ? "Resume" : "Pause";
+});
+
+el.btnLiveLogClear.addEventListener("click", () => {
+  liveLogLines = [];
+  el.liveLogBody.textContent = "";
+});
+
+document.addEventListener("visibilitychange", syncLiveLog);
+
 displayUnit = readDisplayUnit();
 hideBalances = readHideBalances();
 syncAmountFieldLabels();
+syncLiveLog();
 void boot();

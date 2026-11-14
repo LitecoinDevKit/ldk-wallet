@@ -421,6 +421,22 @@ function publicCoins() {
 }
 
 /** Drains the picked coin, so the preview amount is that coin minus the fee. */
+/** A small diagnostic ring that grows one line per poll, like a live wallet. */
+const diagLines: string[] = [
+  "sync: electrum sync starting",
+  "sync: mweb download starting",
+  "sync: mweb finished in 2140 ms",
+];
+function diagLogSince(args: Args) {
+  const since = Number(args?.since ?? 0);
+  diagLines.push(`cover: mempool checked, ${diagLines.length} txs seen`);
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    next: diagLines.length,
+    lines: diagLines.slice(since).map((l) => `${now} ${l}`),
+  };
+}
+
 function transferPreview(args: Args) {
   const req = (args?.req ?? {}) as {
     chain?: string;
@@ -486,6 +502,7 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
     minimum_sat_vb: 1,
   }),
   fetch_network_pulse: () => pulse(),
+  diag_log_since: (args) => diagLogSince(args),
   fetch_insight_charts: () => charts(),
   sync_wallet: () => ({
     summary: combined().transparent,

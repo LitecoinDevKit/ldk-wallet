@@ -33,8 +33,9 @@ use bdk_wallet::{extract_prepared_mweb_pegin, select_mweb_coins, MwebStore, Pers
 
 use crate::descriptors::sign_and_finalize;
 use crate::dto::{
-    CombinedSummary, MwebBroadcastResult, MwebSendRequest, MwebUtxoRecord, PeginRequest,
-    PeginResult, PegoutRequest, SplitResult, TxKind, WalletSummary,
+    ChurnPhase, CoinActions, CoinBlock, CoinStatus, CombinedSummary, MwebBroadcastResult,
+    MwebSendRequest, MwebUtxoRecord, PeginRequest, PeginResult, PegoutRequest, SplitResult, TxKind,
+    WalletSummary,
 };
 use crate::error::WalletError;
 use crate::meta;
@@ -721,6 +722,7 @@ impl MwebRuntime {
             mweb_confirmed_sats: bal.mweb_confirmed.to_sat(),
             mweb_unconfirmed_sats: bal.mweb_untrusted_pending.to_sat(),
             mweb_immature_sats: bal.mweb_immature.to_sat(),
+            mweb_maturity_blocks: MWEB_PEGIN_MATURITY,
             mweb_total_sats: bal.mweb_total().to_sat(),
             mweb_receive_address: mweb_addr,
             mweb_synced_height: self.last_synced_height,
@@ -1432,6 +1434,188 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].locked);
         assert_eq!(rows[0].label, "savings");
+        assert_eq!(rows[0].status, CoinStatus::Frozen);
+        assert!(rows[0].actions.unfreeze);
+        assert_eq!(rows[0].actions.blocked, Some(CoinBlock::Frozen));
+    }
+
+    fn ready_facts() -> CoinFacts {
+        CoinFacts {
+            confirmations: 10,
+            mature: true,
+            maturity_blocks_left: 0,
+            locked: false,
+            from_pegin: false,
+            non_solo_blocks: None,
+            churn_phase: None,
+        }
+    }
+
+    #[test]
+    fn coin_status_reports_each_status() {
+        let cases = [
+            (ready_facts(), CoinStatus::Ready),
+            (
+                CoinFacts {
+                    churn_phase: Some(ChurnPhase::WaitingForCover),
+                    ..ready_facts()
+                },
+                CoinStatus::Churning,
+            ),
+            (
+                CoinFacts {
+                    confirmations: 0,
+                    mature: false,
+                    maturity_blocks_left: 6,
+                    ..ready_facts()
+                },
+                CoinStatus::Pending,
+            ),
+            (
+                CoinFacts {
+                    confirmations: 2,
+                    mature: false,
+                    maturity_blocks_left: 4,
+                    from_pegin: true,
+                    ..ready_facts()
+                },
+                CoinStatus::Maturing,
+            ),
+            (
+                CoinFacts {
+                    locked: true,
+                    ..ready_facts()
+                },
+                CoinStatus::Frozen,
+            ),
+            (
+                CoinFacts {
+                    from_pegin: true,
+                    non_solo_blocks: Some(0),
+                    ..ready_facts()
+                },
+                CoinStatus::TiedToPegin,
+            ),
+            (
+                CoinFacts {
+                    from_pegin: true,
+                    non_solo_blocks: None,
+                    ..ready_facts()
+                },
+                CoinStatus::Ready,
+            ),
+            (
+                CoinFacts {
+                    churn_phase: Some(ChurnPhase::Done),
+                    ..ready_facts()
+                },
+                CoinStatus::Ready,
+            ),
+        ];
+        for (facts, want) in cases {
+            assert_eq!(coin_status(&facts).0, want);
+        }
+    }
+
+    #[test]
+    fn coin_status_takes_the_first_match() {
+        let churning_frozen_tied = CoinFacts {
+            churn_phase: Some(ChurnPhase::PausedSolo),
+            locked: true,
+            from_pegin: true,
+            non_solo_blocks: Some(0),
+            ..ready_facts()
+        };
+        let (status, actions) = coin_status(&churning_frozen_tied);
+        assert_eq!(status, CoinStatus::Churning);
+        assert_eq!(actions.blocked, Some(CoinBlock::Churning));
+        assert!(!actions.unfreeze, "the job owns the freeze while it runs");
+
+        let maturing_frozen = CoinFacts {
+            confirmations: 2,
+            mature: false,
+            maturity_blocks_left: 4,
+            locked: true,
+            ..ready_facts()
+        };
+        let (status, actions) = coin_status(&maturing_frozen);
+        assert_eq!(status, CoinStatus::Maturing);
+        assert_eq!(actions.blocked, Some(CoinBlock::Frozen));
+
+        let frozen_tied = CoinFacts {
+            locked: true,
+            from_pegin: true,
+            non_solo_blocks: Some(0),
+            ..ready_facts()
+        };
+        assert_eq!(coin_status(&frozen_tied).0, CoinStatus::Frozen);
+    }
+
+    #[test]
+    fn coin_actions_follow_the_blocked_reason() {
+        let pending = CoinFacts {
+            confirmations: 0,
+            mature: false,
+            maturity_blocks_left: 1,
+            ..ready_facts()
+        };
+        let maturing = CoinFacts {
+            confirmations: 3,
+            mature: false,
+            maturity_blocks_left: 3,
+            ..ready_facts()
+        };
+        let frozen = CoinFacts {
+            locked: true,
+            ..ready_facts()
+        };
+        let churning = CoinFacts {
+            churn_phase: Some(ChurnPhase::WaitingConfirm),
+            locked: true,
+            ..ready_facts()
+        };
+        let tied = CoinFacts {
+            from_pegin: true,
+            non_solo_blocks: Some(0),
+            ..ready_facts()
+        };
+        let cases = [
+            (pending, Some(CoinBlock::Unconfirmed), false),
+            (
+                maturing,
+                Some(CoinBlock::Maturing { blocks_left: 3 }),
+                false,
+            ),
+            (frozen, Some(CoinBlock::Frozen), true),
+            (churning, Some(CoinBlock::Churning), false),
+        ];
+        for (facts, blocked, unfreeze) in cases {
+            let a = coin_status(&facts).1;
+            assert_eq!(a.blocked, blocked);
+            assert!(!a.spend_to_self && !a.split && !a.transfer && !a.select && !a.freeze);
+            assert_eq!(a.unfreeze, unfreeze);
+        }
+        for facts in [ready_facts(), tied] {
+            let a = coin_status(&facts).1;
+            assert_eq!(a.blocked, None);
+            assert!(a.spend_to_self && a.split && a.transfer && a.select && a.freeze);
+            assert!(!a.unfreeze);
+        }
+    }
+
+    #[test]
+    fn pegin_blocks_left_only_while_a_pegin_matures() {
+        assert_eq!(
+            pegin_blocks_left(TxKind::Pegin, 0),
+            Some(MWEB_PEGIN_MATURITY)
+        );
+        assert_eq!(
+            pegin_blocks_left(TxKind::Pegin, 2),
+            Some(MWEB_PEGIN_MATURITY - 2)
+        );
+        assert_eq!(pegin_blocks_left(TxKind::Pegin, MWEB_PEGIN_MATURITY), None);
+        assert_eq!(pegin_blocks_left(TxKind::Pegout, 0), None);
+        assert_eq!(pegin_blocks_left(TxKind::Transparent, 1), None);
     }
 
     #[test]
@@ -2536,6 +2720,15 @@ pub fn list_mweb_unspent(
             let locked = frozen.contains(&output_id);
             let label = labels.get(&output_id).cloned().unwrap_or_default();
             let fields = churn_fields(&output_id, c.is_pegin, &depth, job.as_ref());
+            let (status, actions) = coin_status(&CoinFacts {
+                confirmations,
+                mature,
+                maturity_blocks_left,
+                locked,
+                from_pegin: fields.from_pegin,
+                non_solo_blocks: fields.non_solo_blocks,
+                churn_phase: fields.churn_phase,
+            });
             MwebUtxoRecord {
                 output_id,
                 amount_sats: c.amount,
@@ -2563,6 +2756,8 @@ pub fn list_mweb_unspent(
                 churn_cover_error: fields.churn_cover_error,
                 churn_spreading: fields.churn_spreading,
                 churn_actions: fields.churn_actions,
+                status,
+                actions,
             }
         })
         .collect();
@@ -2573,6 +2768,68 @@ pub fn list_mweb_unspent(
             .then_with(|| a.output_id.cmp(&b.output_id))
     });
     rows
+}
+
+/// What [`coin_status`] reads about one coin.
+pub(crate) struct CoinFacts {
+    pub confirmations: u32,
+    pub mature: bool,
+    pub maturity_blocks_left: u32,
+    pub locked: bool,
+    pub from_pegin: bool,
+    pub non_solo_blocks: Option<u32>,
+    pub churn_phase: Option<ChurnPhase>,
+}
+
+/// The only place a private coin's status and buttons are decided.
+///
+/// Status is the first match of: churning, pending, maturing, frozen, tied to peg-in, ready.
+/// The blocked reason is the first match of: churning, frozen, unconfirmed, maturing.
+pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
+    let churning = f.churn_phase.is_some_and(ChurnPhase::is_active);
+    let status = if churning {
+        CoinStatus::Churning
+    } else if !f.mature && f.confirmations == 0 {
+        CoinStatus::Pending
+    } else if !f.mature {
+        CoinStatus::Maturing
+    } else if f.locked {
+        CoinStatus::Frozen
+    } else if f.from_pegin && f.non_solo_blocks == Some(0) {
+        CoinStatus::TiedToPegin
+    } else {
+        CoinStatus::Ready
+    };
+    let blocked = if churning {
+        Some(CoinBlock::Churning)
+    } else if f.locked {
+        Some(CoinBlock::Frozen)
+    } else if !f.mature && f.confirmations == 0 {
+        Some(CoinBlock::Unconfirmed)
+    } else if !f.mature {
+        Some(CoinBlock::Maturing {
+            blocks_left: f.maturity_blocks_left,
+        })
+    } else {
+        None
+    };
+    let spendable = blocked.is_none();
+    let actions = CoinActions {
+        spend_to_self: spendable,
+        split: spendable,
+        transfer: spendable,
+        select: spendable,
+        freeze: spendable,
+        unfreeze: !churning && f.locked,
+        blocked,
+    };
+    (status, actions)
+}
+
+/// Blocks left before a peg-in's private coin is spendable, or `None` once it is.
+pub(crate) fn pegin_blocks_left(kind: TxKind, confirmations: u32) -> Option<u32> {
+    let left = MWEB_PEGIN_MATURITY.saturating_sub(confirmations);
+    (kind == TxKind::Pegin && left > 0).then_some(left)
 }
 
 struct ChurnFields {

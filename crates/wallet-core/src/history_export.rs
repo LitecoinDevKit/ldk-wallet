@@ -149,6 +149,7 @@ mod tests {
             confirmations: 3,
             timestamp: Some(1_700_000_000),
             kind: TxKind::Transparent,
+            maturity_blocks_left: None,
         }
     }
 

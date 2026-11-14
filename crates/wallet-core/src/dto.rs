@@ -259,6 +259,9 @@ pub struct TxRecord {
     /// Kind of activity (transparent, peg-in, peg-out, MWEB send/receive/split).
     #[serde(default)]
     pub kind: TxKind,
+    /// Blocks until a peg-in's private coin is spendable. Set only while it is maturing.
+    #[serde(default)]
+    pub maturity_blocks_left: Option<u32>,
 }
 
 /// Request to unlock an encrypted wallet.
@@ -494,6 +497,9 @@ pub struct CombinedSummary {
     pub mweb_confirmed_sats: u64,
     pub mweb_unconfirmed_sats: u64,
     pub mweb_immature_sats: u64,
+    /// Confirmations a peg-in needs before its private coin is spendable.
+    #[serde(default)]
+    pub mweb_maturity_blocks: u32,
     pub mweb_total_sats: u64,
     pub mweb_receive_address: Option<String>,
     /// Tip height of last successful MWEB sync; `None` if never synced.
@@ -624,6 +630,8 @@ pub struct PeginPreview {
     /// True when manual coin selection likely leaves transparent change.
     #[serde(default)]
     pub creates_change: bool,
+    /// Confirmations before the private coin is spendable.
+    pub maturity_blocks: u32,
 }
 
 /// Result of probing an Electrum server (Settings “Test connection”).
@@ -859,6 +867,56 @@ pub struct MwebUtxoRecord {
     /// Buttons for the live job. Set only while the job holds this coin.
     #[serde(default)]
     pub churn_actions: Option<ChurnActions>,
+    /// The one status chip for this coin, from [`crate::mweb::coin_status`].
+    #[serde(default)]
+    pub status: CoinStatus,
+    /// Which coin buttons are allowed, from [`crate::mweb::coin_status`].
+    #[serde(default)]
+    pub actions: CoinActions,
+}
+
+/// Status of one private coin. [`crate::mweb::coin_status`] picks the first that applies,
+/// in declaration order.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoinStatus {
+    /// A live self-spend holds the coin.
+    Churning,
+    /// Not in a block yet.
+    Pending,
+    /// A confirmed peg-in that has not reached maturity.
+    Maturing,
+    /// Frozen by the user.
+    Frozen,
+    /// A mature peg-in output not yet spent in a block with other private activity.
+    TiedToPegin,
+    #[default]
+    Ready,
+}
+
+/// Why a coin's spend buttons are off. Checked in declaration order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CoinBlock {
+    Churning,
+    Frozen,
+    Unconfirmed,
+    Maturing { blocks_left: u32 },
+}
+
+/// Buttons a private coin row may enable. The UI renders these and never works them out.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoinActions {
+    pub spend_to_self: bool,
+    pub split: bool,
+    /// The coin may move to another wallet. Whether another wallet exists is the UI's list.
+    pub transfer: bool,
+    /// The coin may be picked for a private send or peg-out.
+    pub select: bool,
+    pub freeze: bool,
+    pub unfreeze: bool,
+    /// Set whenever the spend buttons are off.
+    pub blocked: Option<CoinBlock>,
 }
 
 /// One output in a split plan (change is flagged).

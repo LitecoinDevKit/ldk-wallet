@@ -882,6 +882,8 @@ pub struct MwebUtxoRecord {
 pub enum CoinStatus {
     /// A live self-spend holds the coin.
     Churning,
+    /// A send, peg-out, split or transfer of this coin is still broadcasting.
+    Sending,
     /// Not in a block yet.
     Pending,
     /// A confirmed peg-in that has not reached maturity.
@@ -899,6 +901,7 @@ pub enum CoinStatus {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CoinBlock {
     Churning,
+    Sending,
     Frozen,
     Unconfirmed,
     Maturing { blocks_left: u32 },

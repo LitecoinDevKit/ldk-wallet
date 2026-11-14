@@ -245,11 +245,19 @@ type ChurnActions = {
 };
 
 /** One status per private coin, picked by `coin_status` in the backend. */
-type CoinStatus = "churning" | "pending" | "maturing" | "frozen" | "tied-to-pegin" | "ready";
+type CoinStatus =
+  | "churning"
+  | "sending"
+  | "pending"
+  | "maturing"
+  | "frozen"
+  | "tied-to-pegin"
+  | "ready";
 
 /** Why a private coin's spend buttons are off. */
 type CoinBlock =
   | { kind: "churning" }
+  | { kind: "sending" }
   | { kind: "frozen" }
   | { kind: "unconfirmed" }
   | { kind: "maturing"; blocks_left: number };
@@ -6212,7 +6220,12 @@ function churnHopLines(coin: MwebUtxoRecord): string[] {
 
 /** A self-spend holds the coin, or it is not in a block or not mature yet. */
 function coinBusyOrUnspendable(coin: MwebUtxoRecord): boolean {
-  return coin.status === "churning" || coin.status === "pending" || coin.status === "maturing";
+  return (
+    coin.status === "churning" ||
+    coin.status === "sending" ||
+    coin.status === "pending" ||
+    coin.status === "maturing"
+  );
 }
 
 type CoinButton = "split" | "transfer" | "spend";
@@ -6229,6 +6242,8 @@ function coinBlockedTitle(blocked: CoinBlock | null, button: CoinButton): string
   switch (blocked?.kind) {
     case "churning":
       return "A self-spend has this coin.";
+    case "sending":
+      return "A send is still using this coin.";
     case "frozen":
       return copy.frozen;
     case "maturing":
@@ -6246,6 +6261,7 @@ function freezeLabel(coin: MwebUtxoRecord): string {
 }
 
 const COIN_ROW_CLASS: Partial<Record<CoinStatus, string>> = {
+  sending: "is-pending",
   pending: "is-pending",
   maturing: "is-maturing",
   frozen: "is-frozen",
@@ -6253,6 +6269,7 @@ const COIN_ROW_CLASS: Partial<Record<CoinStatus, string>> = {
 };
 
 const COIN_CHIPS: Partial<Record<CoinStatus, RowChip>> = {
+  sending: { label: "Sending", className: "pill pending" },
   pending: { label: "Pending", className: "pill pending" },
   maturing: { label: "Maturing", className: "pill pill-maturing" },
   frozen: { label: "Frozen", className: "pill pill-frozen" },
@@ -6283,6 +6300,8 @@ function mwebRowStatusLine(coin: MwebUtxoRecord): string | null {
   switch (coin.status) {
     case "churning":
       return null;
+    case "sending":
+      return "Sending · waiting for the broadcast";
     case "pending":
       return "Pending · not yet spendable";
     case "maturing": {
@@ -6349,7 +6368,7 @@ function appendDetailSection(
 function sortMwebCoins(coins: MwebUtxoRecord[]): MwebUtxoRecord[] {
   const rank = (coin: MwebUtxoRecord): number => {
     if (churnNeedsAttention(coin)) return 0;
-    if (coin.status === "churning") return 1;
+    if (coin.status === "churning" || coin.status === "sending") return 1;
     if (coin.status === "tied-to-pegin") return 2;
     if (coin.status === "pending" || coin.status === "maturing") return 3;
     return 4;
@@ -6596,7 +6615,7 @@ function renderMwebCoinsList() {
     if (coin.actions.unfreeze) frozenCount += 1;
     if (churnNeedsAttention(coin)) attentionCount += 1;
     const spendPending = pendingCoinSpend("private", coin.output_id);
-    const jobHolds = coin.status === "churning" || !!spendPending;
+    const jobHolds = coin.status === "churning" || coin.status === "sending" || !!spendPending;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const tied = coin.status === "tied-to-pegin";
     const expanded = mwebCoinExpanded.has(coin.output_id);
@@ -7125,7 +7144,7 @@ function renderMwebControlList(panel: CoinControlPanel) {
   panel.empty.hidden = mwebUtxoCache.length > 0;
   const sorted = sortMwebCoins(mwebUtxoCache);
   for (const coin of sorted) {
-    const jobHolds = coin.status === "churning";
+    const jobHolds = coin.status === "churning" || coin.status === "sending";
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const expanded = mwebCoinExpanded.has(coin.output_id);
     const li = document.createElement("li");

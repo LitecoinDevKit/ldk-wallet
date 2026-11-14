@@ -258,6 +258,9 @@ function privateCoins(): Coin[] {
       tied.churn_cover_outputs = 5;
       tied.churn_spreading = true;
     }
+  } else if (cover === "sending" && current !== "recovery" && current !== "balance") {
+    labeled.status = "sending";
+    labeled.actions = blockedActions({ kind: "sending" });
   }
   if (current === "balance") {
     return [

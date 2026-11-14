@@ -12,7 +12,7 @@ Each flow with real phases has one table that is the only legal path, and a diag
 | Lock / unlock | `lock::LOCK_TRANSITIONS` | `docs/LOCK_LIFECYCLE.md` | `UPDATE_DIAGRAMS=1 cargo test -p wallet-core lock_table_matches_docs` |
 | UI lifecycle phase | `PHASE_FROM` in `ui/src/phases.ts` | `docs/UI_PHASES.md` | `npm run check:diagrams -- --write` |
 
-Peg-in, peg-out and send are single locked calls with no stored phase, so they have no table. A private coin's status and buttons come from `mweb::coin_status` in `crates/wallet-core/src/mweb.rs`, which documents its priority order (churning, pending, maturing, frozen, tied to peg-in, ready). The UI renders `status`, `actions` and `actions.blocked` on each coin and `maturity_blocks_left` on peg-in history rows; it never works these out from `mature`, `locked`, `confirmations` or `churn_phase`. To change when a coin button is allowed, change `coin_status` and its tests.
+Peg-in, peg-out and send are single locked calls with no stored phase, so they have no table. A private coin's status and buttons come from `mweb::coin_status` in `crates/wallet-core/src/mweb.rs`, which documents its priority order (churning, sending, pending, maturing, frozen, tied to peg-in, ready). A coin is `sending` while a send, peg-out, split or transfer that signed it is still broadcasting; that hold lives in `reserved` in `mweb_frozen.json`, apart from the user's freezes, and only the spend's `CoinHold` releases it. The UI renders `status`, `actions` and `actions.blocked` on each coin and `maturity_blocks_left` on peg-in history rows; it never works these out from `mature`, `locked`, `confirmations` or `churn_phase`. To change when a coin button is allowed, change `coin_status` and its tests.
 
 Any change to a flow with a table follows the same rules:
 
@@ -41,4 +41,4 @@ Any change to a flow with a table follows the same rules:
 - A local, git-ignored `.cargo/config.toml` patches the bdk crates to `../bdk`. Builds then drop the git `source` lines from `Cargo.lock`. Never commit that change: run `git restore Cargo.lock` before committing. CI runs `cargo metadata --locked` and fails on it.
 - `cargo fmt --check` has an existing diff in `crates/wallet-core/src/lib.rs`. Format only the files you touched (`rustfmt --edition 2021 <files>`) so unrelated churn stays out of the diff.
 - Checks CI runs: `cargo clippy --workspace --all-targets --locked`, `cargo test --workspace --locked`, `npm run build`.
-- UI screenshots: `npm run screenshots`. The fixture in `ui/src/shots-fixture.ts` takes `?cover=solo|no-rpc|waiting|spreading|spent` on the coins scene.
+- UI screenshots: `npm run screenshots`. The fixture in `ui/src/shots-fixture.ts` takes `?cover=solo|no-rpc|waiting|spreading|spent|sending` on the coins scene.

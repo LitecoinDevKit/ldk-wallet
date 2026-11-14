@@ -297,7 +297,8 @@ function settings() {
 
 function pulse() {
   return {
-    tip_height: TIP,
+    // The explorer trails Electrum by a block; the UI should still show TIP.
+    tip_height: TIP - 1,
     price_usd: 84.2,
     price_change_pct: 1.2,
     fastest_fee_sat_vb: 3,

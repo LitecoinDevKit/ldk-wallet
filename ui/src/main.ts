@@ -950,6 +950,15 @@ function applyChangeClass(node: HTMLElement, pct: number | null | undefined) {
   node.classList.add(pct > 0 ? "up" : "down");
 }
 
+/** The explorer's tip lags while it computes metrics; Electrum's is current. */
+function renderPulseTip() {
+  if (!lastNetworkPulse) return;
+  const tip = Math.max(lastNetworkPulse.tip_height, lastSummary?.tip_height ?? 0);
+  const text = `#${tip.toLocaleString("en-US")}`;
+  el.pulseTip.textContent = text;
+  el.insightsTip.textContent = text;
+}
+
 function renderNetworkPulse(pulse: NetworkPulse | null) {
   const show = insightsEnabled && pulse != null && currentPhase === "ready";
   el.networkPulse.hidden = !show;
@@ -961,13 +970,12 @@ function renderNetworkPulse(pulse: NetworkPulse | null) {
     (pulse.price_change_pct != null ? ` ${formatPct(pulse.price_change_pct)}` : "");
   el.pulsePrice.textContent = priceText;
   applyChangeClass(el.pulsePrice, pulse.price_change_pct);
-  el.pulseTip.textContent = `#${pulse.tip_height.toLocaleString("en-US")}`;
+  renderPulseTip();
   el.pulseFee.textContent = `${pulse.fastest_fee_sat_vb} sat/vB`;
   el.pulseMempool.textContent = `${formatCompact(pulse.mempool_tx_count)} tx`;
 
   el.insightsPrice.textContent = priceText;
   applyChangeClass(el.insightsPrice, pulse.price_change_pct);
-  el.insightsTip.textContent = `#${pulse.tip_height.toLocaleString("en-US")}`;
   el.insightsFee.textContent = `${pulse.fastest_fee_sat_vb} sat/vB`;
   el.insightsMempool.textContent = `${formatCompact(pulse.mempool_tx_count)} · ${formatCompact(pulse.mempool_vsize)} vB`;
 
@@ -3456,6 +3464,7 @@ function renderSummary(s: WalletSummary) {
   renderFiat();
   el.balanceConfirmed.textContent = formatAmount(s.confirmed_sats);
   el.balanceTip.textContent = s.tip_height.toLocaleString("en-US");
+  renderPulseTip();
   el.address.textContent = s.receive_address;
   void refreshPublicReceiveQr();
 

@@ -168,6 +168,12 @@ pub struct UtxoRecord {
     /// Optional local note (non-secret sidecar).
     #[serde(default)]
     pub label: String,
+    /// The one status chip for this coin, from [`crate::mweb::public_coin_status`].
+    #[serde(default)]
+    pub status: CoinStatus,
+    /// Which coin buttons are allowed, from [`crate::mweb::public_coin_status`].
+    #[serde(default)]
+    pub actions: CoinActions,
 }
 
 /// Freeze or unfreeze a transparent UTXO.
@@ -875,8 +881,9 @@ pub struct MwebUtxoRecord {
     pub actions: CoinActions,
 }
 
-/// Status of one private coin. [`crate::mweb::coin_status`] picks the first that applies,
-/// in declaration order.
+/// Status of one coin. [`crate::mweb::coin_status`] (private) and
+/// [`crate::mweb::public_coin_status`] (public) pick the first that applies, in declaration
+/// order. Public coins only use Sending, Pending, Frozen and Ready.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoinStatus {
@@ -907,14 +914,14 @@ pub enum CoinBlock {
     Maturing { blocks_left: u32 },
 }
 
-/// Buttons a private coin row may enable. The UI renders these and never works them out.
+/// Buttons a coin row may enable. The UI renders these and never works them out.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoinActions {
     pub spend_to_self: bool,
     pub split: bool,
     /// The coin may move to another wallet. Whether another wallet exists is the UI's list.
     pub transfer: bool,
-    /// The coin may be picked for a private send or peg-out.
+    /// The coin may be picked for a send, peg-out or peg-in.
     pub select: bool,
     pub freeze: bool,
     pub unfreeze: bool,

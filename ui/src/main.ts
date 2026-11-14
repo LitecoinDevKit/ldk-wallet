@@ -199,6 +199,9 @@ type UtxoRecord = {
   confirmations: number;
   locked: boolean;
   label?: string;
+  /** From `public_coin_status`: sending, pending, frozen or ready. */
+  status: CoinStatus;
+  actions: CoinActions;
 };
 
 type ChurnHop = {
@@ -244,7 +247,7 @@ type ChurnActions = {
   open_settings: boolean;
 };
 
-/** One status per private coin, picked by `coin_status` in the backend. */
+/** One status per coin, picked by `coin_status` / `public_coin_status` in the backend. */
 type CoinStatus =
   | "churning"
   | "sending"
@@ -254,7 +257,7 @@ type CoinStatus =
   | "tied-to-pegin"
   | "ready";
 
-/** Why a private coin's spend buttons are off. */
+/** Why a coin's spend buttons are off. */
 type CoinBlock =
   | { kind: "churning" }
   | { kind: "sending" }
@@ -262,7 +265,7 @@ type CoinBlock =
   | { kind: "unconfirmed" }
   | { kind: "maturing"; blocks_left: number };
 
-/** Which private coin buttons the backend allows. The UI never works this out itself. */
+/** Which coin buttons the backend allows. The UI never works this out itself. */
 type CoinActions = {
   spend_to_self: boolean;
   split: boolean;
@@ -5490,14 +5493,18 @@ function renderUtxoList(panel: CoinControlPanel) {
     const li = document.createElement("li");
     li.dataset.outpoint = utxo.outpoint;
     const rowClass = ["utxo-row"];
-    if (utxo.locked) rowClass.push("is-frozen");
+    const extraClass = publicRowClass(utxo);
+    if (extraClass) rowClass.push(extraClass);
     li.className = rowClass.join(" ");
 
+    if (!utxo.actions.select) panel.selected.delete(utxo.outpoint);
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.disabled = utxo.locked;
+    check.disabled = !utxo.actions.select;
     check.checked = panel.selected.has(utxo.outpoint);
-    check.title = utxo.locked ? "Unfreeze to spend." : "Include this coin";
+    check.title = utxo.actions.select
+      ? "Include this coin"
+      : coinBlockedTitle(utxo.actions.blocked, "spend", PUBLIC_COIN_BLOCKED_COPY.spend);
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(utxo.outpoint);
       else panel.selected.delete(utxo.outpoint);
@@ -5519,21 +5526,18 @@ function renderUtxoList(panel: CoinControlPanel) {
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(utxo.amount_sats);
     amtRow.append(amt);
-    if (utxo.locked) {
+    const chip = publicRowChip(utxo);
+    if (chip) {
       const pill = document.createElement("span");
-      pill.className = "pill pill-frozen";
-      pill.textContent = "Frozen";
+      pill.className = chip.className;
+      pill.textContent = chip.label;
       amtRow.append(pill);
     }
 
-    const kind = utxo.keychain === "internal" ? "change" : "receive";
-    const conf =
-      utxo.confirmations === 0
-        ? "pending"
-        : `${utxo.confirmations.toLocaleString("en-US")} conf`;
+    const conf = publicConfLabel(utxo);
     const status = document.createElement("span");
     status.className = "utxo-status";
-    status.textContent = `${kind} · ${conf}`;
+    status.textContent = publicRowStatusLine(utxo);
     main.append(amtRow, status);
 
     const actions = document.createElement("div");
@@ -5571,13 +5575,7 @@ function renderUtxoList(panel: CoinControlPanel) {
       renderUtxoList(panel);
     });
 
-    const freeze = document.createElement("button");
-    freeze.type = "button";
-    freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-    freeze.setAttribute("role", "menuitem");
-    freeze.textContent = utxo.locked ? "Unfreeze" : "Freeze";
-    freeze.addEventListener("click", (event) => {
-      event.stopPropagation();
+    const freeze = publicFreezeButton(utxo, () => {
       more.open = false;
       void toggleUtxoLocked(utxo);
     });
@@ -5649,14 +5647,14 @@ function renderCoinsList() {
   el.coinsUtxoEmpty.hidden = utxoCache.length > 0;
   let frozen = 0;
   for (const utxo of utxoCache) {
-    if (utxo.locked) frozen += 1;
+    if (utxo.actions.unfreeze) frozen += 1;
     const expanded = publicCoinExpanded.has(utxo.outpoint);
     const spendPending = pendingCoinSpend("public", utxo.outpoint);
     const li = document.createElement("li");
     li.dataset.outpoint = utxo.outpoint;
     const rowClass = ["utxo-row"];
-    if (utxo.locked) rowClass.push("is-frozen");
-    if (spendPending) rowClass.push("is-pending");
+    const extraClass = spendPending ? "is-pending" : publicRowClass(utxo);
+    if (extraClass) rowClass.push(extraClass);
     li.className = rowClass.join(" ");
 
     const main = document.createElement("div");
@@ -5666,26 +5664,20 @@ function renderCoinsList() {
     const amt = document.createElement("span");
     amt.textContent = formatAmountPlain(utxo.amount_sats);
     amtRow.append(amt);
-    if (spendPending) {
+    const chip = spendPending
+      ? { label: spendPending.pill, className: "pill pending" }
+      : publicRowChip(utxo);
+    if (chip) {
       const pill = document.createElement("span");
-      pill.className = "pill pending";
-      pill.textContent = spendPending.pill;
-      amtRow.append(pill);
-    } else if (utxo.locked) {
-      const pill = document.createElement("span");
-      pill.className = "pill pill-frozen";
-      pill.textContent = "Frozen";
+      pill.className = chip.className;
+      pill.textContent = chip.label;
       amtRow.append(pill);
     }
 
-    const kind = utxo.keychain === "internal" ? "change" : "receive";
-    const conf =
-      utxo.confirmations === 0
-        ? "pending"
-        : `${utxo.confirmations.toLocaleString("en-US")} conf`;
+    const conf = publicConfLabel(utxo);
     const status = document.createElement("span");
     status.className = "utxo-status";
-    status.textContent = spendPending ? spendPending.status : `${kind} · ${conf}`;
+    status.textContent = spendPending ? spendPending.status : publicRowStatusLine(utxo);
     main.append(amtRow, status);
     li.append(main);
 
@@ -5729,13 +5721,7 @@ function renderCoinsList() {
       renderCoinsList();
     });
 
-    const freeze = document.createElement("button");
-    freeze.type = "button";
-    freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-    freeze.setAttribute("role", "menuitem");
-    freeze.textContent = utxo.locked ? "Unfreeze" : "Freeze";
-    freeze.addEventListener("click", (event) => {
-      event.stopPropagation();
+    const freeze = publicFreezeButton(utxo, () => {
       more.open = false;
       void toggleUtxoLocked(utxo);
     });
@@ -5745,13 +5731,10 @@ function renderCoinsList() {
     split.className = "btn btn-ghost btn-sm";
     split.setAttribute("role", "menuitem");
     split.textContent = "Split";
-    const splitBlocked = utxo.locked || utxo.confirmations === 0;
-    split.disabled = splitBlocked;
-    split.title = utxo.locked
-      ? "Unfreeze to split."
-      : utxo.confirmations === 0
-        ? "Split is disabled until the coin is confirmed."
-        : "Split this coin into multiple outputs";
+    split.disabled = !utxo.actions.split;
+    split.title = utxo.actions.split
+      ? "Split this coin into multiple outputs"
+      : coinBlockedTitle(utxo.actions.blocked, "split", PUBLIC_COIN_BLOCKED_COPY.split);
     split.addEventListener("click", (event) => {
       event.stopPropagation();
       more.open = false;
@@ -5767,16 +5750,13 @@ function renderCoinsList() {
     transfer.className = "btn btn-ghost btn-sm";
     transfer.setAttribute("role", "menuitem");
     transfer.textContent = "Transfer to…";
-    const canTransfer =
-      otherWallets().length > 0 && !utxo.locked && utxo.confirmations > 0;
+    const canTransfer = otherWallets().length > 0 && utxo.actions.transfer;
     transfer.disabled = !canTransfer;
-    transfer.title = utxo.locked
-      ? "Unfreeze to transfer."
-      : utxo.confirmations === 0
-        ? "Transfer is disabled until the coin is confirmed."
-        : otherWallets().length === 0
-          ? "Add another wallet to transfer coins between them."
-          : "Send this coin to another wallet on this device";
+    transfer.title = !utxo.actions.transfer
+      ? coinBlockedTitle(utxo.actions.blocked, "transfer", PUBLIC_COIN_BLOCKED_COPY.transfer)
+      : otherWallets().length === 0
+        ? "Add another wallet to transfer coins between them."
+        : "Send this coin to another wallet on this device";
     transfer.addEventListener("click", (event) => {
       event.stopPropagation();
       more.open = false;
@@ -6236,9 +6216,21 @@ const COIN_BLOCKED_COPY: Record<CoinButton, { frozen: string; unconfirmed: strin
   spend: { frozen: "Unfreeze to spend.", unconfirmed: "Cannot spend privately until confirmed." },
 };
 
+const PUBLIC_COIN_BLOCKED_COPY: Record<CoinButton, { frozen: string; unconfirmed: string }> = {
+  split: { frozen: "Unfreeze to split.", unconfirmed: "Split is disabled until the coin is confirmed." },
+  transfer: {
+    frozen: "Unfreeze to transfer.",
+    unconfirmed: "Transfer is disabled until the coin is confirmed.",
+  },
+  spend: { frozen: "Unfreeze to spend.", unconfirmed: "Cannot spend until confirmed." },
+};
+
 /** Tooltip for a coin button the backend turned off. */
-function coinBlockedTitle(blocked: CoinBlock | null, button: CoinButton): string {
-  const copy = COIN_BLOCKED_COPY[button];
+function coinBlockedTitle(
+  blocked: CoinBlock | null,
+  button: CoinButton,
+  copy = COIN_BLOCKED_COPY[button],
+): string {
   switch (blocked?.kind) {
     case "churning":
       return "A self-spend has this coin.";
@@ -6293,6 +6285,48 @@ function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
   if (pill) return { label: pill.label, className: churnPillClass(pill.kind) };
   if (justSpent) return { label: "Just spent", className: "pill churn-pill-accent" };
   return COIN_CHIPS[coin.status] ?? null;
+}
+
+/** The status chip for a public row: Sending or Frozen, else none (the line says pending). */
+function publicRowChip(utxo: UtxoRecord): RowChip | null {
+  if (utxo.status === "sending") return COIN_CHIPS.sending ?? null;
+  if (utxo.actions.blocked?.kind === "frozen") return COIN_CHIPS.frozen ?? null;
+  return null;
+}
+
+function publicRowClass(utxo: UtxoRecord): string | null {
+  if (utxo.status === "sending") return "is-pending";
+  if (utxo.actions.blocked?.kind === "frozen") return "is-frozen";
+  return null;
+}
+
+function publicConfLabel(utxo: UtxoRecord): string {
+  return utxo.confirmations === 0
+    ? "pending"
+    : `${utxo.confirmations.toLocaleString("en-US")} conf`;
+}
+
+function publicRowStatusLine(utxo: UtxoRecord): string {
+  if (utxo.status === "sending") return "Sending · waiting for the broadcast";
+  const kind = utxo.keychain === "internal" ? "change" : "receive";
+  return `${kind} · ${publicConfLabel(utxo)}`;
+}
+
+function publicFreezeButton(utxo: UtxoRecord, onClick: () => void): HTMLButtonElement {
+  const freeze = document.createElement("button");
+  freeze.type = "button";
+  freeze.className = "btn btn-ghost btn-sm utxo-freeze";
+  freeze.setAttribute("role", "menuitem");
+  freeze.textContent = utxo.actions.unfreeze ? "Unfreeze" : "Freeze";
+  freeze.disabled = !utxo.actions.freeze && !utxo.actions.unfreeze;
+  if (freeze.disabled) {
+    freeze.title = coinBlockedTitle(utxo.actions.blocked, "spend", PUBLIC_COIN_BLOCKED_COPY.spend);
+  }
+  freeze.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onClick();
+  });
+  return freeze;
 }
 
 /** Single default-row status sentence. Active jobs stay lean — truth is on #churn-status. */
@@ -7986,7 +8020,7 @@ function publicSpendableSats(selected: Set<string> = sendSelectedOutpoints): num
   if (selectedSum > 0) return selectedSum;
   let sum = 0;
   for (const utxo of utxoCache) {
-    if (!utxo.locked && utxo.confirmations > 0) sum += utxo.amount_sats;
+    if (utxo.actions.blocked == null) sum += utxo.amount_sats;
   }
   return sum;
 }

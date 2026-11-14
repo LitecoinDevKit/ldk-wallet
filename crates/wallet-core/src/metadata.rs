@@ -12,7 +12,7 @@ use crate::dto::ChurnDepthRecord;
 use crate::dto::ContactRecord;
 use crate::error::WalletError;
 use crate::labels::{self, TxLabelsFile};
-use crate::mweb_frozen::{self, MwebFrozenFile};
+use crate::mweb_frozen;
 use crate::split_ids::{self, SplitIdsFile};
 use crate::utxo_labels::{self, UtxoLabelsFile};
 
@@ -194,25 +194,7 @@ pub fn import_json(data_dir: &Path, json: &str) -> Result<MetadataImportResult, 
         )?;
     }
 
-    let mut frozen_file = mweb_frozen::read_ids(data_dir)?;
-    let mut mweb_frozen_upserted = 0usize;
-    for id in bundle.mweb_frozen {
-        let Ok(id) = mweb_frozen::normalize_output_id(&id) else {
-            continue;
-        };
-        if frozen_file.ids.insert(id) {
-            mweb_frozen_upserted += 1;
-        }
-    }
-    if !frozen_file.ids.is_empty() {
-        mweb_frozen::write_ids(
-            data_dir,
-            &MwebFrozenFile {
-                version: 1,
-                ..frozen_file
-            },
-        )?;
-    }
+    let mweb_frozen_upserted = mweb_frozen::add_ids(data_dir, &bundle.mweb_frozen)?;
 
     let churn_depth_upserted = churn::upsert_depth(data_dir, &bundle.churn_depth)?;
 

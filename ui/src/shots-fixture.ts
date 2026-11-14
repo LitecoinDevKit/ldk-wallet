@@ -10,7 +10,8 @@
  *
  * `cover=no-rpc`, `cover=waiting`, or `cover=spreading` marks one private coin as
  * waiting for cover so the live card can be checked without a node. `cover=solo`
- * marks a quiet block. `rpc=1` pretends a Litecoin RPC URL is saved.
+ * marks a quiet block. `cover=sending` shows one private and one public coin held by a
+ * broadcast in flight. `rpc=1` pretends a Litecoin RPC URL is saved.
  */
 
 type Scene = "balance" | "coins" | "self-spend" | "recovery";
@@ -450,7 +451,13 @@ function churnRequest(args: Args): { cover_min: number; spread_send: boolean } {
   };
 }
 
+const PUBLIC_READY: CoinActions = { ...READY, spend_to_self: false };
+
 function publicCoins() {
+  const sending =
+    new URLSearchParams(window.location.search).get("cover") === "sending" &&
+    scene() !== "recovery" &&
+    scene() !== "balance";
   return [
     {
       outpoint: `${id("91")}:0`,
@@ -460,6 +467,8 @@ function publicCoins() {
       keychain: "external",
       confirmations: 12,
       locked: false,
+      status: "ready",
+      actions: PUBLIC_READY,
     },
     {
       outpoint: `${id("92")}:1`,
@@ -469,6 +478,8 @@ function publicCoins() {
       keychain: "external",
       confirmations: 4,
       locked: false,
+      status: sending ? "sending" : "ready",
+      actions: sending ? blockedActions({ kind: "sending" }) : PUBLIC_READY,
     },
   ];
 }

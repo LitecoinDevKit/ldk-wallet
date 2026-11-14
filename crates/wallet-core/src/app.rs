@@ -774,33 +774,25 @@ impl WalletApp {
                 electrum_candidates,
                 electrum_validate_domain,
                 tx,
-                outpoint,
                 fee_sats,
                 address,
                 to_account_index,
+                hold,
             } => {
-                let client =
-                    match electrum::connect_first(&electrum_candidates, electrum_validate_domain) {
-                        Ok((client, _)) => client,
-                        Err(e) => {
-                            self.release_public_split_hold(&source_dir, outpoint);
-                            return Err(e);
-                        }
-                    };
-                if let Err(e) = client.transaction_broadcast(&tx) {
-                    self.release_public_split_hold(&source_dir, outpoint);
-                    return Err(WalletError::Electrum(
-                        crate::error::humanize_broadcast_error(&e.to_string()),
-                    ));
-                }
-                self.commit_public_transfer(
+                let (client, _) =
+                    electrum::connect_first(&electrum_candidates, electrum_validate_domain)?;
+                client.transaction_broadcast(&tx).map_err(|e| {
+                    WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
+                })?;
+                let result = self.commit_public_transfer(
                     &source_dir,
                     tx,
-                    outpoint,
                     fee_sats,
                     address,
                     to_account_index,
-                )
+                );
+                drop(hold);
+                result
             }
             PreparedTransferBroadcast::Private {
                 source_dir,
@@ -1231,6 +1223,7 @@ impl WalletApp {
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let outpoint = parse_outpoint(&req.outpoint)?;
+        refuse_reserved_public(&state.data_dir, outpoint)?;
         if req.locked {
             state.wallet.lock_outpoint(outpoint);
         } else {
@@ -1877,6 +1870,16 @@ impl WalletApp {
             .mweb
             .as_mut()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+        // Peg-in coin selection runs inside bdk_wallet, which skips locked
+        // outpoints. Lock held coins for this call only; the unlock lands
+        // before the persist below, so no user freeze is written.
+        let masked: Vec<OutPoint> = mweb_frozen::public_reserved_outpoints(&state.data_dir)?
+            .into_iter()
+            .filter(|op| !state.wallet.is_outpoint_locked(*op))
+            .collect();
+        for op in &masked {
+            state.wallet.lock_outpoint(*op);
+        }
         let result = mweb::pegin(
             &mut state.wallet,
             &state.signer,
@@ -1885,7 +1888,11 @@ impl WalletApp {
             &peers,
             req,
             network,
-        )?;
+        );
+        for op in masked {
+            state.wallet.unlock_outpoint(op);
+        }
+        let result = result?;
         state
             .wallet
             .persist(&mut state.db)
@@ -2064,25 +2071,18 @@ impl WalletApp {
                 electrum_candidates,
                 electrum_validate_domain,
                 tx,
-                outpoint,
                 fee_sats,
                 output_count,
+                hold,
             } => {
-                let client =
-                    match electrum::connect_first(&electrum_candidates, electrum_validate_domain) {
-                        Ok((client, _)) => client,
-                        Err(e) => {
-                            self.release_public_split_hold(&source_dir, outpoint);
-                            return Err(e);
-                        }
-                    };
-                if let Err(e) = client.transaction_broadcast(&tx) {
-                    self.release_public_split_hold(&source_dir, outpoint);
-                    return Err(WalletError::Electrum(
-                        crate::error::humanize_broadcast_error(&e.to_string()),
-                    ));
-                }
-                self.commit_public_split(&source_dir, tx, outpoint, fee_sats, output_count)
+                let (client, _) =
+                    electrum::connect_first(&electrum_candidates, electrum_validate_domain)?;
+                client.transaction_broadcast(&tx).map_err(|e| {
+                    WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
+                })?;
+                let result = self.commit_public_split(&source_dir, tx, fee_sats, output_count);
+                drop(hold);
+                result
             }
             PreparedSplit::Private {
                 source_dir,
@@ -2100,28 +2100,16 @@ impl WalletApp {
         }
     }
 
-    fn release_public_split_hold(&self, source_dir: &Path, outpoint: OutPoint) {
-        let _ = self.with_account_wallet(source_dir, |wallet, db| {
-            wallet.unlock_outpoint(outpoint);
-            wallet
-                .persist(db)
-                .map_err(|e| WalletError::Persist(e.to_string()))?;
-            Ok(())
-        });
-    }
-
     fn commit_public_split(
         &self,
         source_dir: &Path,
         tx: Transaction,
-        outpoint: OutPoint,
         fee_sats: u64,
         output_count: u32,
     ) -> Result<SplitResult, WalletError> {
         let txid = tx.compute_txid().to_string();
         self.with_account_wallet(source_dir, |wallet, db| {
             wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
-            wallet.unlock_outpoint(outpoint);
             wallet
                 .persist(db)
                 .map_err(|e| WalletError::Persist(e.to_string()))?;
@@ -2152,7 +2140,6 @@ impl WalletApp {
         &self,
         source_dir: &Path,
         tx: Transaction,
-        outpoint: OutPoint,
         fee_sats: u64,
         address: String,
         to_account_index: u32,
@@ -2160,7 +2147,6 @@ impl WalletApp {
         let txid = tx.compute_txid().to_string();
         self.with_account_wallet(source_dir, |wallet, db| {
             wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
-            wallet.unlock_outpoint(outpoint);
             wallet
                 .persist(db)
                 .map_err(|e| WalletError::Persist(e.to_string()))?;
@@ -3084,6 +3070,7 @@ impl MemoryBackedApp {
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let outpoint = parse_outpoint(&req.outpoint)?;
+        refuse_reserved_public(&state.data_dir, outpoint)?;
         if req.locked {
             state.wallet.lock_outpoint(outpoint);
         } else {
@@ -3346,11 +3333,22 @@ fn resolve_pegin_request(
                     "selected outpoint {op} is frozen — unfreeze it before swapping"
                 )));
             }
+            refuse_reserved_public(&state.data_dir, *op)?;
             sum = sum.saturating_add(utxo.txout.value.to_sat());
         }
         sum
     } else {
-        state.wallet.balance().trusted_spendable().to_sat()
+        let held_sats: u64 = mweb_frozen::public_reserved_outpoints(&state.data_dir)?
+            .into_iter()
+            .filter_map(|op| state.wallet.get_utxo(op))
+            .map(|utxo| utxo.txout.value.to_sat())
+            .sum();
+        state
+            .wallet
+            .balance()
+            .trusted_spendable()
+            .to_sat()
+            .saturating_sub(held_sats)
     };
 
     let amount_sats = if req.drain {
@@ -3824,10 +3822,10 @@ enum PreparedTransferBroadcast {
         electrum_candidates: Vec<String>,
         electrum_validate_domain: bool,
         tx: Transaction,
-        outpoint: OutPoint,
         fee_sats: u64,
         address: String,
         to_account_index: u32,
+        hold: CoinHold,
     },
     Private {
         source_dir: PathBuf,
@@ -3867,20 +3865,16 @@ fn prepare_transfer_broadcast(
                 .extract_tx()
                 .map_err(|e| WalletError::BuildTx(e.to_string()))?;
             let outpoint = parse_outpoint(req.coin_id.trim())?;
-            state.wallet.lock_outpoint(outpoint);
-            state
-                .wallet
-                .persist(&mut state.db)
-                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            let hold = CoinHold::take_public(&source_dir, vec![outpoint], session)?;
             Ok(PreparedTransferBroadcast::Public {
                 electrum_candidates: electrum_candidates(state),
                 electrum_validate_domain: state.electrum_validate_domain,
                 source_dir,
                 tx,
-                outpoint,
                 fee_sats,
                 address: prepared.address,
                 to_account_index: prepared.to_account_index,
+                hold,
             })
         }
         SplitChain::Private => {
@@ -3967,6 +3961,13 @@ fn build_send_psbt(
             }
         }
     }
+    let held = mweb_frozen::public_reserved_outpoints(&state.data_dir)?;
+    if let Some(op) = selected.iter().flatten().find(|op| held.contains(op)) {
+        return Err(WalletError::BuildTx(format!(
+            "selected outpoint {op}: {}",
+            mweb_frozen::RESERVED_MESSAGE
+        )));
+    }
 
     let mut tx_builder = state.wallet.build_tx();
     if let Some(ref outpoints) = selected {
@@ -3975,6 +3976,7 @@ fn build_send_psbt(
             .map_err(|e| WalletError::BuildTx(e.to_string()))?;
         tx_builder.manually_selected_only();
     }
+    tx_builder.unspendable(held.into_iter().collect());
 
     if req.drain {
         // With a manual selection, drain only those UTXOs (no drain_wallet).
@@ -4032,6 +4034,7 @@ fn public_split_utxo(state: &WalletState, raw: &str) -> Result<(OutPoint, u64), 
             "selected outpoint {op} is frozen — unfreeze it before splitting"
         )));
     }
+    refuse_reserved_public(&state.data_dir, op)?;
     let tip = state.wallet.local_chain().tip().height();
     let confirmations = match utxo.chain_position {
         ChainPosition::Confirmed { anchor, .. } => {
@@ -4053,9 +4056,9 @@ enum PreparedSplit {
         electrum_candidates: Vec<String>,
         electrum_validate_domain: bool,
         tx: Transaction,
-        outpoint: OutPoint,
         fee_sats: u64,
         output_count: u32,
+        hold: CoinHold,
     },
     Private {
         source_dir: PathBuf,
@@ -4084,11 +4087,7 @@ fn prepare_split(
                 .extract_tx()
                 .map_err(|e| WalletError::Sign(e.to_string()))?;
             let outpoint = parse_outpoint(&req.input)?;
-            state.wallet.lock_outpoint(outpoint);
-            state
-                .wallet
-                .persist(&mut state.db)
-                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            let hold = CoinHold::take_public(&source_dir, vec![outpoint], session)?;
             let electrum_candidates = electrum_candidates(state);
             let electrum_validate_domain = state.electrum_validate_domain;
             Ok(PreparedSplit::Public {
@@ -4096,9 +4095,9 @@ fn prepare_split(
                 electrum_candidates,
                 electrum_validate_domain,
                 tx,
-                outpoint,
                 fee_sats,
                 output_count: preview.outputs.len() as u32,
+                hold,
             })
         }
         SplitChain::Private => {
@@ -4316,6 +4315,7 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
     let labels = utxo_labels::read_labels(&state.data_dir)
         .map(|f| f.labels)
         .unwrap_or_default();
+    let held = mweb_frozen::public_reserved_outpoints(&state.data_dir).unwrap_or_default();
     let mut rows: Vec<UtxoRecord> = state
         .wallet
         .list_unspent()
@@ -4332,6 +4332,12 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
             };
             let outpoint = utxo.outpoint.to_string();
             let label = labels.get(&outpoint).cloned().unwrap_or_default();
+            let locked = state.wallet.is_outpoint_locked(utxo.outpoint);
+            let (status, actions) = mweb::public_coin_status(&mweb::PublicCoinFacts {
+                confirmations,
+                locked,
+                reserved: held.contains(&utxo.outpoint),
+            });
             UtxoRecord {
                 outpoint,
                 txid: utxo.outpoint.txid.to_string(),
@@ -4339,8 +4345,10 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
                 amount_sats: utxo.txout.value.to_sat(),
                 keychain: keychain.into(),
                 confirmations,
-                locked: state.wallet.is_outpoint_locked(utxo.outpoint),
+                locked,
                 label,
+                status,
+                actions,
             }
         })
         .collect();
@@ -4529,11 +4537,16 @@ fn refuse_churn_unfreeze(
     Ok(())
 }
 
-/// A spend's hold on its private inputs, from signing until the broadcast is
-/// settled. Released on drop so every exit lets the coins go.
+/// A spend's hold on its inputs, from signing until the broadcast is settled.
+/// Released on drop so every exit lets the coins go.
 struct CoinHold {
     data_dir: PathBuf,
-    ids: Vec<String>,
+    inputs: HeldInputs,
+}
+
+enum HeldInputs {
+    Private(Vec<String>),
+    Public(Vec<OutPoint>),
 }
 
 impl CoinHold {
@@ -4541,14 +4554,30 @@ impl CoinHold {
         mweb_frozen::reserve(data_dir, &ids, session)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
-            ids,
+            inputs: HeldInputs::Private(ids),
+        })
+    }
+
+    fn take_public(
+        data_dir: &Path,
+        outpoints: Vec<OutPoint>,
+        session: &str,
+    ) -> Result<Self, WalletError> {
+        mweb_frozen::reserve_public(data_dir, &outpoints, session)?;
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            inputs: HeldInputs::Public(outpoints),
         })
     }
 }
 
 impl Drop for CoinHold {
     fn drop(&mut self) {
-        if let Err(e) = mweb_frozen::release(&self.data_dir, &self.ids) {
+        let released = match &self.inputs {
+            HeldInputs::Private(ids) => mweb_frozen::release(&self.data_dir, ids),
+            HeldInputs::Public(outpoints) => mweb_frozen::release_public(&self.data_dir, outpoints),
+        };
+        if let Err(e) = released {
             diag::log(format!("coin hold: release failed: {e}"));
         }
     }
@@ -4558,6 +4587,13 @@ fn refuse_reserved(data_dir: &Path, output_id: &str) -> Result<(), WalletError> 
     let id = mweb_frozen::normalize_output_id(output_id)?;
     if mweb_frozen::read_ids(data_dir)?.reserved.contains_key(&id) {
         return Err(WalletError::Mweb(mweb_frozen::RESERVED_MESSAGE.into()));
+    }
+    Ok(())
+}
+
+fn refuse_reserved_public(data_dir: &Path, outpoint: OutPoint) -> Result<(), WalletError> {
+    if mweb_frozen::public_reserved_outpoints(data_dir)?.contains(&outpoint) {
+        return Err(WalletError::BuildTx(mweb_frozen::RESERVED_MESSAGE.into()));
     }
     Ok(())
 }
@@ -5959,6 +5995,151 @@ mod tests {
 
         drop(hold);
         assert_eq!(row_for(&ids[0]).status, CoinStatus::Ready);
+    }
+
+    /// A testnet wallet holding one confirmed public coin, with its outpoint.
+    fn app_with_public_coin(dir: &Path, amount_sats: u64) -> (WalletApp, OutPoint) {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::chain::BlockId;
+        use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
+
+        let app = app_with_job(dir, ChurnPhase::Cancelled, false);
+        let outpoint = {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_checkpoint(
+                &mut state.wallet,
+                BlockId {
+                    height: 1,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            let op =
+                receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(amount_sats));
+            state.wallet.persist(&mut state.db).unwrap();
+            op
+        };
+        (app, outpoint)
+    }
+
+    fn public_split_req(outpoint: OutPoint) -> SplitRequest {
+        SplitRequest {
+            chain: SplitChain::Public,
+            input: outpoint.to_string(),
+            equal_count: Some(2),
+            amounts: vec![],
+            fee_rate_sat_vb: Some(1),
+            fee_sats: 0,
+        }
+    }
+
+    /// A public coin a split is still broadcasting cannot be unfrozen and picked again.
+    #[test]
+    fn public_coin_in_flight_is_not_unfreezable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, outpoint) = app_with_public_coin(dir.path(), 1_000_000);
+        let prepared = {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            prepare_split(state, &public_split_req(outpoint), &app.session).unwrap()
+        };
+
+        let row = app.list_unspent().unwrap().remove(0);
+        assert_eq!(row.status, CoinStatus::Sending);
+        assert!(!row.locked, "the hold is not a user freeze");
+        assert!(!row.actions.unfreeze && !row.actions.freeze && !row.actions.select);
+        assert!(!row.actions.split && !row.actions.transfer);
+        assert_eq!(row.actions.blocked, Some(CoinBlock::Sending));
+
+        for locked in [false, true] {
+            let err = app
+                .set_utxo_locked(SetUtxoLockedRequest {
+                    outpoint: outpoint.to_string(),
+                    locked,
+                })
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(mweb_frozen::RESERVED_MESSAGE),
+                "{err}"
+            );
+        }
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let err = prepare_split(state, &public_split_req(outpoint), &app.session)
+                .err()
+                .unwrap();
+            assert!(
+                err.to_string().contains(mweb_frozen::RESERVED_MESSAGE),
+                "{err}"
+            );
+            let address = state
+                .wallet
+                .peek_address(KeychainKind::External, 5)
+                .address
+                .to_string();
+            let err = build_send_psbt(
+                state,
+                &SendRequest {
+                    address,
+                    amount_sats: 10_000,
+                    fee_rate_sat_vb: Some(1),
+                    drain: false,
+                    selected_outpoints: None,
+                },
+            )
+            .err()
+            .unwrap();
+            assert!(
+                matches!(err, WalletError::BuildTx(_)),
+                "auto selection must skip the held coin: {err}"
+            );
+        }
+
+        drop(prepared);
+        let row = app.list_unspent().unwrap().remove(0);
+        assert_eq!(row.status, CoinStatus::Ready);
+        assert!(!row.locked);
+    }
+
+    /// A failed public broadcast lets the coin go and leaves no freeze behind.
+    #[test]
+    fn failed_public_split_releases_its_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, outpoint) = app_with_public_coin(dir.path(), 1_000_000);
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.electrum_url = "tcp://127.0.0.1:9".into();
+            state.active_electrum_url = None;
+            state.electrum_use_public_fallback = false;
+        }
+        app.split_coin(public_split_req(outpoint)).unwrap_err();
+
+        let row = app.list_unspent().unwrap().remove(0);
+        assert_eq!(row.status, CoinStatus::Ready);
+        assert!(!row.locked);
+        let file =
+            mweb_frozen::read_ids(&app.lock_state().unwrap().as_ref().unwrap().data_dir).unwrap();
+        assert!(file.public_reserved.is_empty());
+    }
+
+    /// A public hold written by an earlier process is gone after the next load.
+    #[test]
+    fn public_hold_from_a_crashed_session_clears_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, outpoint) = app_with_public_coin(dir.path(), 1_000_000);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        mweb_frozen::reserve_public(&data_dir, &[outpoint], "crashed-session").unwrap();
+
+        app.load(dir.path()).unwrap();
+
+        assert!(mweb_frozen::read_ids(&data_dir)
+            .unwrap()
+            .public_reserved
+            .is_empty());
+        assert_eq!(app.list_unspent().unwrap()[0].status, CoinStatus::Ready);
     }
 
     /// A hold written by an earlier process is gone after the next load.

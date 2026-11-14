@@ -1629,6 +1629,81 @@ mod tests {
         }
     }
 
+    fn public_facts(confirmations: u32, locked: bool, reserved: bool) -> PublicCoinFacts {
+        PublicCoinFacts {
+            confirmations,
+            locked,
+            reserved,
+        }
+    }
+
+    #[test]
+    fn public_coin_status_takes_the_first_match() {
+        // (facts, status, blocked, select/freeze, split/transfer, unfreeze)
+        let cases = [
+            (
+                public_facts(3, false, false),
+                CoinStatus::Ready,
+                None,
+                true,
+                true,
+                false,
+            ),
+            (
+                public_facts(0, false, false),
+                CoinStatus::Pending,
+                Some(CoinBlock::Unconfirmed),
+                true,
+                false,
+                false,
+            ),
+            (
+                public_facts(3, true, false),
+                CoinStatus::Frozen,
+                Some(CoinBlock::Frozen),
+                false,
+                false,
+                true,
+            ),
+            (
+                public_facts(0, true, false),
+                CoinStatus::Pending,
+                Some(CoinBlock::Frozen),
+                false,
+                false,
+                true,
+            ),
+            (
+                public_facts(3, false, true),
+                CoinStatus::Sending,
+                Some(CoinBlock::Sending),
+                false,
+                false,
+                false,
+            ),
+            (
+                public_facts(3, true, true),
+                CoinStatus::Sending,
+                Some(CoinBlock::Sending),
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (facts, status, blocked, free, spend, unfreeze) in cases {
+            let (s, a) = public_coin_status(&facts);
+            assert_eq!(s, status);
+            assert_eq!(a.blocked, blocked);
+            assert_eq!((a.select, a.freeze), (free, free));
+            assert_eq!((a.split, a.transfer), (spend, spend));
+            assert_eq!(
+                a.unfreeze, unfreeze,
+                "the send owns the coin until it finishes"
+            );
+            assert!(!a.spend_to_self);
+        }
+    }
+
     #[test]
     fn pegin_blocks_left_only_while_a_pegin_matures() {
         assert_eq!(
@@ -2857,6 +2932,53 @@ pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
         select: spendable,
         freeze: spendable,
         unfreeze: !churning && !f.reserved && f.locked,
+        blocked,
+    };
+    (status, actions)
+}
+
+/// What [`public_coin_status`] reads about one public coin.
+pub(crate) struct PublicCoinFacts {
+    pub confirmations: u32,
+    /// Frozen by the user (BDK wallet lock).
+    pub locked: bool,
+    /// A split or transfer in flight holds the coin (`mweb_frozen` `public_reserved`).
+    pub reserved: bool,
+}
+
+/// The only place a public coin's status and buttons are decided.
+///
+/// Status is the first match of: sending, pending, frozen, ready. The blocked reason is the
+/// first match of: sending, frozen, unconfirmed. An unconfirmed coin may still be picked
+/// for a send; only split and transfer wait for a confirmation.
+pub(crate) fn public_coin_status(f: &PublicCoinFacts) -> (CoinStatus, CoinActions) {
+    let status = if f.reserved {
+        CoinStatus::Sending
+    } else if f.confirmations == 0 {
+        CoinStatus::Pending
+    } else if f.locked {
+        CoinStatus::Frozen
+    } else {
+        CoinStatus::Ready
+    };
+    let blocked = if f.reserved {
+        Some(CoinBlock::Sending)
+    } else if f.locked {
+        Some(CoinBlock::Frozen)
+    } else if f.confirmations == 0 {
+        Some(CoinBlock::Unconfirmed)
+    } else {
+        None
+    };
+    let free = !f.reserved && !f.locked;
+    let spendable = blocked.is_none();
+    let actions = CoinActions {
+        spend_to_self: false,
+        split: spendable,
+        transfer: spendable,
+        select: free,
+        freeze: free,
+        unfreeze: !f.reserved && f.locked,
         blocked,
     };
     (status, actions)

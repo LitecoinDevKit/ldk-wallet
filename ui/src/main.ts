@@ -22,6 +22,7 @@ type CombinedSummary = {
   mweb_confirmed_sats: number;
   mweb_unconfirmed_sats: number;
   mweb_immature_sats: number;
+  mweb_maturity_blocks: number;
   mweb_total_sats: number;
   mweb_receive_address: string | null;
   mweb_synced_height: number | null;
@@ -136,6 +137,7 @@ type PeginPreview = {
   transparent_fee_sats: number;
   total_from_transparent_sats: number;
   creates_change?: boolean;
+  maturity_blocks: number;
 };
 
 type ElectrumProbe = {
@@ -231,6 +233,8 @@ type MwebUtxoRecord = {
   churn_cover_error?: string | null;
   churn_spreading?: boolean | null;
   churn_actions?: ChurnActions | null;
+  status: CoinStatus;
+  actions: CoinActions;
 };
 
 /** Which self-spend buttons the backend allows. The UI never works this out itself. */
@@ -238,6 +242,27 @@ type ChurnActions = {
   retry: boolean;
   cancel: boolean;
   open_settings: boolean;
+};
+
+/** One status per private coin, picked by `coin_status` in the backend. */
+type CoinStatus = "churning" | "pending" | "maturing" | "frozen" | "tied-to-pegin" | "ready";
+
+/** Why a private coin's spend buttons are off. */
+type CoinBlock =
+  | { kind: "churning" }
+  | { kind: "frozen" }
+  | { kind: "unconfirmed" }
+  | { kind: "maturing"; blocks_left: number };
+
+/** Which private coin buttons the backend allows. The UI never works this out itself. */
+type CoinActions = {
+  spend_to_self: boolean;
+  split: boolean;
+  transfer: boolean;
+  select: boolean;
+  freeze: boolean;
+  unfreeze: boolean;
+  blocked: CoinBlock | null;
 };
 
 type ChurnPhase =
@@ -311,6 +336,8 @@ type TxRecord = {
   confirmations: number;
   timestamp: number | null;
   kind: TxKind;
+  /** Set only while a peg-in is maturing. */
+  maturity_blocks_left?: number | null;
 };
 
 const TX_KIND_LABELS: Record<TxKind, string> = {
@@ -485,8 +512,6 @@ const MIN_PASSPHRASE_LEN = 8;
 const QUIZ_WORD_COUNT = 3;
 /** Warn when network fee is at least half the amount being sent. */
 const HIGH_FEE_RATIO = 0.5;
-/** Peg-in coins mature after this many blocks before private spend. */
-const MWEB_PEGIN_MATURITY_BLOCKS = 6;
 /** Soft threshold for the progressive security checklist (1 LTC). */
 const SECURITY_CHECKLIST_SATS = 100_000_000;
 
@@ -3550,7 +3575,7 @@ function renderCombined(c: CombinedSummary) {
   }
   if (c.mweb_immature_sats > 0) {
     detailParts.push(
-      `Maturing ${formatAmount(c.mweb_immature_sats)} (available after ~${MWEB_PEGIN_MATURITY_BLOCKS} confirmations)`,
+      `Maturing ${formatAmount(c.mweb_immature_sats)} (available after ~${c.mweb_maturity_blocks} confirmations)`,
     );
   }
   if (c.mweb_unconfirmed_sats > 0) {
@@ -3675,10 +3700,8 @@ function buildTxRow(tx: TxRecord, index: number): HTMLLIElement {
   main.append(amount, meta);
 
   const pill = document.createElement("span");
-  const peginMaturing =
-    tx.kind === "pegin" && tx.confirmations < MWEB_PEGIN_MATURITY_BLOCKS;
-  if (peginMaturing) {
-    const left = Math.max(0, MWEB_PEGIN_MATURITY_BLOCKS - tx.confirmations);
+  const left = tx.maturity_blocks_left;
+  if (left != null) {
     pill.className = "pill pending";
     pill.textContent =
       tx.confirmations === 0 ? "maturing · pending" : `maturing · ${left} left`;
@@ -3754,10 +3777,7 @@ async function openTxDetail(index: number) {
     const tx = txRecords[at];
     if (!tx) return;
 
-    const peginLeft =
-      tx.kind === "pegin" && tx.confirmations < MWEB_PEGIN_MATURITY_BLOCKS
-        ? Math.max(0, MWEB_PEGIN_MATURITY_BLOCKS - tx.confirmations)
-        : null;
+    const peginLeft = tx.maturity_blocks_left ?? null;
     const statusText =
       peginLeft != null
         ? tx.confirmations === 0
@@ -5960,6 +5980,16 @@ function stampChurnStarting() {
   coin.churn_cover_error = null;
   coin.churn_spreading = false;
   coin.locked = true;
+  coin.status = "churning";
+  coin.actions = {
+    spend_to_self: false,
+    split: false,
+    transfer: false,
+    select: false,
+    freeze: false,
+    unfreeze: false,
+    blocked: { kind: "churning" },
+  };
   coin.churn_target = churnStartingTarget;
   coin.churn_counted = 0;
 }
@@ -6148,7 +6178,7 @@ function churnSummaryToken(coin: MwebUtxoRecord): string {
 /** Smaller line on #churn-status — keep CHURN.md “non-solo blocks” wording. */
 function churnDepthSentence(coin: MwebUtxoRecord): string | null {
   if (coin.non_solo_blocks == null) {
-    if (!coin.mature || churnPhaseActive(coin.churn_phase)) return null;
+    if (coinBusyOrUnspendable(coin)) return null;
     return "non-solo blocks unknown";
   }
   if (coin.non_solo_blocks > 0) {
@@ -6180,21 +6210,54 @@ function churnHopLines(coin: MwebUtxoRecord): string[] {
   return lines;
 }
 
-function pegInStillTied(coin: MwebUtxoRecord): boolean {
-  return (
-    !!coin.mature &&
-    !!coin.from_pegin &&
-    coin.non_solo_blocks === 0 &&
-    !churnPhaseActive(coin.churn_phase)
-  );
+/** A self-spend holds the coin, or it is not in a block or not mature yet. */
+function coinBusyOrUnspendable(coin: MwebUtxoRecord): boolean {
+  return coin.status === "churning" || coin.status === "pending" || coin.status === "maturing";
+}
+
+type CoinButton = "split" | "transfer" | "spend";
+
+const COIN_BLOCKED_COPY: Record<CoinButton, { frozen: string; unconfirmed: string }> = {
+  split: { frozen: "Unfreeze to split.", unconfirmed: "Cannot spend privately until confirmed." },
+  transfer: { frozen: "Unfreeze to transfer.", unconfirmed: "Cannot transfer until confirmed." },
+  spend: { frozen: "Unfreeze to spend.", unconfirmed: "Cannot spend privately until confirmed." },
+};
+
+/** Tooltip for a coin button the backend turned off. */
+function coinBlockedTitle(blocked: CoinBlock | null, button: CoinButton): string {
+  const copy = COIN_BLOCKED_COPY[button];
+  switch (blocked?.kind) {
+    case "churning":
+      return "A self-spend has this coin.";
+    case "frozen":
+      return copy.frozen;
+    case "maturing":
+      return `Matures in ${blocked.blocks_left} block${blocked.blocks_left === 1 ? "" : "s"}.`;
+    default:
+      return copy.unconfirmed;
+  }
 }
 
 /** Session-only: which private coin rows show expanded technical detail. */
 const mwebCoinExpanded = new Set<string>();
 
-function userFrozen(coin: MwebUtxoRecord): boolean {
-  return !!coin.locked && !churnPhaseActive(coin.churn_phase);
+function freezeLabel(coin: MwebUtxoRecord): string {
+  return coin.actions.unfreeze ? "Unfreeze" : "Freeze";
 }
+
+const COIN_ROW_CLASS: Partial<Record<CoinStatus, string>> = {
+  pending: "is-pending",
+  maturing: "is-maturing",
+  frozen: "is-frozen",
+  "tied-to-pegin": "is-tied",
+};
+
+const COIN_CHIPS: Partial<Record<CoinStatus, RowChip>> = {
+  pending: { label: "Pending", className: "pill pending" },
+  maturing: { label: "Maturing", className: "pill pill-maturing" },
+  frozen: { label: "Frozen", className: "pill pill-frozen" },
+  "tied-to-pegin": { label: "Tied to peg-in", className: "pill pill-tied" },
+};
 
 function truncateOutputId(id: string): string {
   if (id.length <= 20) return id;
@@ -6212,29 +6275,25 @@ function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
   const pill = churnPill(coin);
   if (pill) return { label: pill.label, className: churnPillClass(pill.kind) };
   if (justSpent) return { label: "Just spent", className: "pill churn-pill-accent" };
-  // Unconfirmed self-spends are pending, not peg-in maturity.
-  if (!coin.mature && coin.confirmations === 0) {
-    return { label: "Pending", className: "pill pending" };
-  }
-  if (!coin.mature) return { label: "Maturing", className: "pill pill-maturing" };
-  if (userFrozen(coin)) return { label: "Frozen", className: "pill pill-frozen" };
-  if (pegInStillTied(coin)) return { label: "Tied to peg-in", className: "pill pill-tied" };
-  return null;
+  return COIN_CHIPS[coin.status] ?? null;
 }
 
 /** Single default-row status sentence. Active jobs stay lean — truth is on #churn-status. */
 function mwebRowStatusLine(coin: MwebUtxoRecord): string | null {
-  if (churnPhaseActive(coin.churn_phase)) return null;
-  if (!coin.mature) {
-    const left = coin.maturity_blocks_left ?? 0;
-    return coin.confirmations === 0
-      ? "Pending · not yet spendable"
-      : `Maturing · ${left} block${left === 1 ? "" : "s"} left`;
+  switch (coin.status) {
+    case "churning":
+      return null;
+    case "pending":
+      return "Pending · not yet spendable";
+    case "maturing": {
+      const left = coin.maturity_blocks_left ?? 0;
+      return `Maturing · ${left} block${left === 1 ? "" : "s"} left`;
+    }
+    case "tied-to-pegin":
+      return "Still linked to its peg-in";
+    default:
+      return mwebListDepthSentence(coin);
   }
-  if (pegInStillTied(coin)) {
-    return "Still linked to its peg-in";
-  }
-  return mwebListDepthSentence(coin);
 }
 
 /**
@@ -6242,11 +6301,11 @@ function mwebRowStatusLine(coin: MwebUtxoRecord): string | null {
  * Known depth already shows “Shared N blocks” on the row, so return null then.
  */
 function mwebExpandPrivacy(coin: MwebUtxoRecord): string | null {
-  if (pegInStillTied(coin)) {
+  if (coin.status === "tied-to-pegin") {
     return "Tied to its peg-in until it is spent in a block with other private activity.";
   }
   if (coin.non_solo_blocks == null) {
-    if (!coin.mature || churnPhaseActive(coin.churn_phase)) return null;
+    if (coinBusyOrUnspendable(coin)) return null;
     return "No shared-block history available.";
   }
   if (coin.non_solo_blocks === 0) return "No shared blocks yet";
@@ -6290,9 +6349,9 @@ function appendDetailSection(
 function sortMwebCoins(coins: MwebUtxoRecord[]): MwebUtxoRecord[] {
   const rank = (coin: MwebUtxoRecord): number => {
     if (churnNeedsAttention(coin)) return 0;
-    if (churnPhaseActive(coin.churn_phase)) return 1;
-    if (pegInStillTied(coin)) return 2;
-    if (!coin.mature) return 3;
+    if (coin.status === "churning") return 1;
+    if (coin.status === "tied-to-pegin") return 2;
+    if (coin.status === "pending" || coin.status === "maturing") return 3;
     return 4;
   };
   return [...coins].sort((a, b) => {
@@ -6314,7 +6373,7 @@ function dismissedChurnIds(): Set<string> {
 function dismissChurnBanner() {
   const next = dismissedChurnIds();
   for (const coin of mwebUtxoCache) {
-    if (pegInStillTied(coin)) next.add(coin.output_id);
+    if (coin.status === "tied-to-pegin") next.add(coin.output_id);
   }
   try {
     localStorage.setItem(CHURN_BANNER_DISMISSED_KEY, Array.from(next).join(","));
@@ -6326,7 +6385,7 @@ function dismissChurnBanner() {
 
 function updateChurnBanner() {
   const pending = mwebUtxoCache.filter(
-    (coin) => pegInStillTied(coin) && !dismissedChurnIds().has(coin.output_id),
+    (coin) => coin.status === "tied-to-pegin" && !dismissedChurnIds().has(coin.output_id),
   );
   const show = currentPhase === "ready" && pending.length > 0;
   el.churnBanner.hidden = !show;
@@ -6533,23 +6592,19 @@ function renderMwebCoinsList() {
   let attentionCount = 0;
   const sorted = sortMwebCoins(mwebUtxoCache);
   for (const coin of sorted) {
-    if (!coin.mature) immature += 1;
-    if (userFrozen(coin)) frozenCount += 1;
+    if (coin.status === "pending" || coin.status === "maturing") immature += 1;
+    if (coin.actions.unfreeze) frozenCount += 1;
     if (churnNeedsAttention(coin)) attentionCount += 1;
     const spendPending = pendingCoinSpend("private", coin.output_id);
-    const jobHolds = churnPhaseActive(coin.churn_phase) || !!spendPending;
+    const jobHolds = coin.status === "churning" || !!spendPending;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
-    const tied = pegInStillTied(coin);
+    const tied = coin.status === "tied-to-pegin";
     const expanded = mwebCoinExpanded.has(coin.output_id);
-    const left = coin.maturity_blocks_left ?? 0;
     const li = document.createElement("li");
     li.dataset.outputId = coin.output_id;
     const rowClass = ["utxo-row"];
-    if (spendPending) rowClass.push("is-pending");
-    else if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
-    else if (!coin.mature) rowClass.push("is-pending");
-    else if (userFrozen(coin)) rowClass.push("is-frozen");
-    else if (tied) rowClass.push("is-tied");
+    const statusClass = spendPending ? "is-pending" : COIN_ROW_CLASS[coin.status];
+    if (statusClass) rowClass.push(statusClass);
     if (justSpent) rowClass.push("is-just-spent");
     li.className = rowClass.join(" ");
 
@@ -6587,8 +6642,7 @@ function renderMwebCoinsList() {
     if (!jobHolds) {
       const actions = document.createElement("div");
       actions.className = "split-actions split-actions-private";
-      const spendable = !!coin.mature && !coin.locked;
-      if (spendable) {
+      if (coin.actions.spend_to_self) {
         const spend = document.createElement("button");
         spend.type = "button";
         spend.className = tied ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm";
@@ -6635,8 +6689,8 @@ function renderMwebCoinsList() {
       freeze.type = "button";
       freeze.className = "btn btn-ghost btn-sm utxo-freeze";
       freeze.setAttribute("role", "menuitem");
-      freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
-      freeze.disabled = !coin.mature && !coin.locked;
+      freeze.textContent = freezeLabel(coin);
+      freeze.disabled = !coin.actions.freeze && !coin.actions.unfreeze;
       freeze.addEventListener("click", (event) => {
         event.stopPropagation();
         more.open = false;
@@ -6648,15 +6702,10 @@ function renderMwebCoinsList() {
       split.className = "btn btn-ghost btn-sm";
       split.setAttribute("role", "menuitem");
       split.textContent = "Split";
-      const splitBlocked = !!coin.locked || !coin.mature;
-      split.disabled = splitBlocked;
-      split.title = coin.locked
-        ? "Unfreeze to split."
-        : coin.mature
-          ? "Split this private coin into multiple outputs"
-          : left > 0
-            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
-            : "Cannot spend privately until confirmed.";
+      split.disabled = !coin.actions.split;
+      split.title = coin.actions.split
+        ? "Split this private coin into multiple outputs"
+        : coinBlockedTitle(coin.actions.blocked, "split");
       split.addEventListener("click", (event) => {
         event.stopPropagation();
         more.open = false;
@@ -6672,16 +6721,11 @@ function renderMwebCoinsList() {
       transfer.className = "btn btn-ghost btn-sm";
       transfer.setAttribute("role", "menuitem");
       transfer.textContent = "Transfer to…";
-      const canTransfer =
-        otherWallets().length > 0 && !coin.locked && !!coin.mature;
+      const canTransfer = otherWallets().length > 0 && coin.actions.transfer;
       transfer.disabled = !canTransfer;
-      transfer.title = coin.locked
-        ? "Unfreeze to transfer."
-        : !coin.mature
-          ? left > 0
-            ? `Matures in ${left} block${left === 1 ? "" : "s"}.`
-            : "Cannot transfer until confirmed."
-          : otherWallets().length === 0
+      transfer.title = !coin.actions.transfer
+        ? coinBlockedTitle(coin.actions.blocked, "transfer")
+        : otherWallets().length === 0
             ? "Add another wallet to transfer coins between them."
             : "Send this coin to another wallet on this device";
       transfer.addEventListener("click", (event) => {
@@ -7081,35 +7125,24 @@ function renderMwebControlList(panel: CoinControlPanel) {
   panel.empty.hidden = mwebUtxoCache.length > 0;
   const sorted = sortMwebCoins(mwebUtxoCache);
   for (const coin of sorted) {
-    const jobHolds = churnPhaseActive(coin.churn_phase);
+    const jobHolds = coin.status === "churning";
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
-    const tied = pegInStillTied(coin);
-    const blocked = !!coin.locked || !coin.mature;
     const expanded = mwebCoinExpanded.has(coin.output_id);
-    const left = coin.maturity_blocks_left ?? 0;
     const li = document.createElement("li");
     li.dataset.outputId = coin.output_id;
     const rowClass = ["utxo-row"];
-    if (!coin.mature && coin.confirmations > 0) rowClass.push("is-maturing");
-    else if (!coin.mature) rowClass.push("is-pending");
-    else if (userFrozen(coin)) rowClass.push("is-frozen");
-    else if (tied) rowClass.push("is-tied");
+    const statusClass = COIN_ROW_CLASS[coin.status];
+    if (statusClass) rowClass.push(statusClass);
     if (justSpent) rowClass.push("is-just-spent");
     li.className = rowClass.join(" ");
 
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.disabled = blocked;
+    check.disabled = !coin.actions.select;
     check.checked = panel.selected.has(coin.output_id);
-    check.title = jobHolds
-      ? "A self-spend has this coin."
-      : coin.locked
-        ? "Unfreeze to spend."
-        : !coin.mature
-          ? coin.confirmations === 0
-            ? "Cannot spend privately until confirmed."
-            : `Matures in ${left} block${left === 1 ? "" : "s"}.`
-          : "Include this coin";
+    check.title = coin.actions.select
+      ? "Include this coin"
+      : coinBlockedTitle(coin.actions.blocked, "spend");
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(coin.output_id);
       else panel.selected.delete(coin.output_id);
@@ -7189,8 +7222,8 @@ function renderMwebControlList(panel: CoinControlPanel) {
       freeze.type = "button";
       freeze.className = "btn btn-ghost btn-sm utxo-freeze";
       freeze.setAttribute("role", "menuitem");
-      freeze.textContent = coin.locked ? "Unfreeze" : "Freeze";
-      freeze.disabled = !coin.mature && !coin.locked;
+      freeze.textContent = freezeLabel(coin);
+      freeze.disabled = !coin.actions.freeze && !coin.actions.unfreeze;
       freeze.addEventListener("click", (event) => {
         event.stopPropagation();
         more.open = false;
@@ -7949,7 +7982,7 @@ function privateSpendableSats(selected: Set<string> = mwebSendSelectedIds): numb
   }
   let sum = 0;
   for (const coin of mwebUtxoCache) {
-    if (coin.mature && !coin.locked) sum += coin.amount_sats;
+    if (coin.actions.select) sum += coin.amount_sats;
   }
   return sum;
 }
@@ -8903,7 +8936,7 @@ el.btnPegin.addEventListener("click", async () => {
 
   const pegInFees = preview.mweb_fee_sats + preview.transparent_fee_sats;
   const warnings: string[] = [
-    `Cannot spend privately until ~${MWEB_PEGIN_MATURITY_BLOCKS} confirmations.`,
+    `Cannot spend privately until ~${preview.maturity_blocks} confirmations.`,
   ];
   if (isHighFee(pegInFees, preview.amount_sats)) {
     warnings.push(

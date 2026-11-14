@@ -375,6 +375,8 @@ pub struct WalletApp {
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
+    /// Random per process. Coin holds written under another session are stale.
+    session: String,
     /// Electrum URL that connected most recently. Survives lock so the next
     /// sync does not retry a dead configured server first. Not a secret.
     last_good_electrum: Mutex<Option<String>>,
@@ -398,6 +400,7 @@ impl WalletApp {
             mweb_sync_active: AtomicBool::new(false),
             sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
             pending_lock: AtomicBool::new(false),
+            session: hex::encode(rand::random::<[u8; 16]>()),
             last_good_electrum: Mutex::new(None),
             insights_endpoint: Mutex::new(None),
         }
@@ -755,7 +758,15 @@ impl WalletApp {
             let mut guard = self.lock_state()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let mut park = self.lock_park()?;
-            prepare_transfer_broadcast(root, state, &secret, sealing, &req, &mut park)?
+            prepare_transfer_broadcast(
+                root,
+                state,
+                &secret,
+                sealing,
+                &req,
+                &mut park,
+                &self.session,
+            )?
         };
         match prepared {
             PreparedTransferBroadcast::Public {
@@ -799,21 +810,13 @@ impl WalletApp {
                 network,
                 address,
                 to_account_index,
-                input_ids,
+                hold,
             } => {
-                if let Err(e) =
-                    mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)
-                {
-                    self.unfreeze_mweb_ids(&source_dir, &input_ids);
-                    return Err(e);
-                }
-                self.commit_private_transfer(
-                    &source_dir,
-                    &signed,
-                    &input_ids,
-                    address,
-                    to_account_index,
-                )
+                mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+                let result =
+                    self.commit_private_transfer(&source_dir, &signed, address, to_account_index);
+                drop(hold);
+                result
             }
         }
     }
@@ -1010,6 +1013,7 @@ impl WalletApp {
             .get_mnemonic()?
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
+        mweb_frozen::clear_stale(account_dir, &self.session)?;
         open_wallet_state(account_dir, &meta, &secret, self.secrets.sealing_key())
     }
 
@@ -1249,6 +1253,7 @@ impl WalletApp {
             .as_ref()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
+        refuse_reserved(&state.data_dir, &req.output_id)?;
         mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
     }
 
@@ -1905,7 +1910,7 @@ impl WalletApp {
         self.ensure_unlocked()?;
         // Sign under the lock, then broadcast without it so a transfer or split
         // of a different coin can start while peers are still being tried.
-        let (data_dir, signed, rpc_url, peers, network, input_ids) = {
+        let (data_dir, signed, rpc_url, peers, network, hold) = {
             let mut guard = self.lock_state()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let req = resolve_mweb_send_request(state, req)?;
@@ -1918,21 +1923,15 @@ impl WalletApp {
                 .as_mut()
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let signed = mweb::sign_mweb_send(&state.wallet, mweb, &data_dir, &req, network)?;
-            let input_ids = signed.input_ids();
-            for id in &input_ids {
-                mweb_frozen::set_locked(&data_dir, id, true)?;
-            }
-            (data_dir, signed, rpc_url, peers, network, input_ids)
+            let hold = CoinHold::take(&data_dir, signed.input_ids(), &self.session)?;
+            (data_dir, signed, rpc_url, peers, network, hold)
         };
-        if let Err(e) = mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network) {
-            self.unfreeze_mweb_ids(&data_dir, &input_ids);
-            return Err(e);
-        }
+        mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
         let result = self.with_account_mweb(&data_dir, |runtime| {
             Ok(mweb::apply_signed_mweb_send(runtime, &signed))
-        })?;
-        self.unfreeze_mweb_ids(&data_dir, &input_ids);
-        Ok(result)
+        });
+        drop(hold);
+        result
     }
 
     pub fn preview_pegout(&self, req: PegoutRequest) -> Result<PegoutPreview, WalletError> {
@@ -1947,16 +1946,13 @@ impl WalletApp {
         self.ensure_unlocked()?;
         // Sign under the lock, then broadcast without it: the peer loop can take
         // minutes, and sync, coin lists and other spends must not wait on it.
-        let (data_dir, signed, rpc_url, peers, network, input_ids) = self.sign_pegout(req)?;
-        if let Err(e) = mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network) {
-            self.unfreeze_mweb_ids(&data_dir, &input_ids);
-            return Err(e);
-        }
+        let (data_dir, signed, rpc_url, peers, network, hold) = self.sign_pegout(req)?;
+        mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
         let result = self.with_account_mweb(&data_dir, |runtime| {
             Ok(mweb::apply_signed_pegout(runtime, &signed))
-        })?;
-        self.unfreeze_mweb_ids(&data_dir, &input_ids);
-        Ok(result)
+        });
+        drop(hold);
+        result
     }
 
     #[allow(clippy::type_complexity)]
@@ -1970,7 +1966,7 @@ impl WalletApp {
             Option<String>,
             Vec<String>,
             WalletNetwork,
-            Vec<String>,
+            CoinHold,
         ),
         WalletError,
     > {
@@ -2012,11 +2008,8 @@ impl WalletApp {
             .as_mut()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
         let signed = mweb::sign_pegout(&state.wallet, mweb, &data_dir, req, network)?;
-        let input_ids = signed.input_ids();
-        for id in &input_ids {
-            mweb_frozen::set_locked(&data_dir, id, true)?;
-        }
-        Ok((data_dir, signed, rpc_url, peers, network, input_ids))
+        let hold = CoinHold::take(&data_dir, signed.input_ids(), &self.session)?;
+        Ok((data_dir, signed, rpc_url, peers, network, hold))
     }
 
     pub fn list_mweb_unspent(&self) -> Result<Vec<MwebUtxoRecord>, WalletError> {
@@ -2063,7 +2056,7 @@ impl WalletApp {
         let prepared = {
             let mut guard = self.lock_state()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-            prepare_split(state, &req)?
+            prepare_split(state, &req, &self.session)?
         };
         match prepared {
             PreparedSplit::Public {
@@ -2097,14 +2090,12 @@ impl WalletApp {
                 rpc_url,
                 peers,
                 network,
+                hold,
             } => {
-                if let Err(e) =
-                    mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)
-                {
-                    let _ = mweb_frozen::set_locked(&source_dir, &signed.input_id, false);
-                    return Err(e);
-                }
-                self.commit_private_split(&source_dir, &signed)
+                mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network)?;
+                let result = self.commit_private_split(&source_dir, &signed);
+                drop(hold);
+                result
             }
         }
     }
@@ -2154,14 +2145,7 @@ impl WalletApp {
             mweb::apply_signed_mweb_split(runtime, signed);
             Ok(())
         })?;
-        let _ = mweb_frozen::set_locked(source_dir, &signed.input_id, false);
         Ok(result)
-    }
-
-    fn unfreeze_mweb_ids(&self, source_dir: &Path, input_ids: &[String]) {
-        for id in input_ids {
-            let _ = mweb_frozen::set_locked(source_dir, id, false);
-        }
     }
 
     fn commit_public_transfer(
@@ -2194,7 +2178,6 @@ impl WalletApp {
         &self,
         source_dir: &Path,
         signed: &mweb::SignedMwebSend,
-        input_ids: &[String],
         address: String,
         to_account_index: u32,
     ) -> Result<TransferCoinResult, WalletError> {
@@ -2202,7 +2185,6 @@ impl WalletApp {
         self.with_account_mweb(source_dir, |runtime| {
             Ok(mweb::apply_signed_mweb_send(runtime, signed))
         })?;
-        self.unfreeze_mweb_ids(source_dir, input_ids);
         Ok(TransferCoinResult {
             txid: result.wtxid,
             fee_sats: result.fee_sats,
@@ -3121,6 +3103,7 @@ impl MemoryBackedApp {
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
         refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
+        refuse_reserved(&state.data_dir, &req.output_id)?;
         mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
     }
 
@@ -3416,7 +3399,7 @@ fn resolve_mweb_send_request(
         .as_ref()
         .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     let tip = state.wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(&state.data_dir)?;
     let selected = mweb::normalize_selected_ids(req.selected_output_ids.as_deref());
     let spendable = if let Some(ref ids) = selected {
         let coins = mweb::resolve_spend_coins(
@@ -3504,7 +3487,7 @@ fn resolve_pegout_request(
         .as_ref()
         .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     let tip = state.wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(&state.data_dir)?;
     let selected = mweb::normalize_selected_ids(req.selected_output_ids.as_deref());
     let per_coin = req.drain;
     let dust_sats = if !per_coin && !req.address.trim().is_empty() {
@@ -3854,7 +3837,7 @@ enum PreparedTransferBroadcast {
         network: WalletNetwork,
         address: String,
         to_account_index: u32,
-        input_ids: Vec<String>,
+        hold: CoinHold,
     },
 }
 
@@ -3866,6 +3849,7 @@ fn prepare_transfer_broadcast(
     sealing_key: Option<[u8; 32]>,
     req: &TransferCoinRequest,
     park: &mut AccountPark,
+    session: &str,
 ) -> Result<PreparedTransferBroadcast, WalletError> {
     let prepared = prepare_transfer(root, state, secret, sealing_key, req, true, park)?;
     let source_dir = state.data_dir.clone();
@@ -3911,10 +3895,7 @@ fn prepare_transfer_broadcast(
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let signed =
                 mweb::sign_mweb_send(&state.wallet, mweb, &source_dir, &resolved, network)?;
-            let input_ids = signed.input_ids();
-            for id in &input_ids {
-                mweb_frozen::set_locked(&source_dir, id, true)?;
-            }
+            let hold = CoinHold::take(&source_dir, signed.input_ids(), session)?;
             Ok(PreparedTransferBroadcast::Private {
                 source_dir,
                 signed,
@@ -3923,7 +3904,7 @@ fn prepare_transfer_broadcast(
                 network,
                 address: prepared.address,
                 to_account_index: prepared.to_account_index,
-                input_ids,
+                hold,
             })
         }
     }
@@ -4082,6 +4063,7 @@ enum PreparedSplit {
         rpc_url: Option<String>,
         peers: Vec<String>,
         network: WalletNetwork,
+        hold: CoinHold,
     },
 }
 
@@ -4089,6 +4071,7 @@ enum PreparedSplit {
 fn prepare_split(
     state: &mut WalletState,
     req: &SplitRequest,
+    session: &str,
 ) -> Result<PreparedSplit, WalletError> {
     let preview = plan_split_request(state, req)?;
     let source_dir = state.data_dir.clone();
@@ -4141,13 +4124,14 @@ fn prepare_split(
                 preview.fee_sats,
                 network,
             )?;
-            mweb_frozen::set_locked(&source_dir, &signed.input_id, true)?;
+            let hold = CoinHold::take(&source_dir, vec![signed.input_id.clone()], session)?;
             Ok(PreparedSplit::Private {
                 source_dir,
                 signed,
                 rpc_url,
                 peers,
                 network,
+                hold,
             })
         }
     }
@@ -4183,7 +4167,7 @@ fn plan_split_request(
                 .as_ref()
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let tip = state.wallet.latest_checkpoint().height();
-            let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
+            let frozen = mweb_frozen::unavailable_ids(&state.data_dir)?;
             let coin = mweb::select_split_coin(mweb.store.db(), &req.input, tip, &frozen)?;
             split::plan_split(&PlanParams {
                 input_sats: coin.amount,
@@ -4320,7 +4304,7 @@ fn mweb_inputs_exceed_needed(
         .as_ref()
         .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     let tip = state.wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(&state.data_dir)?;
     let needed = amount_sats.saturating_add(fee_sats);
     let coins = mweb::resolve_spend_coins(mweb.store.db(), tip, &frozen, selected, needed, action)?;
     let sum: u64 = coins.iter().map(|c| c.amount).sum();
@@ -4541,6 +4525,39 @@ fn refuse_churn_unfreeze(
     }
     if churn::held_by_active_job(data_dir, output_id)? {
         return Err(WalletError::Mweb("A self-spend has this coin.".into()));
+    }
+    Ok(())
+}
+
+/// A spend's hold on its private inputs, from signing until the broadcast is
+/// settled. Released on drop so every exit lets the coins go.
+struct CoinHold {
+    data_dir: PathBuf,
+    ids: Vec<String>,
+}
+
+impl CoinHold {
+    fn take(data_dir: &Path, ids: Vec<String>, session: &str) -> Result<Self, WalletError> {
+        mweb_frozen::reserve(data_dir, &ids, session)?;
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            ids,
+        })
+    }
+}
+
+impl Drop for CoinHold {
+    fn drop(&mut self) {
+        if let Err(e) = mweb_frozen::release(&self.data_dir, &self.ids) {
+            diag::log(format!("coin hold: release failed: {e}"));
+        }
+    }
+}
+
+fn refuse_reserved(data_dir: &Path, output_id: &str) -> Result<(), WalletError> {
+    let id = mweb_frozen::normalize_output_id(output_id)?;
+    if mweb_frozen::read_ids(data_dir)?.reserved.contains_key(&id) {
+        return Err(WalletError::Mweb(mweb_frozen::RESERVED_MESSAGE.into()));
     }
     Ok(())
 }
@@ -4919,7 +4936,7 @@ fn churn_start_facts(
     let tip = state.wallet.latest_checkpoint().height();
     let info = mweb::churn_coin_info(mweb, tip, output_id)?;
     let id = mweb_frozen::normalize_output_id(output_id)?;
-    let frozen = mweb_frozen::read_ids(&state.data_dir)?.ids.contains(&id);
+    let frozen = mweb_frozen::unavailable_ids(&state.data_dir)?.contains(&id);
     let job_active = churn::read_job(&state.data_dir)?.is_some_and(|job| job.phase().is_active());
     let recorded = churn::depth_of(&state.data_dir, &id)?.is_some_and(|record| record.from_pegin);
     Ok((info, frozen, job_active, recorded))
@@ -4964,10 +4981,12 @@ fn select_churn_coin(
         .as_ref()
         .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
     let tip = state.wallet.latest_checkpoint().height();
-    let mut frozen = mweb_frozen::read_ids(&state.data_dir)?.ids;
+    let file = mweb_frozen::read_ids(&state.data_dir)?;
+    let mut frozen = file.ids;
     if let Ok(id) = mweb_frozen::normalize_output_id(output_id) {
         frozen.remove(&id);
     }
+    frozen.extend(file.reserved.into_keys());
     mweb::select_mweb_coin(mweb.store.db(), output_id, tip, &frozen, "spending to self")
 }
 
@@ -5586,6 +5605,7 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::{CoinBlock, CoinStatus};
     use crate::mweb_history::MwebHistoryEntry;
 
     #[test]
@@ -5895,6 +5915,66 @@ mod tests {
             resolve_pegout_request(state, pegout_req("", 0, true, &ids[..2])).unwrap();
         assert!(resolved.per_coin);
         assert_eq!(resolved.output_amounts.len(), 2);
+    }
+
+    /// A coin held by a spend that is still broadcasting cannot be unfrozen and picked again.
+    #[test]
+    fn coin_in_flight_is_not_unfreezable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000, 2_000_000]);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        let hold = CoinHold::take(&data_dir, vec![ids[0].clone()], &app.session).unwrap();
+
+        let row_for = |id: &str| {
+            app.list_mweb_unspent()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.output_id == id)
+                .unwrap()
+        };
+        let row = row_for(&ids[0]);
+        assert_eq!(row.status, CoinStatus::Sending);
+        assert!(!row.actions.unfreeze && !row.actions.freeze && !row.actions.select);
+        assert_eq!(row.actions.blocked, Some(CoinBlock::Sending));
+
+        for locked in [false, true] {
+            let err = app
+                .set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+                    output_id: ids[0].clone(),
+                    locked,
+                })
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(mweb_frozen::RESERVED_MESSAGE),
+                "{err}"
+            );
+        }
+        let err = CoinHold::take(&data_dir, vec![ids[0].clone()], &app.session)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains(mweb_frozen::RESERVED_MESSAGE),
+            "{err}"
+        );
+
+        drop(hold);
+        assert_eq!(row_for(&ids[0]).status, CoinStatus::Ready);
+    }
+
+    /// A hold written by an earlier process is gone after the next load.
+    #[test]
+    fn hold_from_a_crashed_session_clears_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000]);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        mweb_frozen::reserve(&data_dir, &ids, "crashed-session").unwrap();
+        mweb_frozen::set_locked(&data_dir, &"ee".repeat(32), true).unwrap();
+
+        app.load(dir.path()).unwrap();
+
+        let file = mweb_frozen::read_ids(&data_dir).unwrap();
+        assert!(file.reserved.is_empty());
+        assert!(file.ids.contains(&"ee".repeat(32)), "user freezes stay");
     }
 
     /// A stale expired record left behind a finished job must not bring it back.

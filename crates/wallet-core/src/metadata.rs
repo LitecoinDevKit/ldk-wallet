@@ -209,7 +209,7 @@ pub fn import_json(data_dir: &Path, json: &str) -> Result<MetadataImportResult, 
             data_dir,
             &MwebFrozenFile {
                 version: 1,
-                ids: frozen_file.ids,
+                ..frozen_file
             },
         )?;
     }

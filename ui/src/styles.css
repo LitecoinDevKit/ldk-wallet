@@ -2357,6 +2357,13 @@ body.live-log-open .toast-region {
   outline: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
 }
 
+/* Opacity makes a dimmed row its own stacking context, which traps the menu's
+   z-index under the rows after it and fades the menu with the row. */
+.utxo-row:has(.utxo-more[open]) {
+  z-index: 41;
+  opacity: 1;
+}
+
 .utxo-row.is-just-spent {
   opacity: 1;
   background: color-mix(in srgb, var(--accent) 8%, var(--surface-2));

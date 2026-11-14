@@ -1445,6 +1445,7 @@ mod tests {
             mature: true,
             maturity_blocks_left: 0,
             locked: false,
+            reserved: false,
             from_pegin: false,
             non_solo_blocks: None,
             churn_phase: None,
@@ -1461,6 +1462,13 @@ mod tests {
                     ..ready_facts()
                 },
                 CoinStatus::Churning,
+            ),
+            (
+                CoinFacts {
+                    reserved: true,
+                    ..ready_facts()
+                },
+                CoinStatus::Sending,
             ),
             (
                 CoinFacts {
@@ -1531,6 +1539,19 @@ mod tests {
         assert_eq!(actions.blocked, Some(CoinBlock::Churning));
         assert!(!actions.unfreeze, "the job owns the freeze while it runs");
 
+        let sending_frozen = CoinFacts {
+            reserved: true,
+            locked: true,
+            ..ready_facts()
+        };
+        let (status, actions) = coin_status(&sending_frozen);
+        assert_eq!(status, CoinStatus::Sending);
+        assert_eq!(actions.blocked, Some(CoinBlock::Sending));
+        assert!(
+            !actions.unfreeze,
+            "the send owns the coin until it finishes"
+        );
+
         let maturing_frozen = CoinFacts {
             confirmations: 2,
             mature: false,
@@ -1579,7 +1600,12 @@ mod tests {
             non_solo_blocks: Some(0),
             ..ready_facts()
         };
+        let sending = CoinFacts {
+            reserved: true,
+            ..ready_facts()
+        };
         let cases = [
+            (sending, Some(CoinBlock::Sending), false),
             (pending, Some(CoinBlock::Unconfirmed), false),
             (
                 maturing,
@@ -2611,7 +2637,7 @@ pub fn sign_mweb_send(
         .require_network(net)
         .map_err(|e| WalletError::InvalidAddress(e.to_string()))?;
     let tip = wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(data_dir)?;
     let selected = normalize_selected_ids(req.selected_output_ids.as_deref());
     let needed = req.amount_sats.saturating_add(req.fee_sats);
     let coins = resolve_spend_coins(
@@ -2684,9 +2710,11 @@ pub fn list_mweb_unspent(
     tip_height: u32,
     data_dir: &Path,
 ) -> Vec<MwebUtxoRecord> {
-    let frozen = mweb_frozen::read_ids(data_dir)
-        .map(|f| f.ids)
-        .unwrap_or_default();
+    let mweb_frozen::MwebFrozenFile {
+        ids: frozen,
+        reserved,
+        ..
+    } = mweb_frozen::read_ids(data_dir).unwrap_or_default();
     let labels = utxo_labels::read_labels(data_dir)
         .map(|f| f.labels)
         .unwrap_or_default();
@@ -2725,6 +2753,7 @@ pub fn list_mweb_unspent(
                 mature,
                 maturity_blocks_left,
                 locked,
+                reserved: reserved.contains_key(&output_id),
                 from_pegin: fields.from_pegin,
                 non_solo_blocks: fields.non_solo_blocks,
                 churn_phase: fields.churn_phase,
@@ -2776,6 +2805,8 @@ pub(crate) struct CoinFacts {
     pub mature: bool,
     pub maturity_blocks_left: u32,
     pub locked: bool,
+    /// A spend in flight holds the coin (`mweb_frozen` `reserved`).
+    pub reserved: bool,
     pub from_pegin: bool,
     pub non_solo_blocks: Option<u32>,
     pub churn_phase: Option<ChurnPhase>,
@@ -2783,12 +2814,15 @@ pub(crate) struct CoinFacts {
 
 /// The only place a private coin's status and buttons are decided.
 ///
-/// Status is the first match of: churning, pending, maturing, frozen, tied to peg-in, ready.
-/// The blocked reason is the first match of: churning, frozen, unconfirmed, maturing.
+/// Status is the first match of: churning, sending, pending, maturing, frozen, tied to peg-in,
+/// ready. The blocked reason is the first match of: churning, sending, frozen, unconfirmed,
+/// maturing.
 pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
     let churning = f.churn_phase.is_some_and(ChurnPhase::is_active);
     let status = if churning {
         CoinStatus::Churning
+    } else if f.reserved {
+        CoinStatus::Sending
     } else if !f.mature && f.confirmations == 0 {
         CoinStatus::Pending
     } else if !f.mature {
@@ -2802,6 +2836,8 @@ pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
     };
     let blocked = if churning {
         Some(CoinBlock::Churning)
+    } else if f.reserved {
+        Some(CoinBlock::Sending)
     } else if f.locked {
         Some(CoinBlock::Frozen)
     } else if !f.mature && f.confirmations == 0 {
@@ -2820,7 +2856,7 @@ pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
         transfer: spendable,
         select: spendable,
         freeze: spendable,
-        unfreeze: !churning && f.locked,
+        unfreeze: !churning && !f.reserved && f.locked,
         blocked,
     };
     (status, actions)
@@ -3315,7 +3351,7 @@ pub fn select_mweb_coin(
     let id_hex = hex::encode(coin.output_id);
     if frozen.contains(&id_hex) {
         return Err(WalletError::BuildTx(format!(
-            "selected private coin is frozen — unfreeze it before {action}"
+            "selected private coin is frozen or a send is still using it — unfreeze it or wait before {action}"
         )));
     }
     if !coin.is_spendable(tip_height, MWEB_PEGIN_MATURITY) {
@@ -3407,7 +3443,7 @@ pub fn sign_mweb_split(
     network: WalletNetwork,
 ) -> Result<SignedMwebSplit, WalletError> {
     let tip = wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(data_dir)?;
     let coin = select_split_coin(runtime.store.db(), output_id_hex, tip, &frozen)?;
     if recipient_amounts.is_empty() {
         return Err(WalletError::BuildTx(
@@ -3924,7 +3960,7 @@ pub fn sign_pegout(
     };
 
     let tip = wallet.latest_checkpoint().height();
-    let frozen = mweb_frozen::read_ids(data_dir)?.ids;
+    let frozen = mweb_frozen::unavailable_ids(data_dir)?;
     let selected = normalize_selected_ids(req.selected_output_ids.as_deref());
     let needed = req.amount_sats.saturating_add(req.fee_sats);
     let coins = resolve_spend_coins(

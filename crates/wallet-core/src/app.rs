@@ -1942,6 +1942,35 @@ impl WalletApp {
 
     pub fn pegout(&self, req: PegoutRequest) -> Result<MwebBroadcastResult, WalletError> {
         self.ensure_unlocked()?;
+        // Sign under the lock, then broadcast without it: the peer loop can take
+        // minutes, and sync, coin lists and other spends must not wait on it.
+        let (data_dir, signed, rpc_url, peers, network, input_ids) = self.sign_pegout(req)?;
+        if let Err(e) = mweb::broadcast_mweb_tx(&signed.tx, rpc_url.as_deref(), &peers, network) {
+            self.unfreeze_mweb_ids(&data_dir, &input_ids);
+            return Err(e);
+        }
+        let result = self.with_account_mweb(&data_dir, |runtime| {
+            Ok(mweb::apply_signed_pegout(runtime, &signed))
+        })?;
+        self.unfreeze_mweb_ids(&data_dir, &input_ids);
+        Ok(result)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn sign_pegout(
+        &self,
+        req: PegoutRequest,
+    ) -> Result<
+        (
+            PathBuf,
+            mweb::SignedPegout,
+            Option<String>,
+            Vec<String>,
+            WalletNetwork,
+            Vec<String>,
+        ),
+        WalletError,
+    > {
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let (mut req, _) = resolve_pegout_request(state, req)?;
@@ -1979,17 +2008,12 @@ impl WalletApp {
             .mweb
             .as_mut()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-        let result = mweb::pegout(
-            &state.wallet,
-            mweb,
-            &data_dir,
-            rpc_url.as_deref(),
-            &peers,
-            req,
-            network,
-        )?;
-        mweb.persist(&data_dir)?;
-        Ok(result)
+        let signed = mweb::sign_pegout(&state.wallet, mweb, &data_dir, req, network)?;
+        let input_ids = signed.input_ids();
+        for id in &input_ids {
+            mweb_frozen::set_locked(&data_dir, id, true)?;
+        }
+        Ok((data_dir, signed, rpc_url, peers, network, input_ids))
     }
 
     pub fn list_mweb_unspent(&self) -> Result<Vec<MwebUtxoRecord>, WalletError> {

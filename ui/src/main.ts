@@ -826,6 +826,8 @@ const cards = Object.fromEntries(
 
 let syncing = false;
 let sending = false;
+/** A peg-out is on its way to peers. The Swap button says so until it returns. */
+let pegoutBroadcasting = false;
 let currentPhase: Phase = "boot";
 let currentView: View = "balance";
 const LIVE_LOG_OPEN_KEY = "ltc-live-log-open";
@@ -2881,6 +2883,7 @@ function updateBusyUi() {
   el.btnPegin.disabled = busy;
   el.btnMwebSend.disabled = busy;
   el.btnPegout.disabled = busy;
+  el.btnPegout.textContent = pegoutBroadcasting ? "Swapping…" : "Move to public";
   el.btnResyncMweb.disabled = busy;
   el.btnRevealMnemonic.disabled = busy;
 
@@ -9225,8 +9228,26 @@ el.btnPegout.addEventListener("click", async () => {
   const pendingLabel = readLabel();
   el.pegoutNote.value = pendingLabel;
 
+  // Drain with no picks spends every spendable private coin; a typed amount picks in the backend.
+  const pendingIds = selected_output_ids?.length
+    ? [...selected_output_ids]
+    : drain
+      ? mwebUtxoCache.filter((coin) => coin.mature && !coin.locked).map((coin) => coin.output_id)
+      : [];
+  beginCoinSpendPending({
+    chain: "private",
+    ids: pendingIds,
+    pill: "Swapping",
+    status: "Broadcasting swap to public…",
+  });
+  pegoutBroadcasting = true;
   updateBusyUi();
-  showLoading("Broadcasting swap…");
+  setStatus(
+    pendingIds.length > 0
+      ? `Swapping ${pendingIds.length} private coin${pendingIds.length === 1 ? "" : "s"} to public…`
+      : "Broadcasting swap to public…",
+    "info",
+  );
   let result: { wtxid: string; fee_sats: number; addresses?: string[] };
   try {
     result = await invoke("pegout_ltc", {
@@ -9242,7 +9263,8 @@ el.btnPegout.addEventListener("click", async () => {
     await showBroadcastFailure(e);
     return;
   } finally {
-    hideLoading();
+    endCoinSpendPending(pendingIds);
+    pegoutBroadcasting = false;
     sending = false;
     updateBusyUi();
   }

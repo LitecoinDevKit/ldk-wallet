@@ -12,7 +12,9 @@ Each flow with real phases has one table that is the only legal path, and a diag
 | Lock / unlock | `lock::LOCK_TRANSITIONS` | `docs/LOCK_LIFECYCLE.md` | `UPDATE_DIAGRAMS=1 cargo test -p wallet-core lock_table_matches_docs` |
 | UI lifecycle phase | `PHASE_FROM` in `ui/src/phases.ts` | `docs/UI_PHASES.md` | `npm run check:diagrams -- --write` |
 
-Peg-in, peg-out and send are the next flows to move behind a table. Any change to one of these flows follows the same rules:
+Peg-in, peg-out and send are single locked calls with no stored phase, so they have no table. A private coin's status and buttons come from `mweb::coin_status` in `crates/wallet-core/src/mweb.rs`, which documents its priority order (churning, pending, maturing, frozen, tied to peg-in, ready). The UI renders `status`, `actions` and `actions.blocked` on each coin and `maturity_blocks_left` on peg-in history rows; it never works these out from `mature`, `locked`, `confirmations` or `churn_phase`. To change when a coin button is allowed, change `coin_status` and its tests.
+
+Any change to a flow with a table follows the same rules:
 
 - One `transition` entry point per flow and a private phase field. To allow a new change, add a row to the table first; never work around it with a setter outside tests.
 - Terminal states (Done, Cancelled, Failed, Locked) cannot be re-entered or left except by the rows the table lists. Add a test that pins this.

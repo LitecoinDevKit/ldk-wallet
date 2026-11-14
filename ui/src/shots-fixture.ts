@@ -88,6 +88,7 @@ function combined() {
     mweb_confirmed_sats: confirmed,
     mweb_unconfirmed_sats: 0,
     mweb_immature_sats: immature,
+    mweb_maturity_blocks: 6,
     mweb_total_sats: confirmed + immature,
     mweb_receive_address: PRIVATE_ADDRESS,
     mweb_synced_height: TIP,
@@ -123,14 +124,56 @@ type Coin = {
   churn_counted?: number | null;
   churn_actions?: { retry: boolean; cancel: boolean; open_settings: boolean } | null;
   churn_error?: string | null;
+  status: string;
+  actions: CoinActions;
 };
 
-function quietCoin(partial: Coin): Coin {
+type CoinActions = {
+  spend_to_self: boolean;
+  split: boolean;
+  transfer: boolean;
+  select: boolean;
+  freeze: boolean;
+  unfreeze: boolean;
+  blocked: { kind: string; blocks_left?: number } | null;
+};
+
+const READY: CoinActions = {
+  spend_to_self: true,
+  split: true,
+  transfer: true,
+  select: true,
+  freeze: true,
+  unfreeze: false,
+  blocked: null,
+};
+
+function blockedActions(blocked: CoinActions["blocked"], unfreeze = false): CoinActions {
+  return {
+    spend_to_self: false,
+    split: false,
+    transfer: false,
+    select: false,
+    freeze: false,
+    unfreeze,
+    blocked,
+  };
+}
+
+function quietCoin(partial: Omit<Coin, "status" | "actions"> & Partial<Coin>): Coin {
   return {
     from_pegin: false,
     non_solo_blocks: 0,
+    status: "ready",
+    actions: READY,
     ...partial,
   };
+}
+
+function holdForChurn(coin: Coin) {
+  coin.locked = true;
+  coin.status = "churning";
+  coin.actions = blockedActions({ kind: "churning" });
 }
 
 function privateCoins(): Coin[] {
@@ -140,6 +183,8 @@ function privateCoins(): Coin[] {
     confirmations: 40,
     mature: true,
     locked: true,
+    status: "frozen",
+    actions: blockedActions({ kind: "frozen" }, true),
   });
   const labeled = quietCoin({
     output_id: id("b2"),
@@ -156,6 +201,8 @@ function privateCoins(): Coin[] {
     maturity_blocks_left: 4,
     from_pegin: false,
     non_solo_blocks: 0,
+    status: "maturing",
+    actions: blockedActions({ kind: "maturing", blocks_left: 4 }),
   };
   const tied: Coin = {
     output_id: id("t7"),
@@ -165,6 +212,8 @@ function privateCoins(): Coin[] {
     from_pegin: true,
     non_solo_blocks: 0,
     label: "From peg-in",
+    status: "tied-to-pegin",
+    actions: READY,
   };
   const current = scene();
   const cover = new URLSearchParams(window.location.search).get("cover");
@@ -173,14 +222,14 @@ function privateCoins(): Coin[] {
     tied.churn_actions = { retry: true, cancel: true, open_settings: false };
     tied.churn_target = 1;
     tied.churn_counted = 0;
-    tied.locked = true;
+    holdForChurn(tied);
   } else if (cover === "spent" && current !== "recovery" && current !== "balance") {
     tied.churn_phase = "waiting-for-cover";
     tied.churn_error = "This coin was spent by another transaction.";
     tied.churn_actions = { retry: false, cancel: true, open_settings: false };
     tied.churn_target = 1;
     tied.churn_counted = 0;
-    tied.locked = true;
+    holdForChurn(tied);
   } else if (
     (cover === "no-rpc" || cover === "waiting" || cover === "spreading") &&
     current !== "recovery" &&
@@ -191,7 +240,7 @@ function privateCoins(): Coin[] {
     tied.churn_actions = { retry: false, cancel: true, open_settings: cover === "no-rpc" };
     tied.churn_target = 3;
     tied.churn_counted = 1;
-    tied.locked = true;
+    holdForChurn(tied);
     const checkedAt = Math.floor(Date.now() / 1000) - 40;
     if (cover === "waiting") {
       tied.churn_cover_min = 2;

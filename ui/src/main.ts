@@ -796,9 +796,6 @@ const el = {
   btnImportMetadata: document.querySelector<HTMLButtonElement>("#btn-import-metadata")!,
   btnExportDiagnostics: document.querySelector<HTMLButtonElement>("#btn-export-diagnostics")!,
   btnCopyDiagnostics: document.querySelector<HTMLButtonElement>("#btn-copy-diagnostics")!,
-  diagnosticsTitle: document.querySelector<HTMLElement>("#diagnostics-title")!,
-  devModeRow: document.querySelector<HTMLElement>("#dev-mode-row")!,
-  devModeToggle: document.querySelector<HTMLInputElement>("#dev-mode-toggle")!,
   liveLog: document.querySelector<HTMLElement>("#live-log")!,
   liveLogBody: document.querySelector<HTMLElement>("#live-log-body")!,
   btnLiveLogPause: document.querySelector<HTMLButtonElement>("#btn-live-log-pause")!,
@@ -831,16 +828,13 @@ let syncing = false;
 let sending = false;
 let currentPhase: Phase = "boot";
 let currentView: View = "balance";
-const DEV_MODE_KEY = "ltc-dev-mode";
 const LIVE_LOG_OPEN_KEY = "ltc-live-log-open";
 const LIVE_LOG_POLL_MS = 1000;
 const LIVE_LOG_MAX_LINES = 1000;
-const DEV_REVEAL_CLICKS = 5;
 let liveLogCursor = 0;
 let liveLogLines: string[] = [];
 let liveLogPaused = false;
 let liveLogTimer: number | null = null;
-let devTitleClicks: number[] = [];
 let activeCard: Card | null = null;
 let syncState: SyncState = "idle";
 let lastTxid: string | null = null;
@@ -9348,10 +9342,6 @@ el.btnCopyDiagnostics.addEventListener("click", async () => {
 
 type DiagLogPage = { next: number; lines: string[] };
 
-function devModeOn(): boolean {
-  return localStorage.getItem(DEV_MODE_KEY) === "1";
-}
-
 /** `<unix seconds> <message>` → `HH:MM:SS <message>` in local time. */
 function formatLogLine(line: string): string {
   const space = line.indexOf(" ");
@@ -9371,18 +9361,12 @@ function appendLiveLog(lines: string[]) {
 }
 
 function liveLogOpen(): boolean {
-  return devModeOn() && localStorage.getItem(LIVE_LOG_OPEN_KEY) === "1";
+  return localStorage.getItem(LIVE_LOG_OPEN_KEY) === "1";
 }
 
 function setLiveLogOpen(open: boolean) {
   if (open) localStorage.setItem(LIVE_LOG_OPEN_KEY, "1");
   else localStorage.removeItem(LIVE_LOG_OPEN_KEY);
-  syncLiveLog();
-}
-
-function setDevMode(on: boolean) {
-  if (on) localStorage.setItem(DEV_MODE_KEY, "1");
-  else localStorage.removeItem(DEV_MODE_KEY);
   syncLiveLog();
 }
 
@@ -9407,13 +9391,10 @@ async function pollLiveLog() {
   }
 }
 
-/** Show the Logs button and drawer, and start or stop polling, to match dev mode, the drawer, and window visibility. */
+/** Swap the Logs button for the drawer, and start or stop polling, to match the drawer and window visibility. */
 function syncLiveLog() {
-  const on = devModeOn();
   const open = liveLogOpen();
-  el.devModeToggle.checked = on;
-  if (on) el.devModeRow.hidden = false;
-  el.btnLiveLog.hidden = !on || open;
+  el.btnLiveLog.hidden = open;
   el.liveLog.hidden = !open;
   document.body.classList.toggle("live-log-open", open);
   if (liveLogWanted()) {
@@ -9424,27 +9405,13 @@ function syncLiveLog() {
   }
 }
 
-el.diagnosticsTitle.addEventListener("click", () => {
-  const now = Date.now();
-  devTitleClicks = devTitleClicks.filter((t) => now - t < 3000).concat(now);
-  if (devTitleClicks.length >= DEV_REVEAL_CLICKS) el.devModeRow.hidden = false;
-});
-
-el.devModeToggle.addEventListener("change", () => setDevMode(el.devModeToggle.checked));
-
 el.btnLiveLog.addEventListener("click", () => setLiveLogOpen(true));
 el.btnLiveLogClose.addEventListener("click", () => setLiveLogOpen(false));
 
-// ⌘⇧L / Ctrl+Shift+L works on every screen, so testers can turn the log on before signing in.
 document.addEventListener("keydown", (event) => {
   if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== "l") return;
   event.preventDefault();
-  if (!devModeOn()) {
-    setDevMode(true);
-    setLiveLogOpen(true);
-  } else {
-    setLiveLogOpen(!liveLogOpen());
-  }
+  setLiveLogOpen(!liveLogOpen());
 });
 
 el.btnLiveLogPause.addEventListener("click", () => {

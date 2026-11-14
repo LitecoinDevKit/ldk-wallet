@@ -1419,7 +1419,7 @@
             </div>
 
             <div class="card" id="diagnostics-card">
-              <h3 id="diagnostics-title">Diagnostics</h3>
+              <h3>Diagnostics</h3>
               <p class="hint">
                 Share this with support when sync is stuck. It includes connection settings, sync
                 phase, and recent non-secret log lines — never your recovery phrase or passphrase.
@@ -1432,10 +1432,6 @@
                   Copy to clipboard
                 </button>
               </div>
-              <label class="check" id="dev-mode-row" hidden>
-                <input id="dev-mode-toggle" type="checkbox" />
-                <span>Developer mode: Logs button on every screen, including sign-in</span>
-              </label>
             </div>
 
             <div class="card" id="privacy-disclosure">
@@ -1628,7 +1624,7 @@
     </div>
 
     <!-- Developer live log: outside both shells so it works before sign-in. -->
-    <button type="button" id="btn-live-log" class="live-log-fab" aria-controls="live-log" hidden>
+    <button type="button" id="btn-live-log" class="live-log-fab" aria-controls="live-log">
       Logs
     </button>
     <section class="live-log" id="live-log" aria-label="Live log" hidden>

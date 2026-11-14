@@ -1172,10 +1172,6 @@ textarea {
   cursor: pointer;
 }
 
-#dev-mode-row {
-  margin-top: 0.85rem;
-}
-
 .live-log-fab {
   position: fixed;
   right: 1rem;

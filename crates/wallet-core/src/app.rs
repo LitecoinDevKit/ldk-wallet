@@ -1033,6 +1033,7 @@ impl WalletApp {
                 mweb_confirmed_sats: 0,
                 mweb_unconfirmed_sats: 0,
                 mweb_immature_sats: 0,
+                mweb_maturity_blocks: bdk_mweb::MWEB_PEGIN_MATURITY,
                 mweb_total_sats: 0,
                 mweb_receive_address: None,
                 mweb_synced_height: None,
@@ -1083,6 +1084,7 @@ impl WalletApp {
                     confirmations,
                     timestamp,
                     kind,
+                    maturity_blocks_left: None,
                 }
             })
             .collect();
@@ -1854,6 +1856,7 @@ impl WalletApp {
             transparent_fee_sats: resolved.transparent_fee_sats,
             total_from_transparent_sats,
             creates_change,
+            maturity_blocks: bdk_mweb::MWEB_PEGIN_MATURITY,
         })
     }
 
@@ -3239,6 +3242,7 @@ impl MemoryBackedApp {
             transparent_fee_sats: resolved.transparent_fee_sats,
             total_from_transparent_sats,
             creates_change,
+            maturity_blocks: bdk_mweb::MWEB_PEGIN_MATURITY,
         })
     }
 
@@ -5552,6 +5556,8 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
                     records[i].confirmations = tip.saturating_sub(h).saturating_add(1);
                 }
             }
+            records[i].maturity_blocks_left =
+                mweb::pegin_blocks_left(records[i].kind, records[i].confirmations);
             continue;
         }
         // Prefer the height resolved and persisted at sync time (covers
@@ -5572,6 +5578,7 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
             confirmations,
             timestamp: Some(entry.timestamp),
             kind: entry.kind,
+            maturity_blocks_left: mweb::pegin_blocks_left(entry.kind, confirmations),
         });
     }
 }
@@ -5670,12 +5677,14 @@ mod tests {
             confirmations: 0,
             timestamp: Some(1_700_000_000),
             kind: TxKind::Transparent,
+            maturity_blocks_left: None,
         }];
         merge_mweb_history(&mut records, &mweb, 100);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].kind, TxKind::Pegin);
         assert_eq!(records[0].fee_sats, Some(51_000));
         assert_eq!(records[0].height, Some(90));
+        assert_eq!(records[0].maturity_blocks_left, None);
         assert_eq!(records[0].confirmations, 11);
     }
 

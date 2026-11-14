@@ -3594,15 +3594,34 @@ pub fn coin_from_value(value: &serde_json::Value) -> Result<bdk_mweb::MwebCoin, 
     serde_json::from_value(value.clone()).map_err(|e| WalletError::Mweb(e.to_string()))
 }
 
-pub fn pegout(
+/// Signed peg-out, not yet broadcast and not yet applied to the coin set.
+///
+/// The caller broadcasts outside the wallet lock, then [`apply_signed_pegout`].
+pub struct SignedPegout {
+    pub tx: Transaction,
+    pub wtxid: String,
+    fee_sats: u64,
+    amount_sats: u64,
+    spent_ids: Vec<[u8; 32]>,
+    change: Option<bdk_mweb::MwebCoin>,
+    addresses: Vec<String>,
+}
+
+impl SignedPegout {
+    /// Output ids this peg-out spends. Freeze them until broadcast finishes.
+    pub fn input_ids(&self) -> Vec<String> {
+        self.spent_ids.iter().map(hex::encode).collect()
+    }
+}
+
+/// Build and sign a peg-out. Does not broadcast or mark coins spent.
+pub fn sign_pegout(
     wallet: &PersistedWallet<Connection>,
-    runtime: &mut MwebRuntime,
+    runtime: &MwebRuntime,
     data_dir: &Path,
-    rpc_url: Option<&str>,
-    peers: &[String],
     req: PegoutRequest,
     network: WalletNetwork,
-) -> Result<MwebBroadcastResult, WalletError> {
+) -> Result<SignedPegout, WalletError> {
     let net = network.to_bitcoin_network();
     let dust_relay = FeeRate::from_sat_per_vb(30)
         .ok_or_else(|| WalletError::BuildTx("internal dust fee rate".into()))?;
@@ -3683,27 +3702,6 @@ pub fn pegout(
     let (tx, change) = wallet
         .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, rpc_url, peers, network)?;
-    let wtxid = tx.compute_wtxid().to_string();
-    for id in &spent_ids {
-        let _ = runtime.store.db_mut().mark_spent(id);
-    }
-    let mut output_ids = Vec::new();
-    if let Some(mut change) = change {
-        change.block_height = None;
-        output_ids.push(hex::encode(change.output_id));
-        runtime.store.db_mut().insert(change);
-    }
-    runtime.history.record(MwebHistoryEntry {
-        id: wtxid.clone(),
-        kind: TxKind::Pegout,
-        net_sats: -((req.amount_sats.saturating_add(req.fee_sats)) as i64),
-        fee_sats: Some(req.fee_sats),
-        timestamp: now_ts(),
-        output_ids,
-        input_ids: spent_ids.iter().map(hex::encode).collect(),
-        confirmed_height: None,
-    });
     let addresses = if req.per_coin {
         req.addresses
     } else if !req.address.is_empty() {
@@ -3711,11 +3709,46 @@ pub fn pegout(
     } else {
         Vec::new()
     };
-    Ok(MwebBroadcastResult {
-        wtxid,
+    Ok(SignedPegout {
+        wtxid: tx.compute_wtxid().to_string(),
+        tx,
         fee_sats: req.fee_sats,
+        amount_sats: req.amount_sats,
+        spent_ids,
+        change,
         addresses,
     })
+}
+
+/// Mark the spent coins, remember change, and record history. Does not broadcast.
+pub fn apply_signed_pegout(
+    runtime: &mut MwebRuntime,
+    signed: &SignedPegout,
+) -> MwebBroadcastResult {
+    for id in &signed.spent_ids {
+        let _ = runtime.store.db_mut().mark_spent(id);
+    }
+    let mut output_ids = Vec::new();
+    if let Some(mut change) = signed.change.clone() {
+        change.block_height = None;
+        output_ids.push(hex::encode(change.output_id));
+        runtime.store.db_mut().insert(change);
+    }
+    runtime.history.record(MwebHistoryEntry {
+        id: signed.wtxid.clone(),
+        kind: TxKind::Pegout,
+        net_sats: -((signed.amount_sats.saturating_add(signed.fee_sats)) as i64),
+        fee_sats: Some(signed.fee_sats),
+        timestamp: now_ts(),
+        output_ids,
+        input_ids: signed.input_ids(),
+        confirmed_height: None,
+    });
+    MwebBroadcastResult {
+        wtxid: signed.wtxid.clone(),
+        fee_sats: signed.fee_sats,
+        addresses: signed.addresses.clone(),
+    }
 }
 
 #[cfg(test)]

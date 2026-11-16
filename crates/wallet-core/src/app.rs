@@ -1349,7 +1349,7 @@ impl WalletApp {
         Ok(())
     }
 
-    /// Build a litview `/tx/{txid}` URL (no network).
+    /// Build a litview `/explorer/tx/{txid}` URL (no network).
     pub fn explorer_tx_url(&self, txid: &str) -> Result<String, WalletError> {
         self.ensure_unlocked()?;
         let guard = self.lock_state()?;
@@ -1357,7 +1357,7 @@ impl WalletApp {
         crate::explorer::tx_url(&state.explorer_base_url, txid)
     }
 
-    /// Build a litview `/block/{hash}` URL (no network).
+    /// Build a litview `/explorer/block/{hash}` URL (no network).
     pub fn explorer_block_url(&self, block_hash: &str) -> Result<String, WalletError> {
         self.ensure_unlocked()?;
         let guard = self.lock_state()?;

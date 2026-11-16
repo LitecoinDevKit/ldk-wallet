@@ -595,7 +595,13 @@
                         />
                       </label>
                       <label class="field">
-                        <span class="field-label" id="send-amount-label">Amount (LTC)</span>
+                        <span class="field-label-row">
+                          <span class="field-label" id="send-amount-label">Amount (LTC)</span>
+                          <span class="unit-toggle" id="send-unit-toggle" role="group" aria-label="Enter amount in">
+                            <button type="button" class="unit-seg" id="send-unit-coin" aria-pressed="true">LTC</button>
+                            <button type="button" class="unit-seg" id="send-unit-usd" aria-pressed="false">USD</button>
+                          </span>
+                        </span>
                         <input
                           id="send-amount"
                           type="text"
@@ -603,6 +609,7 @@
                           placeholder="0.00002940"
                           autocomplete="off"
                         />
+                        <span class="hint mono amount-fiat-hint" id="send-amount-fiat" hidden></span>
                       </label>
                       <div
                         class="amount-presets"
@@ -683,8 +690,20 @@
                         />
                       </label>
                       <label class="field">
-                        <span class="field-label" id="mweb-send-amount-label">Amount (LTC)</span>
+                        <span class="field-label-row">
+                          <span class="field-label" id="mweb-send-amount-label">Amount (LTC)</span>
+                          <span
+                            class="unit-toggle"
+                            id="mweb-send-unit-toggle"
+                            role="group"
+                            aria-label="Enter amount in"
+                          >
+                            <button type="button" class="unit-seg" id="mweb-send-unit-coin" aria-pressed="true">LTC</button>
+                            <button type="button" class="unit-seg" id="mweb-send-unit-usd" aria-pressed="false">USD</button>
+                          </span>
+                        </span>
                         <input id="mweb-send-amount" type="text" inputmode="decimal" placeholder="0.001" />
+                        <span class="hint mono amount-fiat-hint" id="mweb-send-amount-fiat" hidden></span>
                       </label>
                       <div
                         class="amount-presets"
@@ -877,8 +896,15 @@
                         until they mature (~6 confirmations).
                       </p>
                       <label class="field">
-                        <span class="field-label" id="pegin-amount-label">Amount (LTC)</span>
+                        <span class="field-label-row">
+                          <span class="field-label" id="pegin-amount-label">Amount (LTC)</span>
+                          <span class="unit-toggle" role="group" aria-label="Enter amount in">
+                            <button type="button" class="unit-seg" id="pegin-unit-coin" aria-pressed="true">LTC</button>
+                            <button type="button" class="unit-seg" id="pegin-unit-usd" aria-pressed="false">USD</button>
+                          </span>
+                        </span>
                         <input id="pegin-amount" type="text" inputmode="decimal" placeholder="0.001" />
+                        <span class="hint mono amount-fiat-hint" id="pegin-amount-fiat" hidden></span>
                       </label>
                       <div
                         class="amount-presets"
@@ -936,8 +962,15 @@
                         consolidated on the way out.
                       </p>
                       <label class="field">
-                        <span class="field-label" id="pegout-amount-label">Amount (LTC)</span>
+                        <span class="field-label-row">
+                          <span class="field-label" id="pegout-amount-label">Amount (LTC)</span>
+                          <span class="unit-toggle" role="group" aria-label="Enter amount in">
+                            <button type="button" class="unit-seg" id="pegout-unit-coin" aria-pressed="true">LTC</button>
+                            <button type="button" class="unit-seg" id="pegout-unit-usd" aria-pressed="false">USD</button>
+                          </span>
+                        </span>
                         <input id="pegout-amount" type="text" inputmode="decimal" placeholder="0.001" />
+                        <span class="hint mono amount-fiat-hint" id="pegout-amount-fiat" hidden></span>
                       </label>
                       <div
                         class="amount-presets"

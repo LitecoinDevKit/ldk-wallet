@@ -49,7 +49,7 @@ pub fn is_chain_txid(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// `{base}/tx/{txid}`
+/// `{base}/explorer/tx/{txid}`
 pub fn tx_url(base: &str, txid: &str) -> Result<String, WalletError> {
     let base = normalize_base_url(base)?;
     let txid = txid.trim();
@@ -58,17 +58,30 @@ pub fn tx_url(base: &str, txid: &str) -> Result<String, WalletError> {
             "not a transparent transaction id — cannot open in explorer".into(),
         ));
     }
-    Ok(format!("{base}/tx/{txid}"))
+    Ok(format!("{base}/explorer/tx/{txid}"))
 }
 
-/// `{base}/block/{hash}` when hash looks like a block hash.
+/// `{base}/explorer/block/{hash}` when hash looks like a block hash.
 pub fn block_url(base: &str, block_hash: &str) -> Result<String, WalletError> {
     let base = normalize_base_url(base)?;
     let hash = block_hash.trim();
     if !is_chain_txid(hash) {
         return Err(WalletError::Meta("invalid block hash".into()));
     }
-    Ok(format!("{base}/block/{hash}"))
+    Ok(format!("{base}/explorer/block/{hash}"))
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+pub(crate) fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Reject non-http(s) URLs before handing them to the OS opener.
@@ -113,14 +126,26 @@ fn get_text(url: &str) -> Result<String, WalletError> {
         .map_err(|e| WalletError::Explorer(format!("read failed: {e}")))
 }
 
-/// `GET {base}/api/mempool/price` — plain number body.
-pub fn fetch_spot_price(base: &str) -> Result<f64, WalletError> {
+fn spot_price_url(base: &str) -> Result<String, WalletError> {
     let base = normalize_base_url(base)?;
-    let url = format!("{base}/api/mempool/price");
-    let body = get_text(&url)?;
-    body.trim()
+    Ok(format!("{base}/api/oracle/price"))
+}
+
+fn parse_spot_price(body: &str) -> Result<f64, WalletError> {
+    let price = body
+        .trim()
         .parse::<f64>()
-        .map_err(|e| WalletError::Explorer(format!("invalid price: {e}")))
+        .map_err(|e| WalletError::Explorer(format!("invalid price: {e}")))?;
+    if !price.is_finite() || price <= 0.0 {
+        return Err(WalletError::Explorer(format!("invalid price: {price}")));
+    }
+    Ok(price)
+}
+
+/// `GET {base}/api/oracle/price` — plain number body, LTC/USD.
+pub fn fetch_spot_price(base: &str) -> Result<f64, WalletError> {
+    let body = get_text(&spot_price_url(base)?)?;
+    parse_spot_price(&body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,9 +319,38 @@ mod tests {
         let txid = "cf24383eacf8c34c01a0114df0d58e438a5d4fb685570f43c2cef84522361bd0";
         assert_eq!(
             tx_url("https://litview.space", txid).unwrap(),
-            format!("https://litview.space/tx/{txid}")
+            format!("https://litview.space/explorer/tx/{txid}")
         );
         assert!(tx_url("https://litview.space", "not-a-txid").is_err());
+    }
+
+    #[test]
+    fn builds_block_url() {
+        let hash = "1fae52603e7df23ced83b952618a5d6fba4f58d99aa691a2a8c6b174e61ea802";
+        assert_eq!(
+            block_url("https://litview.space/", hash).unwrap(),
+            format!("https://litview.space/explorer/block/{hash}")
+        );
+        assert!(block_url("https://litview.space", "123").is_err());
+    }
+
+    #[test]
+    fn percent_encodes_reserved() {
+        assert_eq!(percent_encode("a-b_c.d~1"), "a-b_c.d~1");
+        assert_eq!(percent_encode("{\"x\": 1}"), "%7B%22x%22%3A%201%7D");
+    }
+
+    #[test]
+    fn spot_price_uses_oracle_route() {
+        assert_eq!(
+            spot_price_url("https://litview.space/").unwrap(),
+            "https://litview.space/api/oracle/price"
+        );
+        assert_eq!(parse_spot_price("45.04\n").unwrap(), 45.04);
+        assert!(parse_spot_price("0").is_err());
+        assert!(parse_spot_price("-1").is_err());
+        assert!(parse_spot_price("NaN").is_err());
+        assert!(parse_spot_price("{\"USD\":45}").is_err());
     }
 
     #[test]

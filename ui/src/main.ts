@@ -1,4 +1,12 @@
 import { invoke } from "./ipc";
+import {
+  formatUsd,
+  formatUsdAtPrice,
+  isUsablePrice,
+  parseUsdToSats,
+  satsToUsd,
+  SEND_PRICE_MAX_AGE_MS,
+} from "./fiat";
 import { PHASE_FROM, PHASE_LABELS, type Phase } from "./phases";
 import QRCode from "qrcode";
 
@@ -724,6 +732,9 @@ const el = {
   btnContactAdd: document.querySelector<HTMLButtonElement>("#btn-contact-add")!,
   sendAmount: document.querySelector<HTMLInputElement>("#send-amount")!,
   sendAmountPresets: document.querySelector<HTMLElement>("#send-amount-presets")!,
+  sendUnitCoin: document.querySelector<HTMLButtonElement>("#send-unit-coin")!,
+  sendUnitUsd: document.querySelector<HTMLButtonElement>("#send-unit-usd")!,
+  sendAmountFiat: document.querySelector<HTMLElement>("#send-amount-fiat")!,
   sendNote: document.querySelector<HTMLInputElement>("#send-note")!,
   sendDrain: document.querySelector<HTMLInputElement>("#send-drain")!,
   coinControl: document.querySelector<HTMLDetailsElement>("#coin-control")!,
@@ -745,6 +756,12 @@ const el = {
   mwebSendAmountLabel: document.querySelector<HTMLElement>("#mweb-send-amount-label")!,
   peginAmountLabel: document.querySelector<HTMLElement>("#pegin-amount-label")!,
   pegoutAmountLabel: document.querySelector<HTMLElement>("#pegout-amount-label")!,
+  peginUnitCoin: document.querySelector<HTMLButtonElement>("#pegin-unit-coin")!,
+  peginUnitUsd: document.querySelector<HTMLButtonElement>("#pegin-unit-usd")!,
+  peginAmountFiat: document.querySelector<HTMLElement>("#pegin-amount-fiat")!,
+  pegoutUnitCoin: document.querySelector<HTMLButtonElement>("#pegout-unit-coin")!,
+  pegoutUnitUsd: document.querySelector<HTMLButtonElement>("#pegout-unit-usd")!,
+  pegoutAmountFiat: document.querySelector<HTMLElement>("#pegout-amount-fiat")!,
   settingsExplorer: document.querySelector<HTMLInputElement>("#settings-explorer")!,
   settingsShowFiat: document.querySelector<HTMLInputElement>("#settings-show-fiat")!,
   settingsUnitLtc: document.querySelector<HTMLInputElement>("#settings-unit-ltc")!,
@@ -769,6 +786,9 @@ const el = {
   mwebSendAddress: document.querySelector<HTMLInputElement>("#mweb-send-address")!,
   mwebSendAmount: document.querySelector<HTMLInputElement>("#mweb-send-amount")!,
   mwebSendAmountPresets: document.querySelector<HTMLElement>("#mweb-send-amount-presets")!,
+  mwebSendUnitCoin: document.querySelector<HTMLButtonElement>("#mweb-send-unit-coin")!,
+  mwebSendUnitUsd: document.querySelector<HTMLButtonElement>("#mweb-send-unit-usd")!,
+  mwebSendAmountFiat: document.querySelector<HTMLElement>("#mweb-send-amount-fiat")!,
   mwebSendNote: document.querySelector<HTMLInputElement>("#mweb-send-note")!,
   mwebSendDrain: document.querySelector<HTMLInputElement>("#mweb-send-drain")!,
   mwebSendCoinControl: document.querySelector<HTMLDetailsElement>("#mweb-send-coin-control")!,
@@ -907,6 +927,7 @@ let litvmHistoryWarning: string | null = null;
 let lastLitvmSummary: LitVmSummary | null = null;
 let explorerBaseUrl = "https://litview.space";
 let spotPriceUsd: number | null = null;
+let spotPriceFetchedAt = 0;
 let lastNetworkPulse: NetworkPulse | null = null;
 let insightsPulseTimer: number | null = null;
 let lastTotalSats = 0;
@@ -954,15 +975,6 @@ async function openExplorerForTxid(txid: string) {
   }
 }
 
-function formatUsd(amount: number): string {
-  return amount.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 function renderFiat() {
   if (hideBalances || !showFiat || spotPriceUsd == null || !Number.isFinite(spotPriceUsd)) {
     el.balanceFiat.hidden = true;
@@ -974,14 +986,221 @@ function renderFiat() {
   el.balanceFiat.textContent = `≈ ${formatUsd(usd)}`;
 }
 
+function setSpotPrice(price: number | null) {
+  spotPriceUsd = isUsablePrice(price) ? price : null;
+  spotPriceFetchedAt = spotPriceUsd == null ? 0 : Date.now();
+  renderFiat();
+  renderAmountFields();
+}
+
 async function refreshSpotPrice() {
   if (!showFiat || currentPhase !== "ready") return;
   try {
-    spotPriceUsd = await invoke<number>("fetch_spot_price");
-    renderFiat();
+    setSpotPrice(await invoke<number>("fetch_spot_price"));
   } catch {
     /* soft-fail: keep last price or hide */
   }
+}
+
+type AmountEntry = "coin" | "usd";
+
+type AmountField = {
+  input: HTMLInputElement;
+  label: HTMLElement;
+  coinBtn: HTMLButtonElement;
+  usdBtn: HTMLButtonElement;
+  hint: HTMLElement;
+  clearPreset: () => void;
+  entry: AmountEntry;
+};
+
+const publicSendAmount: AmountField = {
+  input: el.sendAmount,
+  label: el.sendAmountLabel,
+  coinBtn: el.sendUnitCoin,
+  usdBtn: el.sendUnitUsd,
+  hint: el.sendAmountFiat,
+  clearPreset: clearSendAmountPreset,
+  entry: "coin",
+};
+
+const privateSendAmount: AmountField = {
+  input: el.mwebSendAmount,
+  label: el.mwebSendAmountLabel,
+  coinBtn: el.mwebSendUnitCoin,
+  usdBtn: el.mwebSendUnitUsd,
+  hint: el.mwebSendAmountFiat,
+  clearPreset: clearMwebSendAmountPreset,
+  entry: "coin",
+};
+
+const peginAmount: AmountField = {
+  input: el.peginAmount,
+  label: el.peginAmountLabel,
+  coinBtn: el.peginUnitCoin,
+  usdBtn: el.peginUnitUsd,
+  hint: el.peginAmountFiat,
+  clearPreset: clearPeginAmountPreset,
+  entry: "coin",
+};
+
+const pegoutAmount: AmountField = {
+  input: el.pegoutAmount,
+  label: el.pegoutAmountLabel,
+  coinBtn: el.pegoutUnitCoin,
+  usdBtn: el.pegoutUnitUsd,
+  hint: el.pegoutAmountFiat,
+  clearPreset: clearPegoutAmountPreset,
+  entry: "coin",
+};
+
+const amountFields = [publicSendAmount, privateSendAmount, peginAmount, pegoutAmount];
+
+function usdEntryAvailable(): boolean {
+  return showFiat && isUsablePrice(spotPriceUsd);
+}
+
+function renderAmountField(field: AmountField) {
+  if (field.entry === "usd" && !usdEntryAvailable()) {
+    // A USD figure can't be converted without a price; don't let it be read as LTC.
+    field.entry = "coin";
+    field.input.value = "";
+  }
+  const usd = field.entry === "usd";
+  field.label.textContent = `Amount (${usd ? "USD" : unitLabel()})`;
+  field.coinBtn.textContent = unitLabel();
+  field.coinBtn.setAttribute("aria-pressed", usd ? "false" : "true");
+  field.usdBtn.setAttribute("aria-pressed", usd ? "true" : "false");
+  const busy = syncing || sending;
+  field.coinBtn.disabled = busy;
+  field.usdBtn.disabled = busy || !usdEntryAvailable();
+  field.usdBtn.title = usdEntryAvailable()
+    ? "Enter the amount in US dollars"
+    : showFiat
+      ? "No LTC/USD price from the explorer yet"
+      : "Turn on “Show LTC/USD” in Settings to enter dollars";
+  if (usd) {
+    field.input.placeholder = "10.00";
+    field.input.inputMode = "decimal";
+  }
+
+  const raw = field.input.value.trim();
+  const price = spotPriceUsd;
+  let text = "";
+  if (raw && isUsablePrice(price) && usdEntryAvailable()) {
+    if (usd) {
+      const sats = parseUsdToSats(raw, price);
+      if (sats != null) text = `≈ ${formatAmountPlain(sats)} at ${formatUsd(price)}/LTC`;
+    } else {
+      const sats = parseAmountToSats(raw);
+      if (sats != null) text = `≈ ${formatUsd(satsToUsd(sats, price))}`;
+    }
+  }
+  field.hint.textContent = text;
+  field.hint.hidden = !text;
+}
+
+function renderAmountFields() {
+  for (const field of amountFields) renderAmountField(field);
+}
+
+function setAmountEntry(field: AmountField, entry: AmountEntry) {
+  if (entry === "usd" && !usdEntryAvailable()) return;
+  if (field.entry !== entry) {
+    field.entry = entry;
+    field.input.value = "";
+    field.clearPreset();
+    syncAmountFieldLabels();
+  }
+  renderAmountField(field);
+}
+
+/** Coin-unit values (presets, payment requests) are written in LTC mode so they aren't rounded to cents. */
+function useCoinEntryFor(input: HTMLInputElement) {
+  const field = amountFields.find((f) => f.input === input);
+  if (!field || field.entry === "coin") return;
+  field.entry = "coin";
+  syncAmountFieldLabels();
+}
+
+function displayPriceForReview(): number | null {
+  return usdEntryAvailable() ? spotPriceUsd : null;
+}
+
+/** Price to size a USD send with: a fresh fetch, else the last price if it is recent. */
+async function spotPriceForSend(): Promise<number | null> {
+  try {
+    const price = await invoke<number>("fetch_spot_price");
+    if (isUsablePrice(price)) {
+      setSpotPrice(price);
+      return price;
+    }
+  } catch {
+    /* fall back to the last price below */
+  }
+  if (isUsablePrice(spotPriceUsd) && Date.now() - spotPriceFetchedAt < SEND_PRICE_MAX_AGE_MS) {
+    return spotPriceUsd;
+  }
+  return null;
+}
+
+/**
+ * Read a send amount in litoshis from its field. In USD mode, also returns the
+ * price used so the review can show it.
+ */
+async function readAmountSats(
+  field: AmountField,
+  what: string,
+): Promise<{ sats: number; price: number | null } | null> {
+  if (field.entry === "coin") {
+    const sats = parseAmountToSats(field.input.value);
+    if (sats == null) {
+      setError(amountError(what, field.input.value));
+      return null;
+    }
+    return { sats, price: displayPriceForReview() };
+  }
+  const shown = field.input.value.trim();
+  if (!shown) {
+    setError(`Enter a ${what} amount in USD.`);
+    return null;
+  }
+  sending = true;
+  updateBusyUi();
+  showLoading("Getting LTC/USD price…");
+  let price: number | null;
+  try {
+    price = await spotPriceForSend();
+  } finally {
+    hideLoading();
+    sending = false;
+    updateBusyUi();
+  }
+  if (price == null) {
+    setError(
+      "Could not get a current LTC/USD price from the explorer. Try again, or switch to LTC.",
+    );
+    return null;
+  }
+  const sats = parseUsdToSats(shown, price);
+  if (sats == null) {
+    setError(
+      shown.includes(",")
+        ? `Invalid ${what} amount "${shown}" — use a dot as the decimal separator (e.g. 12.50), no commas.`
+        : `Invalid ${what} amount "${shown}" — enter USD like 12.50 (max 2 decimal places).`,
+    );
+    return null;
+  }
+  return { sats, price };
+}
+
+/** Review-dialog rows: the USD value of the amount, and a reminder that the LTC amount is what moves. */
+function usdReviewRows(amountSats: number, price: number | null): DetailRow[] {
+  if (!isUsablePrice(price)) return [];
+  return [
+    ["Amount in USD", formatUsdAtPrice(amountSats, price)],
+    ["Exact amount", `${formatAmountPlain(amountSats)} (USD is an estimate)`],
+  ];
 }
 
 function formatCompact(n: number): string {
@@ -1311,7 +1530,7 @@ function renderInsightCharts(series: MetricSeries[]) {
     foot.append(windowLabel, openLabel);
 
     card.append(top, plot, range, foot);
-    card.addEventListener("click", () => openLitviewPath(s.litview_path || "/charts"));
+    card.addEventListener("click", () => openLitviewPath(s.litview_path || "/studio/"));
     el.insightsCharts.appendChild(card);
   }
 }
@@ -1336,8 +1555,7 @@ async function refreshNetworkPulse() {
     setInsightsPulseLoading(false);
     renderNetworkPulse(lastNetworkPulse);
     if (showFiat && lastNetworkPulse) {
-      spotPriceUsd = lastNetworkPulse.price_usd;
-      renderFiat();
+      setSpotPrice(lastNetworkPulse.price_usd);
     }
   } catch (e) {
     setInsightsPulseLoading(false);
@@ -1675,11 +1893,6 @@ function amountInputs(): HTMLInputElement[] {
 }
 
 function syncAmountFieldLabels() {
-  const label = `Amount (${unitLabel()})`;
-  el.sendAmountLabel.textContent = label;
-  el.mwebSendAmountLabel.textContent = label;
-  el.peginAmountLabel.textContent = label;
-  el.pegoutAmountLabel.textContent = label;
   el.receiveAmountLabel.textContent = `Request amount (optional, ${unitLabel()})`;
   const placeholder = displayUnit === "litoshis" ? String(DUST_LITOSHIS) : "0.001";
   for (const input of [el.sendAmount, el.mwebSendAmount, el.peginAmount, el.pegoutAmount]) {
@@ -1691,6 +1904,7 @@ function syncAmountFieldLabels() {
   el.settingsUnitLtc.checked = displayUnit === "ltc";
   el.settingsUnitLitoshis.checked = displayUnit === "litoshis";
   syncHideBalancesUi();
+  renderAmountFields();
 }
 
 function setDisplayUnit(unit: DisplayUnit, opts: { clearAmbiguous?: boolean; keepHidden?: boolean } = {}) {
@@ -1703,15 +1917,18 @@ function setDisplayUnit(unit: DisplayUnit, opts: { clearAmbiguous?: boolean; kee
   }
   syncAmountFieldLabels();
   if (opts.clearAmbiguous !== false && prev !== unit) {
+    const usdInputs = new Set(
+      amountFields.filter((f) => f.entry === "usd").map((f) => f.input),
+    );
     for (const input of amountInputs()) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() || usdInputs.has(input)) continue;
       // Value typed for the other unit is ambiguous — clear rather than mis-parse.
       input.value = "";
     }
-    clearSendAmountPreset();
-    clearMwebSendAmountPreset();
-    clearPeginAmountPreset();
-    clearPegoutAmountPreset();
+    for (const field of amountFields) {
+      if (field.entry === "coin") field.clearPreset();
+    }
+    renderAmountFields();
   }
   refreshBalanceDisplays();
   void refreshPublicReceiveQr();
@@ -1818,7 +2035,7 @@ el.networkPulse.addEventListener("click", () => setView("insights"));
 el.btnRefreshInsights.addEventListener("click", () => void refreshInsightsView());
 
 el.btnOpenLitview.addEventListener("click", () => {
-  openLitviewPath("/charts");
+  openLitviewPath("/studio/");
 });
 
 el.historySearch.addEventListener("input", () => {
@@ -2471,7 +2688,7 @@ function stopStatusStripClock() {
 
 el.statusBlock.addEventListener("click", () => {
   if (el.statusBlock.disabled || statusStripModel.tip == null || statusStripModel.error) return;
-  openLitviewPath(`/block/${statusStripModel.tip}`);
+  openLitviewPath(`/explorer/block/${statusStripModel.tip}`);
 });
 
 async function showBroadcastFailure(raw: unknown): Promise<void> {
@@ -2905,6 +3122,7 @@ function updateBusyUi() {
   el.mwebSendNote.disabled = busy;
   el.pegoutAmount.disabled = busy;
   el.pegoutNote.disabled = busy;
+  renderAmountFields();
   for (const group of [
     el.sendAmountPresets,
     el.mwebSendAmountPresets,
@@ -4181,6 +4399,7 @@ async function loadSettings() {
     el.settingsShowFiat.checked = s.show_fiat ?? true;
     el.settingsFeeHints.checked = s.use_explorer_fee_hints ?? true;
     showFiat = s.show_fiat ?? true;
+    if (!showFiat) setSpotPrice(null);
     useExplorerFeeHints = s.use_explorer_fee_hints ?? true;
     insightsEnabled = s.insights_enabled ?? true;
     el.settingsInsightsEnabled.checked = insightsEnabled;
@@ -5008,6 +5227,7 @@ async function lockWallet(statusMessage = "Wallet locked.") {
   stopAutoSync();
   stopMwebProgressPolling();
   syncing = false;
+  for (const field of amountFields) setAmountEntry(field, "coin");
   setPhase("unlock");
   setStatus(statusMessage);
   updateBusyUi();
@@ -5270,6 +5490,7 @@ function tryParseSendPaymentUri(raw: string): boolean {
   }
   el.sendAddress.value = parsed.address;
   if (parsed.amountSats != null) {
+    useCoinEntryFor(el.sendAmount);
     el.sendAmount.value = formatAmountInput(parsed.amountSats);
     clearSendAmountPreset();
   }
@@ -8102,6 +8323,7 @@ function applyAmountPreset(opts: {
   preset: AmountPreset;
   quiet?: boolean;
 }) {
+  useCoinEntryFor(opts.amountInput);
   if (opts.balance <= 0) {
     if (opts.quiet) {
       opts.amountInput.value = "";
@@ -8293,6 +8515,10 @@ el.mwebSendAmount.addEventListener("input", () => {
   clearMwebSendAmountPreset();
   updateBusyUi();
 });
+for (const field of amountFields) {
+  field.coinBtn.addEventListener("click", () => setAmountEntry(field, "coin"));
+  field.usdBtn.addEventListener("click", () => setAmountEntry(field, "usd"));
+}
 el.peginAmount.addEventListener("input", () => {
   clearPeginAmountPreset();
   updateBusyUi();
@@ -8722,17 +8948,16 @@ el.sendForm.addEventListener("submit", async (event) => {
   }
 
   let amount_sats = 0;
+  let usdPrice = displayPriceForReview();
   if (!drain) {
-    const parsed = parseAmountToSats(el.sendAmount.value);
-    if (parsed == null) {
-      setError(amountError("send", el.sendAmount.value));
-      return;
-    }
-    if (parsed < DUST_LITOSHIS) {
+    const read = await readAmountSats(publicSendAmount, "send");
+    if (!read) return;
+    if (read.sats < DUST_LITOSHIS) {
       setError(`Amount must be ≥ ${DUST_LITOSHIS} litoshis (Litecoin dust limit for ltc1).`);
       return;
     }
-    amount_sats = parsed;
+    amount_sats = read.sats;
+    usdPrice = read.price;
   }
 
   const selected_outpoints = selectedOutpointsFor(sendCoinPanel);
@@ -8793,6 +9018,7 @@ el.sendForm.addEventListener("submit", async (event) => {
     warning: reuseWarnings.length ? reuseWarnings : undefined,
     rows: [
       ["Amount", amountLabel],
+      ...usdReviewRows(preview.amount_sats, usdPrice),
       ["Network fee", formatAmountPlain(preview.fee_sats)],
       ["Total leaving wallet", formatAmountPlain(totalLeave)],
       ...(drain
@@ -8939,8 +9165,7 @@ el.btnSaveSettings.addEventListener("click", async () => {
       if (currentView === "insights") setView("balance");
     }
     if (!showFiat) {
-      spotPriceUsd = null;
-      renderFiat();
+      setSpotPrice(null);
     } else {
       void refreshSpotPrice();
     }
@@ -8971,13 +9196,16 @@ el.btnPegin.addEventListener("click", async () => {
   const drain = el.peginDrain.checked;
   const selected_outpoints = selectedOutpointsFor(peginCoinPanel);
   let amount_sats = 0;
+  let usdPrice = displayPriceForReview();
   if (!drain) {
-    const parsed = parseAmountToSats(el.peginAmount.value);
-    if (parsed == null || parsed <= 0) {
+    const read = await readAmountSats(peginAmount, "peg-in");
+    if (!read) return;
+    if (read.sats <= 0) {
       setError(amountError("peg-in", el.peginAmount.value));
       return;
     }
-    amount_sats = parsed;
+    amount_sats = read.sats;
+    usdPrice = read.price;
   }
 
   sending = true;
@@ -9021,6 +9249,7 @@ el.btnPegin.addEventListener("click", async () => {
     warning: warnings,
     rows: [
       ["Amount", formatAmountPlain(preview.amount_sats)],
+      ...usdReviewRows(preview.amount_sats, usdPrice),
       ["Private credit", formatAmountPlain(preview.private_credit_sats)],
       ["Private network fee (MWEB)", formatAmountPlain(preview.mweb_fee_sats)],
       ["Miner fee (public chain)", formatAmountPlain(preview.transparent_fee_sats)],
@@ -9108,13 +9337,12 @@ el.btnMwebSend.addEventListener("click", async () => {
   const drain = el.mwebSendDrain.checked;
   const selected_output_ids = selectedOutpointsFor(mwebSendCoinPanel);
   let amount_sats = 0;
+  let usdPrice = displayPriceForReview();
   if (!drain) {
-    const parsed = parseAmountToSats(el.mwebSendAmount.value);
-    if (parsed == null) {
-      setError(amountError("MWEB send", el.mwebSendAmount.value));
-      return;
-    }
-    amount_sats = parsed;
+    const read = await readAmountSats(privateSendAmount, "MWEB send");
+    if (!read) return;
+    amount_sats = read.sats;
+    usdPrice = read.price;
   }
 
   sending = true;
@@ -9147,6 +9375,7 @@ el.btnMwebSend.addEventListener("click", async () => {
       : undefined,
     rows: [
       ["Amount", formatAmountPlain(preview.amount_sats)],
+      ...usdReviewRows(preview.amount_sats, usdPrice),
       ["Network fee", formatAmountPlain(preview.fee_sats)],
       ["Total leaving private", formatAmountPlain(preview.amount_sats + preview.fee_sats)],
       ...(selected_output_ids?.length
@@ -9228,13 +9457,12 @@ el.btnPegout.addEventListener("click", async () => {
   const selected_output_ids = selectedOutpointsFor(pegoutCoinPanel);
   const perCoin = drain;
   let amount_sats = 0;
+  let usdPrice = displayPriceForReview();
   if (!perCoin) {
-    const parsed = parseAmountToSats(el.pegoutAmount.value);
-    if (parsed == null) {
-      setError(amountError("swap", el.pegoutAmount.value));
-      return;
-    }
-    amount_sats = parsed;
+    const read = await readAmountSats(pegoutAmount, "swap");
+    if (!read) return;
+    amount_sats = read.sats;
+    usdPrice = read.price;
   }
 
   sending = true;
@@ -9288,6 +9516,7 @@ el.btnPegout.addEventListener("click", async () => {
       : undefined,
     rows: [
       ...outputRows,
+      ...usdReviewRows(preview.amount_sats, usdPrice),
       ["Network fee", formatAmountPlain(preview.fee_sats)],
       ["Total leaving private", formatAmountPlain(preview.amount_sats + preview.fee_sats)],
       ...(selected_output_ids?.length

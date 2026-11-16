@@ -12,37 +12,67 @@ use crate::explorer::{self, normalize_base_url};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Allowlisted charts shown in Insights (name, day-index series, UI title, unit hint).
+/// Litview daily series index.
+const DAY_INDEX: &str = "day1";
+
+/// One allowlisted Insights chart.
+pub struct ChartSpec {
+    /// Stable id the UI keys ordering and formatting on.
+    pub id: &'static str,
+    /// Litview series name; may change between LRK releases while `id` stays.
+    pub series: &'static str,
+    pub title: &'static str,
+    pub unit: &'static str,
+}
+
+const fn chart(
+    id: &'static str,
+    series: &'static str,
+    title: &'static str,
+    unit: &'static str,
+) -> ChartSpec {
+    ChartSpec {
+        id,
+        series,
+        title,
+        unit,
+    }
+}
+
+/// Allowlisted charts shown in Insights, all read at [`DAY_INDEX`].
 /// Order matches the Insights UI slate (price featured first).
-pub const CHART_ALLOWLIST: &[(&str, &str, &str, &str)] = &[
-    ("price", "day", "Price", "USD"),
-    ("mvrv", "day", "MVRV", "ratio"),
-    ("price_drawdown", "day", "ATH drawdown", "%"),
-    ("fee_median", "day", "Median fee", "sats"),
-    ("tx_count_sum_24h", "day", "Tx count (24h)", "count"),
-    ("hash_rate", "day", "Hash rate", "H/s"),
-    ("mweb_balance", "day", "MWEB balance", "LTC"),
-    (
+pub const CHART_ALLOWLIST: &[ChartSpec] = &[
+    chart("price", "price", "Price", "USD"),
+    chart("mvrv", "mvrv", "MVRV", "ratio"),
+    chart("price_drawdown", "price_drawdown", "ATH drawdown", "%"),
+    chart("fee_median", "tx_fee_median", "Median fee", "sats"),
+    chart(
+        "tx_count_sum_24h",
+        "tx_count_sum_24h",
+        "Tx count (24h)",
+        "count",
+    ),
+    chart("hash_rate", "hashrate", "Hash rate", "H/s"),
+    chart("mweb_balance", "mweb_supply", "MWEB balance", "LTC"),
+    chart(
         "mweb_pegin_count_sum_1m",
-        "day",
+        "mweb_peg_in_output_count_sum_1m",
         "MWEB peg-ins (1m)",
         "count",
     ),
 ];
 
-/// Litview SPA path for a series id (see LRK `website/scripts/options/*` tree).
-fn litview_chart_path(id: &str) -> String {
-    match id {
-        "price" => "/charts/market/price".into(),
-        "mvrv" => "/charts/distribution/overview/capitalization/mvrv".into(),
-        "price_drawdown" => "/charts/market/all-time-high/drawdown".into(),
-        "fee_median" => "/charts/network/transactions/fee/block".into(),
-        "tx_count_sum_24h" => "/charts/network/transactions/count/24h".into(),
-        "hash_rate" => "/charts/mining/hashrate/current".into(),
-        "mweb_balance" => "/charts/network/mweb/balance/combined".into(),
-        "mweb_pegin_count_sum_1m" => "/charts/network/mweb/peg-in-count/1m".into(),
-        _ => "/charts".into(),
-    }
+/// Litview Studio link that draws `spec`'s series (`/studio/#chart=` + chart JSON).
+fn litview_chart_path(spec: &ChartSpec) -> String {
+    let chart = serde_json::json!({
+        "title": spec.title,
+        "index": DAY_INDEX,
+        "layers": [{ "series": spec.series }],
+    });
+    format!(
+        "/studio/#chart={}",
+        explorer::percent_encode(&chart.to_string())
+    )
 }
 
 fn now_unix() -> u64 {
@@ -90,9 +120,6 @@ struct MempoolStats {
 
 #[derive(Debug, Deserialize)]
 struct SeriesResponse {
-    #[serde(default)]
-    #[serde(rename = "type")]
-    value_type: Option<String>,
     #[serde(default)]
     data: Vec<Option<f64>>,
 }
@@ -144,7 +171,7 @@ pub fn fetch_network_pulse(base: &str) -> Result<NetworkPulse, WalletError> {
         let price = s.spawn(|| explorer::fetch_spot_price(b));
         let fees = s.spawn(|| explorer::fetch_fee_ladder(b));
         let mempool = s.spawn(|| mempool_stats(b));
-        let change = s.spawn(|| fetch_series_raw(b, "price", "day", -2));
+        let change = s.spawn(|| fetch_series_raw(b, "price", DAY_INDEX, -2));
 
         let tip_height = tip
             .join()
@@ -182,29 +209,19 @@ pub fn fetch_network_pulse(base: &str) -> Result<NetworkPulse, WalletError> {
     Ok(tip_h)
 }
 
-fn series_to_metric(
-    id: &str,
-    title: &str,
-    unit: &str,
-    index: &str,
-    raw: SeriesResponse,
-) -> MetricSeries {
+fn series_to_metric(spec: &ChartSpec, raw: SeriesResponse) -> MetricSeries {
     let values = values_from_series(&raw);
     let latest = values.last().copied();
     let change_pct = pct_change(&values);
-    let unit = raw
-        .value_type
-        .filter(|s| !s.is_empty() && s != "None")
-        .unwrap_or_else(|| unit.to_string());
     MetricSeries {
-        id: id.to_string(),
-        title: title.to_string(),
-        unit,
-        index: index.to_string(),
+        id: spec.id.to_string(),
+        title: spec.title.to_string(),
+        unit: spec.unit.to_string(),
+        index: DAY_INDEX.to_string(),
         values,
         latest,
         change_pct,
-        litview_path: litview_chart_path(id),
+        litview_path: litview_chart_path(spec),
     }
 }
 
@@ -214,11 +231,11 @@ pub fn fetch_insight_charts(base: &str) -> Result<Vec<MetricSeries>, WalletError
     let out = std::thread::scope(|s| {
         let handles: Vec<_> = CHART_ALLOWLIST
             .iter()
-            .map(|&(name, index, title, unit)| {
+            .map(|spec| {
                 let base = &base;
                 s.spawn(move || {
-                    fetch_series_raw(base, name, index, -30)
-                        .map(|raw| series_to_metric(name, title, unit, index, raw))
+                    fetch_series_raw(base, spec.series, DAY_INDEX, -30)
+                        .map(|raw| series_to_metric(spec, raw))
                 })
             })
             .collect();
@@ -238,4 +255,49 @@ pub fn fetch_insight_charts(base: &str) -> Result<Vec<MetricSeries>, WalletError
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chart_ids_map_to_current_litview_series() {
+        let pairs: Vec<(&str, &str)> = CHART_ALLOWLIST
+            .iter()
+            .map(|spec| (spec.id, spec.series))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("price", "price"),
+                ("mvrv", "mvrv"),
+                ("price_drawdown", "price_drawdown"),
+                ("fee_median", "tx_fee_median"),
+                ("tx_count_sum_24h", "tx_count_sum_24h"),
+                ("hash_rate", "hashrate"),
+                ("mweb_balance", "mweb_supply"),
+                ("mweb_pegin_count_sum_1m", "mweb_peg_in_output_count_sum_1m"),
+            ]
+        );
+        assert_eq!(DAY_INDEX, "day1");
+    }
+
+    #[test]
+    fn chart_links_open_their_series_in_studio() {
+        let spec = &CHART_ALLOWLIST[0];
+        assert_eq!(
+            litview_chart_path(spec),
+            "/studio/#chart=%7B%22index%22%3A%22day1%22%2C%22layers%22%3A%5B%7B%22series%22%3A%22price%22%7D%5D%2C%22title%22%3A%22Price%22%7D"
+        );
+        for spec in CHART_ALLOWLIST {
+            let path = litview_chart_path(spec);
+            assert!(path.starts_with("/studio/#chart="), "{}", spec.id);
+            assert!(
+                path.contains(&format!("%22series%22%3A%22{}%22", spec.series)),
+                "{}",
+                spec.id
+            );
+        }
+    }
 }

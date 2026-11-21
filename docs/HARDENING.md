@@ -1,0 +1,71 @@
+# Hardening checklist
+
+The one living checklist for hardening this wallet, which is an unaudited prototype. Update it in the same PR as the work. Rules for doing the work are in `AGENTS.md`.
+
+## Next up
+
+1. Land the `SyncPass` guard ([#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25)).
+2. Property tests on every transition table (item 3).
+3. Coin-status and public-coin-status tests (item 4).
+
+## Status
+
+| # | Task | Priority | Status | PR | Notes |
+|---|------|----------|--------|----|-------|
+| 1 | Tighten `AGENTS.md` | Planned | Done | [#24](https://github.com/LitecoinDevKit/ldk-wallet/pull/24) | Also adds this file. |
+| 2 | `SyncPass` guard for `sync_phase` | Planned | In review | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | Stacked on #24. |
+| 3 | Property tests on transition tables | High | Not started | | |
+| 4 | Coin-status tests | High | Not started | | |
+| 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
+| 6 | UI action-flag consistency checks | High | Not started | | |
+| 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |
+| 8 | Screenshot regression in CI | CI | Not started | | |
+| 9 | `cargo miri` on pure logic | CI | Not started | | |
+| 10 | Fuzz or property tests on transitions and parsers | Fuzzing | Not started | | |
+| 11 | Chaos tests for lock and failure mid-pass | Fuzzing | Not started | | |
+| 12 | `docs/MWEB_E2E.md` as a pre-release gate | Process | Not started | | |
+| 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
+| 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
+| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | Needs #25 for a trustworthy phase. |
+
+## Already planned
+
+**1. Tighten `AGENTS.md`.** Corrects the terminal-state rule (only churn's `Done` and `Cancelled` are terminal; lock's `Locked` is left by Unlock), removes the repeated churn rules, and adds a common-mistakes list, a checklist for adding a flow with a table, and a list of the flows without a table (peg-in, peg-out and send; sync phase; LitVM).
+
+**2. `SyncPass` guard.** `sync_phase` could stay at a step such as `MwebDownload` after an early `?` return, so the UI kept showing that step. `SyncPass` in `app.rs` becomes the only writer and resets to Idle unless `finish` is called. `set_sync_phase` is removed. Failing test: `failed_resync_leaves_the_sync_phase_idle`. It uses `discovery::go_offline_for_test()` so it needs no network.
+
+## High-value automated checks
+
+**3. Property tests on transition tables.** For `churn::TRANSITIONS`, `lock::LOCK_TRANSITIONS` and `PHASE_FROM` in `ui/src/phases.ts`: every phase and event gives either a legal next phase or a clean rejection, and terminal states have no exits. Today `table_has_one_row_per_key_and_no_exit_from_finished` and `every_lock_ends_locked` cover parts of this; there is no proptest dependency yet.
+
+**4. Coin-status tests.** Cover the priority order documented on `mweb::coin_status` and `mweb::public_coin_status`, and the difference between an in-flight hold (`reserved`, `public_reserved`) and the user's Freeze. Assert that buttons come only from the returned flags.
+
+**5. Error-path integration tests.** Lock races, persist failures, bad peers, foreign spend and early returns. Assert the final phase, holds and coin status. Reuse `app_with_job`, `app_with_foreign_spent_job`, `app_with_private_coins` and `discovery::go_offline_for_test()`; no network.
+
+**6. UI action-flag consistency.** Check that backend flags map to the expected buttons and that `ui/src/main.ts` never infers an action from a phase. The known exception is LitVM's Speed up (see `AGENTS.md`).
+
+## CI and regression
+
+**7. Diagram and table checks on every PR.** `ci.yml` runs on every PR. `transition_table_matches_docs` and `lock_table_matches_docs` run inside `cargo test --workspace --locked`, and `npm run check:diagrams` runs after `npm run build`.
+
+**8. Screenshot regression.** Run `npm run screenshots` in CI for the coins scenes that show status chips and churn cards (`?cover=` values in `ui/src/shots-fixture.ts`).
+
+**9. `cargo miri`.** On the pure state-machine, hold and status logic, where it can run without I/O.
+
+## Fuzzing and chaos
+
+**10. Fuzz or structure-aware property tests** on `churn::transition`, the coin status functions, and pure parsers used by holds and phases.
+
+**11. Chaos tests.** Inject a lock or a failure mid-sync and mid-churn, then check that no phase is stuck and no reserved hold is orphaned.
+
+## Process and audit readiness
+
+**12.** Turn `docs/MWEB_E2E.md` into a repeatable pre-release gate, including how to record the run.
+
+**13.** Review notes for reserved holds vs user freezes and for the lock lifecycle, pointing at the tests that pin them.
+
+**14.** Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current with new findings and residual risks.
+
+## Observability
+
+**15.** Log phase changes, hold take and release, and transition rejections with the job or coin id, from and to, and the reason, so support bundles and post-mortems are useful.

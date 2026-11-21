@@ -369,6 +369,46 @@ fn activate_parked(
     Ok(Some(summary))
 }
 
+/// The only writer of [`WalletApp::sync_phase`] during a pass. Dropped without
+/// [`SyncPass::finish`], it puts the phase back to Idle, so no early return can
+/// leave pollers reading a step that has stopped.
+struct SyncPass<'a> {
+    phase: &'a AtomicU8,
+    finished: bool,
+}
+
+impl SyncPass<'_> {
+    fn electrum(&self, full_scan: bool) {
+        self.set(if full_scan {
+            SyncPhase::ElectrumFullScan
+        } else {
+            SyncPhase::ElectrumSync
+        });
+    }
+
+    fn mweb(&self) {
+        self.set(SyncPhase::MwebDownload);
+    }
+
+    /// Done stays visible until the next pass starts.
+    fn finish(mut self) {
+        self.set(SyncPhase::Done);
+        self.finished = true;
+    }
+
+    fn set(&self, phase: SyncPhase) {
+        self.phase.store(phase.as_u8(), Ordering::Relaxed);
+    }
+}
+
+impl Drop for SyncPass<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.set(SyncPhase::Idle);
+        }
+    }
+}
+
 /// Application-facing wallet handle. BDK types stay private.
 pub struct WalletApp {
     state: Mutex<Option<WalletState>>,
@@ -437,8 +477,11 @@ impl WalletApp {
         }
     }
 
-    fn set_sync_phase(&self, phase: SyncPhase) {
-        self.sync_phase.store(phase.as_u8(), Ordering::Relaxed);
+    fn sync_pass(&self) -> SyncPass<'_> {
+        SyncPass {
+            phase: &self.sync_phase,
+            finished: false,
+        }
     }
 
     fn publish_insights(&self, state: &WalletState) {
@@ -1473,45 +1516,28 @@ impl WalletApp {
         let prev_height = prev.height();
         let prev_hash = prev.hash();
 
+        // Prefetch only warms the chain; the sync after it reports Done.
+        let pass = self.sync_pass();
         let prefer = self.remembered_electrum();
-        let (client, used) = match connect_from_meta(&meta, prefer.as_deref()) {
-            Ok(connected) => connected,
-            Err(e) => {
-                self.set_sync_phase(SyncPhase::Idle);
-                return Err(e);
-            }
-        };
+        let (client, used) = connect_from_meta(&meta, prefer.as_deref())?;
         self.remember_electrum(used);
 
         let full_scan = meta.needs_full_scan;
-        self.set_sync_phase(if full_scan {
-            SyncPhase::ElectrumFullScan
-        } else {
-            SyncPhase::ElectrumSync
-        });
-        if let Err(e) = apply_electrum_chain_update(&mut wallet, &client, full_scan) {
-            self.set_sync_phase(SyncPhase::Idle);
-            return Err(e);
-        }
+        pass.electrum(full_scan);
+        apply_electrum_chain_update(&mut wallet, &client, full_scan)?;
 
         if !chain_extended_in_place(&wallet, prev_height, prev_hash) {
             diag::log("prefetch: electrum update looked like a reorg; not persisting");
-            self.set_sync_phase(SyncPhase::Idle);
             return Ok(false);
         }
 
-        if let Err(e) = wallet.persist(&mut db) {
-            self.set_sync_phase(SyncPhase::Idle);
-            return Err(WalletError::Persist(e.to_string()));
-        }
+        wallet
+            .persist(&mut db)
+            .map_err(|e| WalletError::Persist(e.to_string()))?;
         if full_scan {
             meta.needs_full_scan = false;
-            if let Err(e) = meta::write_meta(&account_dir, &meta) {
-                self.set_sync_phase(SyncPhase::Idle);
-                return Err(e);
-            }
+            meta::write_meta(&account_dir, &meta)?;
         }
-        self.set_sync_phase(SyncPhase::Idle);
         Ok(true)
     }
 
@@ -1534,6 +1560,7 @@ impl WalletApp {
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
+        let pass = self.sync_pass();
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
         let electrum_started = std::time::Instant::now();
@@ -1547,15 +1574,8 @@ impl WalletApp {
         let did_full_scan = state.needs_full_scan;
         let prev_tip = state.last_tip_height;
 
-        self.set_sync_phase(if did_full_scan {
-            SyncPhase::ElectrumFullScan
-        } else {
-            SyncPhase::ElectrumSync
-        });
-        if let Err(e) = apply_electrum_chain_update(&mut state.wallet, &client, did_full_scan) {
-            self.set_sync_phase(SyncPhase::Idle);
-            return Err(e);
-        }
+        pass.electrum(did_full_scan);
+        apply_electrum_chain_update(&mut state.wallet, &client, did_full_scan)?;
 
         state
             .wallet
@@ -1622,7 +1642,7 @@ impl WalletApp {
         // MWEB sync (best-effort; peer failure → stale, not hard error).
         let mut mweb_ms = 0u64;
         if let Some(ref mut mweb) = state.mweb {
-            self.set_sync_phase(SyncPhase::MwebDownload);
+            pass.mweb();
             diag::log("sync: mweb download starting");
             let mweb_started = std::time::Instant::now();
             let peers = state.mweb_peers.clone();
@@ -1680,12 +1700,10 @@ impl WalletApp {
         let new_txs = tx_count_after.saturating_sub(tx_count_before) as u32;
         let summary = build_summary(state)?;
         guard.check_lock()?;
-        self.set_sync_phase(SyncPhase::Done);
+        pass.finish();
         diag::log(format!(
             "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs}"
         ));
-        // Leave Done briefly visible to pollers, then idle on next pollers' natural gap.
-        // Callers that poll after sync returns still see Done once.
         Ok(SyncResult {
             summary,
             new_txs,
@@ -1710,6 +1728,7 @@ impl WalletApp {
     fn resync_mweb_inner(&self, new_scheme: Option<MwebScheme>) -> Result<(), WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
+        let pass = self.sync_pass();
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         mweb::wipe_mweb_files(&state.data_dir)?;
         // A manual resync usually means something looked wrong, so re-crawl
@@ -1738,7 +1757,7 @@ impl WalletApp {
         let tip_height = state.wallet.latest_checkpoint().height();
         let tip_hash = state.wallet.latest_checkpoint().hash();
         if let Some(ref mut mweb) = state.mweb {
-            self.set_sync_phase(SyncPhase::MwebDownload);
+            pass.mweb();
             diag::log("resync_mweb: mweb download starting");
             let peers = state.mweb_peers.clone();
             let network = state.network;
@@ -1760,7 +1779,7 @@ impl WalletApp {
         guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         state.needs_mweb_scan = false;
-        self.set_sync_phase(SyncPhase::Done);
+        pass.finish();
         Ok(())
     }
 
@@ -6435,6 +6454,66 @@ mod lock_lifecycle_tests {
         assert!(matches!(guard.check_lock(), Err(WalletError::Locked)));
         assert!(guard.is_none());
         assert!(!app.pending_lock.load(Ordering::Acquire));
+    }
+
+    /// A resync that fails after the download step must not leave pollers
+    /// reading "downloading" until the next successful pass.
+    #[test]
+    fn failed_resync_leaves_the_sync_phase_idle() {
+        crate::discovery::go_offline_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let data_dir = {
+            let mut guard = app.state.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.mweb_peers.clear();
+            state.data_dir.clone()
+        };
+        std::fs::create_dir_all(crate::meta::mweb_seal_counter_path(&data_dir)).unwrap();
+
+        assert!(
+            app.resync_mweb().is_err(),
+            "persist cannot write the seal counter"
+        );
+
+        assert_eq!(app.mweb_sync_progress().phase, crate::SyncPhase::Idle);
+    }
+
+    #[test]
+    fn a_pass_dropped_mid_step_resets_to_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WalletApp::new(dir.path());
+        let phase = || app.mweb_sync_progress().phase;
+
+        let pass = app.sync_pass();
+        pass.electrum(true);
+        assert_eq!(phase(), crate::SyncPhase::ElectrumFullScan);
+        pass.mweb();
+        assert_eq!(phase(), crate::SyncPhase::MwebDownload);
+        drop(pass);
+
+        assert_eq!(phase(), crate::SyncPhase::Idle);
+    }
+
+    #[test]
+    fn a_finished_pass_shows_done_until_the_next_pass_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WalletApp::new(dir.path());
+        let phase = || app.mweb_sync_progress().phase;
+
+        let pass = app.sync_pass();
+        pass.electrum(false);
+        pass.finish();
+        assert_eq!(phase(), crate::SyncPhase::Done);
+
+        let next = app.sync_pass();
+        assert_eq!(
+            phase(),
+            crate::SyncPhase::Done,
+            "starting a pass writes nothing"
+        );
+        drop(next);
+        assert_eq!(phase(), crate::SyncPhase::Idle);
     }
 
     /// Unlock decrypts the mnemonic only. Loading the wallet is a separate step.

@@ -14,7 +14,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 1 | Tighten `AGENTS.md` | Planned | Done | [#24](https://github.com/LitecoinDevKit/ldk-wallet/pull/24) | Also adds this file. |
 | 2 | `SyncPass` guard for `sync_phase` | Planned | Done | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | |
 | 3 | Property tests on transition tables | High | Done | [#26](https://github.com/LitecoinDevKit/ldk-wallet/pull/26), [#27](https://github.com/LitecoinDevKit/ldk-wallet/pull/27), [#28](https://github.com/LitecoinDevKit/ldk-wallet/pull/28) | churn (500×30), lock (5×8), UI (500×30). |
-| 4 | Coin-status tests | High | Done | | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
+| 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
 | 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
 | 6 | UI action-flag consistency checks | High | Not started | | |
 | 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |

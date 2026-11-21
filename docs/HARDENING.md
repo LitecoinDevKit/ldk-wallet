@@ -4,10 +4,9 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Diagram and table checks on every PR (item 7).
-2. Logging for phase changes, holds and rejections (item 15).
-3. Untrusted input bounds (item 19).
-4. Backup and restore round-trips (item 20).
+1. Logging for phase changes, holds and rejections (item 15).
+2. Untrusted input bounds (item 19).
+3. Backup and restore round-trips (item 20).
 
 ## Status
 
@@ -19,7 +18,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
 | 5 | Error-path integration tests | High | Done | [#30](https://github.com/LitecoinDevKit/ldk-wallet/pull/30) | Offline lock races, persist failures, bad peers, foreign spend, and rejected commands. Three state-cleanup bugs fixed. |
 | 6 | UI action-flag consistency checks | High | Done | [#31](https://github.com/LitecoinDevKit/ldk-wallet/pull/31) | Pure flag-to-button mapping in `ui/src/actions.ts` and static checks in `scripts/action-flags.test.mjs`. |
-| 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |
+| 7 | Diagram and table checks on every PR | CI | Done | | Churn and lock diagram tests run in both Rust jobs; the frontend job checks the UI diagram and the phase table. |
 | 8 | Screenshot regression in CI | CI | Not started | | |
 | 9 | `cargo miri` on pure logic | CI | Not started | | |
 | 10 | Fuzz or property tests on transitions and parsers | Fuzzing | Not started | | |
@@ -104,7 +103,13 @@ Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Can
 
 ## CI and regression
 
-**7. Diagram and table checks on every PR.** `ci.yml` runs on every PR. `transition_table_matches_docs` and `lock_table_matches_docs` run inside `cargo test --workspace --locked`, and `npm run check:diagrams` runs after `npm run build`.
+**7. Diagram and table checks on every PR.** `.github/workflows/ci.yml` runs on every `pull_request` and on pushes to `main`, with no path filter. The weekly schedule skips only the Rust jobs.
+
+- `transition_table_matches_docs` and `lock_table_matches_docs` run inside `cargo test --workspace --locked` on the Ubuntu `rust` job and the Windows `rust-windows` job. They compare `churn::TRANSITIONS` and `lock::LOCK_TRANSITIONS` with the generated blocks in `docs/CHURN.md` and `docs/LOCK_LIFECYCLE.md`. `diagram::check_doc` reads those paths from `CARGO_MANIFEST_DIR`. A stale block or a missing marker fails the job. `UPDATE_DIAGRAMS` rewrites the block for a local refresh; with it unset, the test asserts the committed block.
+- The same `cargo test` runs the table checks from item 3: `table_has_one_row_per_key_and_no_exit_from_finished`, `lock_table_matches_behavior`, `lock_table_has_unique_keys_and_every_state_is_reachable`, and the churn and lock random walks.
+- The frontend job runs `npm run check:diagrams` after `npm run build`. That compares `PHASE_FROM` in `ui/src/phases.ts` with `docs/UI_PHASES.md` and exits non-zero when the block is stale. `npm run test:ui` in the same job runs the phase-table walks in `scripts/phase-table.test.mjs`.
+
+These are the only three generated diagrams (`churn-transitions`, `lock-transitions`, `ui-phases`). A changed line in any of them fails the job that owns it.
 
 **8. Screenshot regression.** Run `npm run screenshots` in CI for the coins scenes that show status chips and churn cards (`?cover=` values in `ui/src/shots-fixture.ts`).
 

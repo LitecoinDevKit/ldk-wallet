@@ -45,6 +45,14 @@ Severity: **H**igh / **M**edium / **L**ow / **I**nformational.
 | — | I | Release integrity relied on checksums alone | GitHub build provenance attestations on every artifact (`gh attestation verify`); optional minisign signing of the checksums files (drop-in via `MINISIGN_SECRET_KEY` secret) |
 | — | I | Dependency advisories were only checked when code changed | Weekly scheduled CI run of `cargo audit` / `cargo deny` / `npm audit` |
 
+## Fixed with the error-path checks
+
+| # | Sev | Finding | Fix |
+| --- | --- | --- | --- |
+| — | L | `cancel_churn` called `revert_unbroadcast_hop` before `churn::request_cancel`. A cancel rejected from `WaitingConfirm`, `Done`, or `Cancelled` still recalled an unbroadcast hop and rewrote the coin store and `mweb_frozen.json` | `request_cancel` runs first. Cancel only changes the phase, so a rejection leaves the coins and freezes as they were |
+| — | L | An armed hop can expire, or a later hop can be broadcast, while the wallet is locked. The pump then has no `WalletState`, so it records the event and leaves the coin store behind. After unlock, `list_mweb_unspent` still showed the phantom, and `retry_churn` tried to spend it. A hop broadcast while locked also left the spent coin user-frozen with Unfreeze offered | `read_account_state` runs `undo_expired_local` and `apply_pending_local` after opening the account. `retry_churn` runs `undo_expired_local` before it reads the job |
+| — | L | Signing a hop freezes both the spent output and the new one. `apply_pending_local` unlocks the spent output when a later hop is broadcast. Hop 0 is already in the coin store, so `send_armed_hop` skipped that. `note_foreign_spend` deleted `churn_armed.json` without unlocking `spent_output_id`. The freeze stayed in `mweb_frozen.json` after `Done` or cancel | Hop 0's broadcast and `note_foreign_spend` clear `spent_output_id` with `mweb_frozen::set_locked(..., false)` |
+
 ## Fixed with the coin-status checks
 
 | # | Sev | Finding | Fix |

@@ -45,6 +45,12 @@ Severity: **H**igh / **M**edium / **L**ow / **I**nformational.
 | — | I | Release integrity relied on checksums alone | GitHub build provenance attestations on every artifact (`gh attestation verify`); optional minisign signing of the checksums files (drop-in via `MINISIGN_SECRET_KEY` secret) |
 | — | I | Dependency advisories were only checked when code changed | Weekly scheduled CI run of `cargo audit` / `cargo deny` / `npm audit` |
 
+## Fixed with the coin-status checks
+
+| # | Sev | Finding | Fix |
+| --- | --- | --- | --- |
+| — | L | `set_mweb_utxo_locked` and `set_utxo_locked` accepted Freeze or Unfreeze when `coin_status` / `public_coin_status` left the flag off: a pending or maturing private coin, a coin a self-spend holds, and a repeat of the current freeze | The commands refuse unless the listed coin's `freeze` or `unfreeze` flag is set. A coin that is not listed can still be cleared, so a stale freeze does not get stuck |
+
 ## `bdk_mweb` security hardening pass
 
 `LitecoinDevKit/bdk` has been through a security pass covering `crates/mweb`

@@ -1704,6 +1704,196 @@ mod tests {
         }
     }
 
+    /// Doc order for [`coin_status`], written as a list so it is not a copy of the `if` chain.
+    fn spec_private(f: &CoinFacts) -> (CoinStatus, Option<CoinBlock>) {
+        let churning = f.churn_phase.is_some_and(ChurnPhase::is_active);
+        let status = [
+            (CoinStatus::Churning, churning),
+            (CoinStatus::Sending, f.reserved),
+            (CoinStatus::Pending, !f.mature && f.confirmations == 0),
+            (CoinStatus::Maturing, !f.mature),
+            (CoinStatus::Frozen, f.locked),
+            (
+                CoinStatus::TiedToPegin,
+                f.from_pegin && f.non_solo_blocks == Some(0),
+            ),
+            (CoinStatus::Ready, true),
+        ]
+        .into_iter()
+        .find(|(_, applies)| *applies)
+        .unwrap()
+        .0;
+        let blocked = [
+            (CoinBlock::Churning, churning),
+            (CoinBlock::Sending, f.reserved),
+            (CoinBlock::Frozen, f.locked),
+            (CoinBlock::Unconfirmed, !f.mature && f.confirmations == 0),
+            (
+                CoinBlock::Maturing {
+                    blocks_left: f.maturity_blocks_left,
+                },
+                !f.mature,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, applies)| *applies)
+        .map(|(block, _)| block);
+        (status, blocked)
+    }
+
+    #[test]
+    fn coin_status_holds_for_every_fact_combination() {
+        let phases = std::iter::once(None).chain(ChurnPhase::ALL.map(Some));
+        let maturities = [
+            (0, false, 6), // pending
+            (2, false, 4), // maturing peg-in
+            (10, true, 0), // mature
+        ];
+        let mut seen = 0usize;
+        for churn_phase in phases {
+            for reserved in [false, true] {
+                for locked in [false, true] {
+                    for (confirmations, mature, maturity_blocks_left) in maturities {
+                        for from_pegin in [false, true] {
+                            for non_solo_blocks in [None, Some(0), Some(1)] {
+                                let facts = CoinFacts {
+                                    confirmations,
+                                    mature,
+                                    maturity_blocks_left,
+                                    locked,
+                                    reserved,
+                                    from_pegin,
+                                    non_solo_blocks,
+                                    churn_phase,
+                                };
+                                let (status, actions) = coin_status(&facts);
+                                let (want_status, want_blocked) = spec_private(&facts);
+                                assert_eq!(status, want_status, "{facts:?}");
+                                assert_eq!(actions.blocked, want_blocked, "{facts:?}");
+                                let spend = actions.blocked.is_none();
+                                assert_eq!(
+                                    (
+                                        actions.spend_to_self,
+                                        actions.split,
+                                        actions.transfer,
+                                        actions.select,
+                                        actions.freeze,
+                                    ),
+                                    (spend, spend, spend, spend, spend),
+                                    "{facts:?}"
+                                );
+                                assert_eq!(
+                                    spend,
+                                    matches!(status, CoinStatus::Ready | CoinStatus::TiedToPegin),
+                                    "{facts:?}"
+                                );
+                                let churning = facts.churn_phase.is_some_and(ChurnPhase::is_active);
+                                if facts.reserved || churning {
+                                    assert!(
+                                        !actions.spend_to_self
+                                            && !actions.split
+                                            && !actions.transfer
+                                            && !actions.select
+                                            && !actions.freeze
+                                            && !actions.unfreeze,
+                                        "a hold is not a freeze the user can undo: {facts:?}"
+                                    );
+                                }
+                                if facts.locked && !facts.reserved && !churning {
+                                    assert!(actions.unfreeze, "{facts:?}");
+                                }
+                                if !facts.locked {
+                                    assert!(!actions.unfreeze, "{facts:?}");
+                                }
+                                assert!(
+                                    !(actions.freeze && actions.unfreeze),
+                                    "freeze and unfreeze are never both on: {facts:?}"
+                                );
+                                if status == CoinStatus::Churning {
+                                    assert_eq!(actions.blocked, Some(CoinBlock::Churning));
+                                }
+                                if status == CoinStatus::Sending {
+                                    assert_eq!(actions.blocked, Some(CoinBlock::Sending));
+                                }
+                                if let Some(CoinBlock::Maturing { blocks_left }) = actions.blocked {
+                                    assert_eq!(blocks_left, facts.maturity_blocks_left);
+                                }
+                                seen += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 8 * 2 * 2 * 3 * 2 * 3);
+    }
+
+    /// Doc order for [`public_coin_status`].
+    fn spec_public(f: &PublicCoinFacts) -> (CoinStatus, Option<CoinBlock>) {
+        let status = [
+            (CoinStatus::Sending, f.reserved),
+            (CoinStatus::Pending, f.confirmations == 0),
+            (CoinStatus::Frozen, f.locked),
+            (CoinStatus::Ready, true),
+        ]
+        .into_iter()
+        .find(|(_, applies)| *applies)
+        .unwrap()
+        .0;
+        let blocked = [
+            (CoinBlock::Sending, f.reserved),
+            (CoinBlock::Frozen, f.locked),
+            (CoinBlock::Unconfirmed, f.confirmations == 0),
+        ]
+        .into_iter()
+        .find(|(_, applies)| *applies)
+        .map(|(block, _)| block);
+        (status, blocked)
+    }
+
+    #[test]
+    fn public_coin_status_holds_for_every_fact_combination() {
+        let mut seen = 0usize;
+        for confirmations in [0, 1, 6] {
+            for locked in [false, true] {
+                for reserved in [false, true] {
+                    let facts = public_facts(confirmations, locked, reserved);
+                    let (status, actions) = public_coin_status(&facts);
+                    let (want_status, want_blocked) = spec_public(&facts);
+                    assert_eq!(status, want_status, "{facts:?}");
+                    assert_eq!(actions.blocked, want_blocked, "{facts:?}");
+                    assert!(!actions.spend_to_self, "{facts:?}");
+                    let free = !facts.reserved && !facts.locked;
+                    assert_eq!((actions.select, actions.freeze), (free, free), "{facts:?}");
+                    let spend = actions.blocked.is_none();
+                    assert_eq!(
+                        (actions.split, actions.transfer),
+                        (spend, spend),
+                        "{facts:?}"
+                    );
+                    assert_eq!(
+                        actions.unfreeze,
+                        facts.locked && !facts.reserved,
+                        "{facts:?}"
+                    );
+                    if facts.reserved {
+                        assert!(
+                            !actions.spend_to_self
+                                && !actions.split
+                                && !actions.transfer
+                                && !actions.select
+                                && !actions.freeze
+                                && !actions.unfreeze,
+                            "a hold is not a freeze the user can undo: {facts:?}"
+                        );
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 12);
+    }
+
     #[test]
     fn pegin_blocks_left_only_while_a_pegin_matures() {
         assert_eq!(
@@ -2998,6 +3188,7 @@ pub fn list_mweb_unspent(
 }
 
 /// What [`coin_status`] reads about one coin.
+#[derive(Debug)]
 pub(crate) struct CoinFacts {
     pub confirmations: u32,
     pub mature: bool,
@@ -3061,6 +3252,7 @@ pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
 }
 
 /// What [`public_coin_status`] reads about one public coin.
+#[derive(Debug)]
 pub(crate) struct PublicCoinFacts {
     pub confirmations: u32,
     /// Frozen by the user (BDK wallet lock).
@@ -3105,6 +3297,21 @@ pub(crate) fn public_coin_status(f: &PublicCoinFacts) -> (CoinStatus, CoinAction
         blocked,
     };
     (status, actions)
+}
+
+/// The sentence a freeze command shows when [`CoinActions`] blocks that request.
+///
+/// Churning and sending reuse the sentences the older checks already return.
+pub(crate) fn coin_block_message(block: CoinBlock) -> String {
+    match block {
+        CoinBlock::Churning => "A self-spend has this coin.".into(),
+        CoinBlock::Sending => mweb_frozen::RESERVED_MESSAGE.into(),
+        CoinBlock::Frozen => "This coin is frozen.".into(),
+        CoinBlock::Unconfirmed => "This coin is not confirmed yet.".into(),
+        CoinBlock::Maturing { blocks_left } => {
+            format!("This coin is still maturing ({blocks_left} blocks left).")
+        }
+    }
 }
 
 /// Blocks left before a peg-in's private coin is spendable, or `None` once it is.

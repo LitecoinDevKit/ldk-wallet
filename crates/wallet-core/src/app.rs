@@ -1059,7 +1059,12 @@ impl WalletApp {
             .ok_or(WalletError::MissingMnemonic)?;
         let secret = MasterSecret::from_stored(&stored)?;
         mweb_frozen::clear_stale(account_dir, &self.session)?;
-        open_wallet_state(account_dir, &meta, &secret, self.secrets.sealing_key())
+        let mut state = open_wallet_state(account_dir, &meta, &secret, self.secrets.sealing_key())?;
+        // A hop can expire or land while the wallet is locked, when the pump has
+        // no `WalletState` to update. Catch the coin store up before anyone lists it.
+        let _ = undo_expired_local(&mut state);
+        let _ = apply_pending_local(&mut state);
+        Ok(state)
     }
 
     pub fn summary(&self) -> Result<WalletSummary, WalletError> {
@@ -2351,6 +2356,9 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        // The load path also does this. Retry can run on a state that was already
+        // open when the armed hop expired, so it has to reconcile before it signs.
+        undo_expired_local(state)?;
         let mut job = churn::read_job(&state.data_dir)?
             .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
         churn::request_retry(&mut job)?;
@@ -2372,9 +2380,11 @@ impl WalletApp {
         let mut job = churn::read_job(&state.data_dir)?
             .ok_or_else(|| WalletError::BuildTx("There is no self-spend to cancel.".into()))?;
         let shown = job.current_output_id.clone();
+        // Reject the transition before recalling the hop. Cancel only changes the
+        // phase, so a refusal leaves the coin store and the freeze file alone.
+        churn::request_cancel(&mut job)?;
         revert_unbroadcast_hop(state, &mut job)?;
         let restored = job.current_output_id.clone();
-        churn::request_cancel(&mut job)?;
         churn::write_job(&state.data_dir, &job)?;
         let _ = churn::remove_armed(&state.data_dir);
         mweb_frozen::set_locked(&state.data_dir, &shown, false)?;
@@ -5311,10 +5321,14 @@ fn note_foreign_spend(
         if hop.local_applied && !hop.broadcast {
             let wtxid = hop.wtxid.clone();
             let created = hop.created_output_id.clone();
+            let spent = hop.spent_output_id.clone();
             if let Some(mweb) = state.mweb.as_mut() {
                 mweb::drop_unbroadcast_output(mweb, &wtxid, &created);
                 let _ = mweb.persist(&state.data_dir);
             }
+            // The hop froze the spent coin when it was signed. Nothing else
+            // unlocks it: this hop never reaches `apply_pending_local`.
+            mweb_frozen::set_locked(&state.data_dir, &spent, false)?;
         }
     }
     // An expired record would make the next pass report this as an expiry.
@@ -5341,6 +5355,7 @@ fn send_armed_hop(
     let wtxid = hop.wtxid.clone();
     let txid = hop.txid.clone();
     let created = hop.created_output_id.clone();
+    let spent = hop.spent_output_id.clone();
     let local_applied = hop.local_applied;
     match mweb::broadcast_prepared_raw(&raw, route) {
         Ok(()) => {
@@ -5353,10 +5368,12 @@ fn send_armed_hop(
             record.send_after = None;
             churn::write_job(data_dir, job)?;
             churn::write_armed(data_dir, record)?;
-            if !local_applied {
-                if let Some(state) = state {
-                    let _ = apply_pending_local(state);
-                }
+            if local_applied {
+                // Hop 0 is already in the coin store, so it skips
+                // `apply_pending_local`, which is what unlocks later hops.
+                mweb_frozen::set_locked(data_dir, &spent, false)?;
+            } else if let Some(state) = state {
+                let _ = apply_pending_local(state);
             }
             Ok(())
         }
@@ -5910,21 +5927,16 @@ mod tests {
         {
             let mut guard = app.lock_state().unwrap();
             let state = guard.as_mut().unwrap();
-            let mweb = state.mweb.as_mut().expect("mweb runtime");
             for (i, amount) in amounts.iter().enumerate() {
                 let id = [0x40 + i as u8; 32];
-                mweb.store.db_mut().insert(bdk_mweb::MwebCoin {
-                    output_id: id,
-                    commitment: [0; 33],
-                    amount: *amount,
-                    address_index: 0,
-                    blind: [0; 32],
-                    shared_secret: [0; 32],
-                    spend_key: Some([1; 32]),
-                    block_height: Some(0),
-                    is_pegin: false,
-                    leaf_index: Some(i as u64),
-                });
+                insert_private_coin(state, id, *amount, Some(0), false);
+                let _ = state
+                    .mweb
+                    .as_mut()
+                    .expect("mweb runtime")
+                    .store
+                    .db_mut()
+                    .set_leaf_index(&id, i as u64);
                 ids.push(hex::encode(id));
             }
         }
@@ -6079,13 +6091,23 @@ mod tests {
         block_height: Option<u32>,
         is_pegin: bool,
     ) {
+        // A zero blind does not open, so `MwebStore::from_changeset` drops the coin
+        // on reload and the signer refuses it. Match `persistable_coin`.
+        let mut blind: [u8; 32] = [0x0b; 32];
+        blind[0] = blind[0].wrapping_add(id[0]);
+        let commitment = bdk_mweb::crypto::switch_commit(
+            &blind,
+            amount,
+            &bdk_wallet::bitcoin::secp256k1::Secp256k1::new(),
+        )
+        .expect("test coin commitment");
         let mweb = state.mweb.as_mut().expect("mweb runtime");
         mweb.store.db_mut().insert(bdk_mweb::MwebCoin {
             output_id: id,
-            commitment: [0; 33],
+            commitment,
             amount,
             address_index: 0,
-            blind: [0; 32],
+            blind,
             shared_secret: [0; 32],
             spend_key: Some([1; 32]),
             block_height,
@@ -6863,6 +6885,8 @@ mod tests {
 
         app.cancel_churn().expect("cancel still works");
     }
+
+    mod error_path_tests;
 }
 
 /// Revealed external/internal addresses for local `is_wallet` tagging.

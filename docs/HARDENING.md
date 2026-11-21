@@ -4,8 +4,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Error-path integration tests (item 5).
-2. UI action-flag consistency checks (item 6).
+1. UI action-flag consistency checks (item 6).
 
 ## Status
 
@@ -15,7 +14,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 2 | `SyncPass` guard for `sync_phase` | Planned | Done | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | |
 | 3 | Property tests on transition tables | High | Done | [#26](https://github.com/LitecoinDevKit/ldk-wallet/pull/26), [#27](https://github.com/LitecoinDevKit/ldk-wallet/pull/27), [#28](https://github.com/LitecoinDevKit/ldk-wallet/pull/28) | churn (500×30), lock (5×8), UI (500×30). |
 | 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
-| 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
+| 5 | Error-path integration tests | High | Done | [#30](https://github.com/LitecoinDevKit/ldk-wallet/pull/30) | Offline lock races, persist failures, bad peers, foreign spend, and rejected commands. Three state-cleanup bugs fixed. |
 | 6 | UI action-flag consistency checks | High | Not started | | |
 | 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |
 | 8 | Screenshot regression in CI | CI | Not started | | |
@@ -44,7 +43,16 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 Those command tests found the mismatch: Freeze was accepted on a pending or maturing private coin, on a coin a self-spend holds, and as a no-op when the coin was already in that state (public coins included). The commands now refuse, with the blocked reason's sentence, unless the flag is set. A coin missing from the listing still follows the old path, so a stale freeze can be cleared. `ChurnPhase::ALL` is the shared phase list.
 
-**5. Error-path integration tests.** Lock races, persist failures, bad peers, foreign spend and early returns. Assert the final phase, holds and coin status. Reuse `app_with_job`, `app_with_foreign_spent_job`, `app_with_private_coins` and `discovery::go_offline_for_test()`; no network.
+**5. Error-path integration tests.** Offline tests in `app::tests::error_path_tests` (`crates/wallet-core/src/app/tests/error_path_tests.rs`). They reuse `app_with_job`, `app_with_private_coins`, `app_with_public_coins`, and `discovery::go_offline_for_test()`. Dead peers are `127.0.0.1:9` or a loopback listener the test owns. Each one checks the phase (`ChurnPhase`, `LockState`, `SyncPhase`), the holds (`reserved`, `public_reserved`, user freezes), and the coin row (`CoinStatus`, `CoinActions`).
+
+- Lock during a private send, a public split, and an MWEB resync. The spend returns an error, the state is dropped, and the in-flight hold is released. A bystander freeze stays. Resync ends at `SyncPhase::Idle` with `needs_mweb_scan` still set.
+- A locked pump that expires a hop is reconciled by `load` and by `retry_churn` before anything is signed again. A hop broadcast while locked is applied on `load`.
+- Persist failures (the seal-counter path replaced with a directory): `start_churn` leaves no job, `retry_churn` keeps the paused job, a private split takes no hold, and `set_mweb_scheme` leaves sync idle with the scan flag set.
+- Private send, peg-out, split, and transfer, and public send, transfer, and peg-in, against a dead peer or Electrum. Holds and the peg-in's temporary outpoint mask are released. A dead Electrum `sync` stays `Idle` and keeps `needs_full_scan`. Unreachable MWEB peers make `resync_mweb` finish `Done` and stale.
+- A failed churn broadcast pauses at `WaitingToBroadcast` until Retry. Unread headers leave `WaitingConfirm` waiting. `PausedUnscored` inside the inclusion grace returns to `WaitingConfirm`. After the grace, `NotIncluded` restores the original coin and sets `needs_resign`.
+- A foreign spend drops the phantom, refuses Retry, and `cancel_churn` removes `mweb_frozen.json`. Rejected `retry_churn` and `cancel_churn`, and the spend validations that return before signing, leave the job files and coins unchanged.
+
+Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Cancel` before it recalls an unbroadcast hop. `load` and `retry_churn` run `undo_expired_local` and `apply_pending_local`, so a hop that expired or was broadcast while locked is applied before the next command. `note_foreign_spend` and a broadcast of hop 0 clear the `spent_output_id` freeze, which `apply_pending_local` only cleared for later hops.
 
 **6. UI action-flag consistency.** Check that backend flags map to the expected buttons and that `ui/src/main.ts` never infers an action from a phase. The known exception is LitVM's Speed up (see `AGENTS.md`).
 

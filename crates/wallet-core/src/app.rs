@@ -6657,6 +6657,186 @@ mod lock_lifecycle_tests {
         }
     }
 
+    /// Run one deterministic random walk against `app` starting from `start`
+    /// (`Loaded` or `Locked`), using an explicit mutex-holder model
+    /// (`held: Option<StateGuard>`):
+    /// - While `held.is_some()`, only `Lock`, `CheckLock`, and `ReleaseGuard`
+    ///   are generated (`Load` and `LockWhileHeld` would deadlock on the same
+    ///   thread's mutex; `Unlock` while `LockPending` is the documented "Known
+    ///   edge" in `docs/LOCK_LIFECYCLE.md`).
+    /// - `CheckLock` drops `held` immediately after observing `Err(Locked)`,
+    ///   matching how real holders exit on `guard.check_lock()?`.
+    /// - `ReleaseGuard` drops `held`.
+    /// - Replay a single failing seed by creating `unlocked_app` once and
+    ///   calling `walk_lock(&app, dir.path(), seed, start, STEPS, &mut hits)`.
+    fn walk_lock(
+        app: &WalletApp,
+        data_dir: &Path,
+        seed: u64,
+        start: LockState,
+        steps_per_walk: usize,
+        hit_rows: &mut [bool],
+    ) {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        // Only events that can actually be called in the current mutex state:
+        // `CheckLock` and `ReleaseGuard` require a held `StateGuard`; while a
+        // guard is held, `Load` and `LockWhileHeld` would deadlock on this
+        // thread's mutex.
+        const FREE_EVENTS: [LockEvent; 4] = [
+            LockEvent::Unlock,
+            LockEvent::Load,
+            LockEvent::Lock,
+            LockEvent::LockWhileHeld,
+        ];
+        const HELD_EVENTS: [LockEvent; 3] = [
+            LockEvent::Lock,
+            LockEvent::CheckLock,
+            LockEvent::ReleaseGuard,
+        ];
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        match start {
+            LockState::Locked => app.lock(),
+            LockState::UnlockedEmpty => {
+                app.lock();
+                app.unlock(UnlockRequest {
+                    passphrase: PASSPHRASE.into(),
+                })
+                .unwrap();
+            }
+            LockState::Loaded => {
+                if app.is_locked() {
+                    app.unlock(UnlockRequest {
+                        passphrase: PASSPHRASE.into(),
+                    })
+                    .unwrap();
+                }
+                if !state_loaded(app) {
+                    app.load(data_dir).unwrap();
+                }
+            }
+            LockState::LockPending => unreachable!("walk_lock starts with no held guard"),
+        }
+        let mut held: Option<super::StateGuard<'_>> = None;
+        let mut steps: Vec<String> = Vec::with_capacity(steps_per_walk);
+
+        for step in 0..steps_per_walk {
+            let from = observe(app, held.as_ref());
+            assert_eq!(
+                from == LockState::LockPending,
+                held.is_some(),
+                "seed={seed} mutex model drifted before step {step}: state={from:?} held={}\nsteps={steps:#?}",
+                held.is_some()
+            );
+
+            let choices: &[LockEvent] = if held.is_some() {
+                &HELD_EVENTS
+            } else {
+                &FREE_EVENTS
+            };
+            let event = choices[rng.gen_range(0..choices.len())];
+
+            match event {
+                LockEvent::Unlock => {
+                    let _ = app.unlock(UnlockRequest {
+                        passphrase: PASSPHRASE.into(),
+                    });
+                }
+                LockEvent::Load => {
+                    let _ = app.load(data_dir);
+                }
+                LockEvent::Lock => app.lock(),
+                LockEvent::LockWhileHeld => {
+                    // Mirrors wallet commands: `let guard = self.lock_state()?;
+                    // let _ = guard.as_ref().ok_or(WalletError::NotLoaded)?;`
+                    if let Ok(guard) = app.lock_state() {
+                        if guard.is_some() {
+                            held = Some(guard);
+                            app.lock();
+                        }
+                    }
+                }
+                LockEvent::CheckLock => {
+                    let mut guard = held
+                        .take()
+                        .expect("CheckLock is only generated when a guard is held");
+                    let res = guard.check_lock();
+                    assert!(
+                        matches!(res, Err(WalletError::Locked)),
+                        "seed={seed} CheckLock in {from:?} expected Err(Locked), got {res:?}\nsteps={steps:#?}"
+                    );
+                    drop(guard);
+                }
+                LockEvent::ReleaseGuard => {
+                    let guard = held
+                        .take()
+                        .expect("ReleaseGuard is only generated when a guard is held");
+                    drop(guard);
+                }
+            }
+
+            let after = observe(app, held.as_ref());
+            steps.push(format!("#{step}: {from:?} + {event:?} -> {after:?}"));
+
+            assert_eq!(
+                after == LockState::LockPending,
+                held.is_some(),
+                "seed={seed} mutex model drifted after step {step}: state={after:?} held={}\nsteps={steps:#?}",
+                held.is_some()
+            );
+
+            if let Some(idx) = LOCK_TRANSITIONS
+                .iter()
+                .position(|(f, e, _)| *f == from && *e == event)
+            {
+                hit_rows[idx] = true;
+                let expected = LOCK_TRANSITIONS[idx].2;
+                assert_eq!(
+                    after, expected,
+                    "seed={seed} row ({from:?}, {event:?}) expected {expected:?}, got {after:?}\nsteps={steps:#?}"
+                );
+            } else {
+                assert_eq!(
+                    after, from,
+                    "seed={seed} unmapped event {event:?} from {from:?} changed state to {after:?}\nsteps={steps:#?}"
+                );
+            }
+        }
+
+        drop(held);
+    }
+
+    /// Model-based random walks over `LOCK_TRANSITIONS` on a real `WalletApp`.
+    /// Checks mapped transitions, unmapped no-op stability, legal `(locked,
+    /// pending, loaded)` triples via `observe()`, and full row coverage.
+    #[test]
+    fn lock_random_walks_match_table_and_cover_all_rows() {
+        const SEEDS: u64 = 5;
+        const STEPS: usize = 8;
+
+        const STARTS: [LockState; 3] = [
+            LockState::Loaded,
+            LockState::UnlockedEmpty,
+            LockState::Locked,
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let mut hit_rows = vec![false; LOCK_TRANSITIONS.len()];
+        for seed in 0..SEEDS {
+            let start = STARTS[(seed as usize) % STARTS.len()];
+            walk_lock(&app, dir.path(), seed, start, STEPS, &mut hit_rows);
+        }
+
+        for (idx, (from, event, to)) in LOCK_TRANSITIONS.iter().enumerate() {
+            assert!(
+                hit_rows[idx],
+                "row ({from:?}, {event:?} -> {to:?}) was never exercised across {SEEDS}×{STEPS} walks"
+            );
+        }
+    }
+
     /// Wipe is offered on the locked screen, so it must not need an unlock.
     #[test]
     fn wipe_works_while_locked() {

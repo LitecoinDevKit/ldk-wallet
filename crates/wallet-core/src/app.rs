@@ -1276,18 +1276,7 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let outpoint = parse_outpoint(&req.outpoint)?;
-        refuse_reserved_public(&state.data_dir, outpoint)?;
-        if req.locked {
-            state.wallet.lock_outpoint(outpoint);
-        } else {
-            state.wallet.unlock_outpoint(outpoint);
-        }
-        state
-            .wallet
-            .persist(&mut state.db)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        Ok(())
+        set_public_freeze(state, req)
     }
 
     /// Freeze or unfreeze a private (MWEB) coin (wipeable sidecar).
@@ -1299,9 +1288,7 @@ impl WalletApp {
             .mweb
             .as_ref()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-        refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
-        refuse_reserved(&state.data_dir, &req.output_id)?;
-        mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
+        set_private_freeze(state, req)
     }
 
     /// Set or clear a local UTXO label (non-secret sidecar).
@@ -3078,18 +3065,7 @@ impl MemoryBackedApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let outpoint = parse_outpoint(&req.outpoint)?;
-        refuse_reserved_public(&state.data_dir, outpoint)?;
-        if req.locked {
-            state.wallet.lock_outpoint(outpoint);
-        } else {
-            state.wallet.unlock_outpoint(outpoint);
-        }
-        state
-            .wallet
-            .persist(&mut state.db)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        Ok(())
+        set_public_freeze(state, req)
     }
 
     pub fn set_mweb_utxo_locked(&self, req: SetMwebUtxoLockedRequest) -> Result<(), WalletError> {
@@ -3098,9 +3074,7 @@ impl MemoryBackedApp {
             .lock()
             .map_err(|_| WalletError::Persist("wallet state lock poisoned".into()))?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
-        refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
-        refuse_reserved(&state.data_dir, &req.output_id)?;
-        mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
+        set_private_freeze(state, req)
     }
 
     pub fn set_utxo_label(&self, req: SetUtxoLabelRequest) -> Result<(), WalletError> {
@@ -4521,6 +4495,76 @@ fn fetch_tx_hex_litecoinspace(txid_hex: &str) -> Result<Vec<u8>, String> {
         return Err("response was not hex".into());
     }
     hex::decode(hex).map_err(|e| e.to_string())
+}
+
+/// `Err` when the request's freeze or unfreeze flag is off. `None` for the
+/// blocked reason means the coin is not frozen, so Unfreeze has nothing to do.
+fn refuse_freeze_flag(locking: bool, actions: crate::dto::CoinActions) -> Result<(), String> {
+    let allowed = if locking {
+        actions.freeze
+    } else {
+        actions.unfreeze
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(match (locking, actions.blocked) {
+        (false, None) => "This coin is not frozen.".into(),
+        (_, Some(block)) => mweb::coin_block_message(block),
+        (true, None) => "This coin cannot be frozen.".into(),
+    })
+}
+
+/// Freeze or unfreeze a private coin. A coin that is not in the listing keeps
+/// today's behaviour, so a stale freeze can still be cleared.
+fn set_private_freeze(
+    state: &WalletState,
+    req: SetMwebUtxoLockedRequest,
+) -> Result<(), WalletError> {
+    refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
+    refuse_reserved(&state.data_dir, &req.output_id)?;
+    if let Some(mweb) = state.mweb.as_ref() {
+        if let Ok(id) = mweb_frozen::normalize_output_id(&req.output_id) {
+            let tip = state.wallet.latest_checkpoint().height();
+            if let Some(row) = mweb::list_mweb_unspent(mweb, tip, &state.data_dir)
+                .into_iter()
+                .find(|row| row.output_id == id)
+            {
+                if let Err(msg) = refuse_freeze_flag(req.locked, row.actions) {
+                    return Err(WalletError::Mweb(msg));
+                }
+            }
+        }
+    }
+    mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
+}
+
+/// Freeze or unfreeze a public coin. An outpoint that is not in the listing
+/// keeps today's behaviour.
+fn set_public_freeze(
+    state: &mut WalletState,
+    req: SetUtxoLockedRequest,
+) -> Result<(), WalletError> {
+    let outpoint = parse_outpoint(&req.outpoint)?;
+    refuse_reserved_public(&state.data_dir, outpoint)?;
+    if let Some(row) = collect_unspent(state)
+        .into_iter()
+        .find(|row| row.outpoint == outpoint.to_string())
+    {
+        if let Err(msg) = refuse_freeze_flag(req.locked, row.actions) {
+            return Err(WalletError::BuildTx(msg));
+        }
+    }
+    if req.locked {
+        state.wallet.lock_outpoint(outpoint);
+    } else {
+        state.wallet.unlock_outpoint(outpoint);
+    }
+    state
+        .wallet
+        .persist(&mut state.db)
+        .map_err(|e| WalletError::Persist(e.to_string()))?;
+    Ok(())
 }
 
 fn refuse_churn_unfreeze(
@@ -5992,15 +6036,16 @@ mod tests {
         assert_eq!(row_for(&ids[0]).status, CoinStatus::Ready);
     }
 
-    /// A testnet wallet holding one confirmed public coin, with its outpoint.
-    fn app_with_public_coin(dir: &Path, amount_sats: u64) -> (WalletApp, OutPoint) {
+    /// A testnet wallet holding confirmed public coins of these amounts, with their outpoints.
+    fn app_with_public_coins(dir: &Path, amounts: &[u64]) -> (WalletApp, Vec<OutPoint>) {
         use bdk_wallet::bitcoin::hashes::Hash;
         use bdk_wallet::bitcoin::BlockHash;
         use bdk_wallet::chain::BlockId;
         use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
 
         let app = app_with_job(dir, ChurnPhase::Cancelled, false);
-        let outpoint = {
+        let mut outpoints = Vec::with_capacity(amounts.len());
+        {
             let mut guard = app.lock_state().unwrap();
             let state = guard.as_mut().unwrap();
             insert_checkpoint(
@@ -6010,12 +6055,151 @@ mod tests {
                     hash: BlockHash::all_zeros(),
                 },
             );
-            let op =
-                receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(amount_sats));
+            for amount_sats in amounts {
+                outpoints.push(receive_output_in_latest_block(
+                    &mut state.wallet,
+                    Amount::from_sat(*amount_sats),
+                ));
+            }
             state.wallet.persist(&mut state.db).unwrap();
-            op
+        }
+        (app, outpoints)
+    }
+
+    /// A testnet wallet holding one confirmed public coin, with its outpoint.
+    fn app_with_public_coin(dir: &Path, amount_sats: u64) -> (WalletApp, OutPoint) {
+        let (app, mut outpoints) = app_with_public_coins(dir, &[amount_sats]);
+        (app, outpoints.remove(0))
+    }
+
+    fn insert_private_coin(
+        state: &mut WalletState,
+        id: [u8; 32],
+        amount: u64,
+        block_height: Option<u32>,
+        is_pegin: bool,
+    ) {
+        let mweb = state.mweb.as_mut().expect("mweb runtime");
+        mweb.store.db_mut().insert(bdk_mweb::MwebCoin {
+            output_id: id,
+            commitment: [0; 33],
+            amount,
+            address_index: 0,
+            blind: [0; 32],
+            shared_secret: [0; 32],
+            spend_key: Some([1; 32]),
+            block_height,
+            is_pegin,
+            leaf_index: Some(1),
+        });
+    }
+
+    fn frozen_file_bytes(dir: &Path) -> Option<Vec<u8>> {
+        std::fs::read(mweb_frozen::frozen_path(dir)).ok()
+    }
+
+    /// Private and public coins in the states `coin_status` distinguishes.
+    /// The holds stay alive for as long as this value does.
+    struct StatusWallet {
+        app: WalletApp,
+        private_frozen: String,
+        private_held: String,
+        public_frozen: OutPoint,
+        public_held: OutPoint,
+        _private_hold: CoinHold,
+        _public_hold: CoinHold,
+    }
+
+    fn open_status_wallet(dir: &Path) -> StatusWallet {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::chain::BlockId;
+        use bdk_wallet::test_utils::{
+            insert_checkpoint, receive_output, receive_output_in_latest_block, ReceiveTo,
         };
-        (app, outpoint)
+
+        let app = app_with_job(dir, ChurnPhase::Cancelled, false);
+        let ready = [0x41; 32];
+        let frozen = [0x42; 32];
+        let held = [0x43; 32];
+        let pending = [0x44; 32];
+        let maturing = [0x45; 32];
+        let (public_frozen, public_held) = {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_private_coin(state, ready, 1_000_000, Some(0), false);
+            insert_private_coin(state, frozen, 1_000_000, Some(0), false);
+            insert_private_coin(state, held, 1_000_000, Some(0), false);
+            insert_private_coin(state, pending, 1_000_000, None, false);
+            insert_private_coin(state, maturing, 1_000_000, Some(0), true);
+            insert_checkpoint(
+                &mut state.wallet,
+                BlockId {
+                    height: 1,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            let _confirmed =
+                receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
+            let public_frozen =
+                receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
+            let public_held =
+                receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
+            let _unconfirmed = receive_output(
+                &mut state.wallet,
+                Amount::from_sat(1_000_000),
+                ReceiveTo::Mempool(1),
+            );
+            state.wallet.persist(&mut state.db).unwrap();
+            (public_frozen, public_held)
+        };
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        let private_frozen = hex::encode(frozen);
+        let private_held = hex::encode(held);
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: private_frozen.clone(),
+            locked: true,
+        })
+        .unwrap();
+        app.set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: public_frozen.to_string(),
+            locked: true,
+        })
+        .unwrap();
+        let private_hold =
+            CoinHold::take(&data_dir, vec![private_held.clone()], &app.session).unwrap();
+        let public_hold =
+            CoinHold::take_public(&data_dir, vec![public_held], &app.session).unwrap();
+        StatusWallet {
+            app,
+            private_frozen,
+            private_held,
+            public_frozen,
+            public_held,
+            _private_hold: private_hold,
+            _public_hold: public_hold,
+        }
+    }
+
+    fn assert_flag_gates_command(
+        allowed: bool,
+        result: Result<(), WalletError>,
+        before: &Option<Vec<u8>>,
+        data_dir: &Path,
+        label: &str,
+    ) {
+        match (allowed, result) {
+            (true, Ok(())) => {}
+            (false, Err(err)) => assert_eq!(
+                &frozen_file_bytes(data_dir),
+                before,
+                "{label} changed mweb_frozen.json ({err})"
+            ),
+            (true, Err(err)) => {
+                panic!("{label}: the flag allows it but the command refused: {err}")
+            }
+            (false, Ok(())) => panic!("{label}: the flag blocks it but the command accepted it"),
+        }
     }
 
     fn public_split_req(outpoint: OutPoint) -> SplitRequest {
@@ -6135,6 +6319,481 @@ mod tests {
             .public_reserved
             .is_empty());
         assert_eq!(app.list_unspent().unwrap()[0].status, CoinStatus::Ready);
+    }
+
+    fn actions_off(actions: &crate::dto::CoinActions) -> bool {
+        !actions.spend_to_self
+            && !actions.split
+            && !actions.transfer
+            && !actions.select
+            && !actions.freeze
+            && !actions.unfreeze
+    }
+
+    /// A user freeze and an in-flight hold on two private coins do not disturb each other.
+    #[test]
+    fn user_freeze_and_in_flight_hold_stay_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000, 2_000_000, 1_000_000]);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: ids[0].clone(),
+            locked: true,
+        })
+        .unwrap();
+        let hold = CoinHold::take(&data_dir, vec![ids[1].clone()], &app.session).unwrap();
+
+        let row_for = |id: &str| {
+            app.list_mweb_unspent()
+                .unwrap()
+                .into_iter()
+                .find(|coin| coin.output_id == id)
+                .unwrap()
+        };
+        let frozen = row_for(&ids[0]);
+        assert_eq!(frozen.status, CoinStatus::Frozen);
+        assert!(frozen.locked);
+        assert!(frozen.actions.unfreeze);
+        let sending = row_for(&ids[1]);
+        assert_eq!(sending.status, CoinStatus::Sending);
+        assert!(!sending.locked, "the hold is not a user freeze");
+        assert!(actions_off(&sending.actions));
+        assert_eq!(sending.actions.blocked, Some(CoinBlock::Sending));
+
+        let err = CoinHold::take(&data_dir, vec![ids[0].clone()], &app.session)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("frozen"), "{err}");
+
+        let reserved = mweb_frozen::read_ids(&data_dir).unwrap().reserved;
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: ids[2].clone(),
+            locked: true,
+        })
+        .unwrap();
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: ids[2].clone(),
+            locked: false,
+        })
+        .unwrap();
+        assert_eq!(mweb_frozen::read_ids(&data_dir).unwrap().reserved, reserved);
+
+        drop(hold);
+        assert_eq!(row_for(&ids[1]).status, CoinStatus::Ready);
+        let still_frozen = row_for(&ids[0]);
+        assert_eq!(still_frozen.status, CoinStatus::Frozen);
+        assert!(mweb_frozen::read_ids(&data_dir)
+            .unwrap()
+            .ids
+            .contains(&ids[0]));
+
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: ids[0].clone(),
+            locked: false,
+        })
+        .unwrap();
+        assert_eq!(row_for(&ids[0]).status, CoinStatus::Ready);
+        assert!(!mweb_frozen::frozen_path(&data_dir).is_file());
+    }
+
+    /// A user freeze and an in-flight hold on two public coins do not disturb each other.
+    #[test]
+    fn public_user_freeze_and_in_flight_hold_stay_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, ops) = app_with_public_coins(dir.path(), &[1_000_000, 2_000_000, 3_000_000]);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        app.set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: ops[0].to_string(),
+            locked: true,
+        })
+        .unwrap();
+        let hold = CoinHold::take_public(&data_dir, vec![ops[1]], &app.session).unwrap();
+
+        let row_for = |op: &OutPoint| {
+            app.list_unspent()
+                .unwrap()
+                .into_iter()
+                .find(|coin| coin.outpoint == op.to_string())
+                .unwrap()
+        };
+        let frozen = row_for(&ops[0]);
+        assert_eq!(frozen.status, CoinStatus::Frozen);
+        assert!(frozen.locked);
+        assert!(frozen.actions.unfreeze);
+        let sending = row_for(&ops[1]);
+        assert_eq!(sending.status, CoinStatus::Sending);
+        assert!(!sending.locked, "the hold is not a user freeze");
+        assert!(actions_off(&sending.actions));
+        assert_eq!(sending.actions.blocked, Some(CoinBlock::Sending));
+        {
+            let guard = app.lock_state().unwrap();
+            assert!(
+                !guard.as_ref().unwrap().wallet.is_outpoint_locked(ops[1]),
+                "the hold never used BDK's lock_outpoint"
+            );
+        }
+
+        let reserved = mweb_frozen::read_ids(&data_dir).unwrap().public_reserved;
+        app.set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: ops[2].to_string(),
+            locked: true,
+        })
+        .unwrap();
+        app.set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: ops[2].to_string(),
+            locked: false,
+        })
+        .unwrap();
+        assert_eq!(
+            mweb_frozen::read_ids(&data_dir).unwrap().public_reserved,
+            reserved
+        );
+
+        drop(hold);
+        let released = row_for(&ops[1]);
+        assert_eq!(released.status, CoinStatus::Ready);
+        assert!(!released.locked);
+        assert_eq!(row_for(&ops[0]).status, CoinStatus::Frozen);
+        assert!(mweb_frozen::read_ids(&data_dir)
+            .unwrap()
+            .public_reserved
+            .is_empty());
+
+        app.set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: ops[0].to_string(),
+            locked: false,
+        })
+        .unwrap();
+        let thawed = row_for(&ops[0]);
+        assert_eq!(thawed.status, CoinStatus::Ready);
+        assert!(!thawed.locked);
+    }
+
+    /// Listed rows carry exactly what `coin_status` and `public_coin_status` return.
+    #[test]
+    fn listed_rows_carry_exactly_the_status_function_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = open_status_wallet(dir.path());
+        let data_dir = wallet
+            .app
+            .lock_state()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .data_dir
+            .clone();
+        let file = mweb_frozen::read_ids(&data_dir).unwrap();
+
+        let private_rows = wallet.app.list_mweb_unspent().unwrap();
+        for status in [
+            CoinStatus::Ready,
+            CoinStatus::Frozen,
+            CoinStatus::Sending,
+            CoinStatus::Pending,
+            CoinStatus::Maturing,
+        ] {
+            assert!(
+                private_rows.iter().any(|row| row.status == status),
+                "missing private {status:?}"
+            );
+        }
+        assert_eq!(
+            private_rows
+                .iter()
+                .find(|row| row.output_id == wallet.private_frozen)
+                .unwrap()
+                .status,
+            CoinStatus::Frozen
+        );
+        assert_eq!(
+            private_rows
+                .iter()
+                .find(|row| row.output_id == wallet.private_held)
+                .unwrap()
+                .status,
+            CoinStatus::Sending
+        );
+        for row in &private_rows {
+            let (status, actions) = mweb::coin_status(&mweb::CoinFacts {
+                confirmations: row.confirmations,
+                mature: row.mature,
+                maturity_blocks_left: row.maturity_blocks_left,
+                locked: row.locked,
+                reserved: file.reserved.contains_key(&row.output_id),
+                from_pegin: row.from_pegin,
+                non_solo_blocks: row.non_solo_blocks,
+                churn_phase: row.churn_phase,
+            });
+            assert_eq!(
+                (row.status, row.actions),
+                (status, actions),
+                "{}",
+                row.output_id
+            );
+        }
+
+        let public_rows = wallet.app.list_unspent().unwrap();
+        for status in [
+            CoinStatus::Ready,
+            CoinStatus::Frozen,
+            CoinStatus::Sending,
+            CoinStatus::Pending,
+        ] {
+            assert!(
+                public_rows.iter().any(|row| row.status == status),
+                "missing public {status:?}"
+            );
+        }
+        assert_eq!(
+            public_rows
+                .iter()
+                .find(|row| row.outpoint == wallet.public_frozen.to_string())
+                .unwrap()
+                .status,
+            CoinStatus::Frozen
+        );
+        assert_eq!(
+            public_rows
+                .iter()
+                .find(|row| row.outpoint == wallet.public_held.to_string())
+                .unwrap()
+                .status,
+            CoinStatus::Sending
+        );
+        for row in &public_rows {
+            let (status, actions) = mweb::public_coin_status(&mweb::PublicCoinFacts {
+                confirmations: row.confirmations,
+                locked: row.locked,
+                reserved: file.public_reserved.contains_key(&row.outpoint),
+            });
+            assert_eq!(
+                (row.status, row.actions),
+                (status, actions),
+                "{}",
+                row.outpoint
+            );
+        }
+    }
+
+    /// `set_mweb_utxo_locked` succeeds only when the listed coin's flag says so.
+    #[test]
+    fn private_freeze_command_follows_the_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_job(dir.path(), ChurnPhase::WaitingForCover, false);
+        let data_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+        let churn_hex = churn::read_job(&data_dir)
+            .unwrap()
+            .unwrap()
+            .current_output_id;
+        let churn_id: [u8; 32] = hex::decode(&churn_hex).unwrap().try_into().unwrap();
+        let ready = [0x51; 32];
+        let frozen = [0x52; 32];
+        let held = [0x53; 32];
+        let pending = [0x54; 32];
+        let maturing = [0x55; 32];
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_private_coin(state, churn_id, 1_000_000, Some(0), false);
+            insert_private_coin(state, ready, 1_000_000, Some(0), false);
+            insert_private_coin(state, frozen, 1_000_000, Some(0), false);
+            insert_private_coin(state, held, 1_000_000, Some(0), false);
+            insert_private_coin(state, pending, 1_000_000, None, false);
+            insert_private_coin(state, maturing, 1_000_000, Some(0), true);
+        }
+        let frozen_id = hex::encode(frozen);
+        let held_id = hex::encode(held);
+        app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: frozen_id.clone(),
+            locked: true,
+        })
+        .unwrap();
+        let _hold = CoinHold::take(&data_dir, vec![held_id.clone()], &app.session).unwrap();
+
+        let rows = app.list_mweb_unspent().unwrap();
+        for status in [
+            CoinStatus::Churning,
+            CoinStatus::Ready,
+            CoinStatus::Frozen,
+            CoinStatus::Sending,
+            CoinStatus::Pending,
+            CoinStatus::Maturing,
+        ] {
+            assert!(
+                rows.iter().any(|row| row.status == status),
+                "missing {status:?}"
+            );
+        }
+
+        let ids: Vec<String> = rows.into_iter().map(|row| row.output_id).collect();
+        for id in ids {
+            for locked in [true, false] {
+                let row = app
+                    .list_mweb_unspent()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.output_id == id)
+                    .unwrap();
+                let allowed = if locked {
+                    row.actions.freeze
+                } else {
+                    row.actions.unfreeze
+                };
+                let before = frozen_file_bytes(&data_dir);
+                let result = app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+                    output_id: id.clone(),
+                    locked,
+                });
+                assert_flag_gates_command(
+                    allowed,
+                    result,
+                    &before,
+                    &data_dir,
+                    &format!("{} locked={locked} ({:?})", id, row.status),
+                );
+            }
+        }
+    }
+
+    /// `set_utxo_locked` succeeds only when the listed coin's flag says so.
+    #[test]
+    fn public_freeze_command_follows_the_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = open_status_wallet(dir.path());
+        let data_dir = wallet
+            .app
+            .lock_state()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .data_dir
+            .clone();
+        let rows = wallet.app.list_unspent().unwrap();
+        for status in [
+            CoinStatus::Ready,
+            CoinStatus::Pending,
+            CoinStatus::Frozen,
+            CoinStatus::Sending,
+        ] {
+            assert!(
+                rows.iter().any(|row| row.status == status),
+                "missing {status:?}"
+            );
+        }
+        let outpoints: Vec<String> = rows.into_iter().map(|row| row.outpoint).collect();
+        for outpoint in outpoints {
+            for locked in [true, false] {
+                let row = wallet
+                    .app
+                    .list_unspent()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.outpoint == outpoint)
+                    .unwrap();
+                let allowed = if locked {
+                    row.actions.freeze
+                } else {
+                    row.actions.unfreeze
+                };
+                let locked_before = {
+                    let guard = wallet.app.lock_state().unwrap();
+                    guard
+                        .as_ref()
+                        .unwrap()
+                        .wallet
+                        .is_outpoint_locked(OutPoint::from_str(&outpoint).unwrap())
+                };
+                let before = frozen_file_bytes(&data_dir);
+                let result = wallet.app.set_utxo_locked(SetUtxoLockedRequest {
+                    outpoint: outpoint.clone(),
+                    locked,
+                });
+                let refused = result.is_err();
+                assert_flag_gates_command(
+                    allowed,
+                    result,
+                    &before,
+                    &data_dir,
+                    &format!("{outpoint} locked={locked} ({:?})", row.status),
+                );
+                if refused {
+                    let guard = wallet.app.lock_state().unwrap();
+                    assert_eq!(
+                        guard
+                            .as_ref()
+                            .unwrap()
+                            .wallet
+                            .is_outpoint_locked(OutPoint::from_str(&outpoint).unwrap()),
+                        locked_before,
+                        "{outpoint} lock bit changed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spending a selected coin succeeds exactly when its `select` flag is set.
+    #[test]
+    fn select_flag_matches_spend_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = open_status_wallet(dir.path());
+
+        {
+            let guard = wallet.app.lock_state().unwrap();
+            let state = guard.as_ref().unwrap();
+            let mweb = state.mweb.as_ref().unwrap();
+            let tip = state.wallet.latest_checkpoint().height();
+            let frozen = mweb_frozen::unavailable_ids(&state.data_dir).unwrap();
+            let rows = mweb::list_mweb_unspent(mweb, tip, &state.data_dir);
+            assert!(
+                rows.len() >= 5,
+                "expected every private status, got {}",
+                rows.len()
+            );
+            for row in rows {
+                let result = mweb::resolve_spend_coins(
+                    mweb.store.db(),
+                    tip,
+                    &frozen,
+                    Some(std::slice::from_ref(&row.output_id)),
+                    1,
+                    "spending",
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    row.actions.select,
+                    "{} ({:?}): {result:?}",
+                    row.output_id,
+                    row.status
+                );
+            }
+        }
+
+        let address = wallet.app.receive_address().unwrap();
+        let mut guard = wallet.app.lock_state().unwrap();
+        let state = guard.as_mut().unwrap();
+        let cases: Vec<(String, bool, CoinStatus)> = collect_unspent(state)
+            .into_iter()
+            .map(|row| (row.outpoint, row.actions.select, row.status))
+            .collect();
+        assert!(cases.len() >= 4, "expected every public status");
+        for (outpoint, select, status) in cases {
+            let result = build_send_psbt(
+                state,
+                &SendRequest {
+                    address: address.clone(),
+                    amount_sats: 10_000,
+                    fee_rate_sat_vb: Some(1),
+                    drain: false,
+                    selected_outpoints: Some(vec![outpoint.clone()]),
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                select,
+                "{outpoint} ({status:?}): {result:?}"
+            );
+        }
     }
 
     /// A hold written by an earlier process is gone after the next load.

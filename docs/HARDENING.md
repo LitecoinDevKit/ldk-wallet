@@ -4,9 +4,8 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Coin-status and public-coin-status tests (item 4).
-2. Error-path integration tests (item 5).
-3. UI action-flag consistency checks (item 6).
+1. Error-path integration tests (item 5).
+2. UI action-flag consistency checks (item 6).
 
 ## Status
 
@@ -15,7 +14,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 1 | Tighten `AGENTS.md` | Planned | Done | [#24](https://github.com/LitecoinDevKit/ldk-wallet/pull/24) | Also adds this file. |
 | 2 | `SyncPass` guard for `sync_phase` | Planned | Done | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | |
 | 3 | Property tests on transition tables | High | Done | [#26](https://github.com/LitecoinDevKit/ldk-wallet/pull/26), [#27](https://github.com/LitecoinDevKit/ldk-wallet/pull/27), [#28](https://github.com/LitecoinDevKit/ldk-wallet/pull/28) | churn (500×30), lock (5×8), UI (500×30). |
-| 4 | Coin-status tests | High | Not started | | |
+| 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
 | 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
 | 6 | UI action-flag consistency checks | High | Not started | | |
 | 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |
@@ -41,7 +40,9 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 - Lock (`lock_random_walks_match_table_and_cover_all_rows` in `crates/wallet-core/src/app.rs` and `lock_table_has_unique_keys_and_every_state_is_reachable` in `crates/wallet-core/src/lock.rs`): 5 seeds × 8 steps on a real `WalletApp` with an explicit mutex-holder model, covering every row of `LOCK_TRANSITIONS`. Replay with `cargo test -p wallet-core lock_random_walks_match_table_and_cover_all_rows` (or call `walk_lock(&app, dir.path(), seed, start, 8, &mut hits)` to isolate one seed).
 - UI (`scripts/phase-table.test.mjs` testing `canEnter` and `PHASE_FROM` in `ui/src/phases.ts`): 500 seeds × 30 steps plus reachability, `fatal` exit, and self-loop checks, run in CI via `npm run test:ui` (or call `walkUi(seed)` to isolate one seed).
 
-**4. Coin-status tests.** Cover the priority order documented on `mweb::coin_status` and `mweb::public_coin_status`, and the difference between an in-flight hold (`reserved`, `public_reserved`) and the user's Freeze. Assert that buttons come only from the returned flags.
+**4. Coin-status tests.** `coin_status_holds_for_every_fact_combination` and `public_coin_status_holds_for_every_fact_combination` (in `crates/wallet-core/src/mweb.rs`) walk every fact combination against the documented priority order. Buttons come only from the returned flags: the spend buttons are on exactly when nothing blocks the coin, a hold turns every button off, and a user freeze stays undoable. `user_freeze_and_in_flight_hold_stay_separate` and `public_user_freeze_and_in_flight_hold_stay_separate` keep a user freeze and an in-flight hold on different coins. `listed_rows_carry_exactly_the_status_function_output` checks each listed row equals the status function. `select_flag_matches_spend_resolution` checks private and public spend selection against `select` (an unconfirmed public coin stays selectable). `private_freeze_command_follows_the_flags` and `public_freeze_command_follows_the_flags` make `set_mweb_utxo_locked` and `set_utxo_locked` succeed only when the listed coin's `freeze` or `unfreeze` flag is set.
+
+Those command tests found the mismatch: Freeze was accepted on a pending or maturing private coin, on a coin a self-spend holds, and as a no-op when the coin was already in that state (public coins included). The commands now refuse, with the blocked reason's sentence, unless the flag is set. A coin missing from the listing still follows the old path, so a stale freeze can be cleared. `ChurnPhase::ALL` is the shared phase list.
 
 **5. Error-path integration tests.** Lock races, persist failures, bad peers, foreign spend and early returns. Assert the final phase, holds and coin status. Reuse `app_with_job`, `app_with_foreign_spent_job`, `app_with_private_coins` and `discovery::go_offline_for_test()`; no network.
 

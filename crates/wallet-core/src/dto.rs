@@ -1050,6 +1050,38 @@ impl ChurnPhase {
     }
 }
 
+/// Every phase, shared by the churn and coin-status tests.
+///
+/// [`churn_phase_all_is_exhaustive`] fails to compile when a phase is added, so
+/// this list gets updated too.
+#[cfg(test)]
+impl ChurnPhase {
+    pub(crate) const ALL: [ChurnPhase; 7] = [
+        ChurnPhase::WaitingToBroadcast,
+        ChurnPhase::WaitingForCover,
+        ChurnPhase::WaitingConfirm,
+        ChurnPhase::PausedSolo,
+        ChurnPhase::PausedUnscored,
+        ChurnPhase::Done,
+        ChurnPhase::Cancelled,
+    ];
+}
+
+/// Fails to compile when a phase is added, so [`ChurnPhase::ALL`] gets updated too.
+#[cfg(test)]
+#[allow(dead_code)]
+fn churn_phase_all_is_exhaustive(phase: ChurnPhase) {
+    match phase {
+        ChurnPhase::WaitingToBroadcast
+        | ChurnPhase::WaitingForCover
+        | ChurnPhase::WaitingConfirm
+        | ChurnPhase::PausedSolo
+        | ChurnPhase::PausedUnscored
+        | ChurnPhase::Done
+        | ChurnPhase::Cancelled => {}
+    }
+}
+
 /// Start or preview a self-spend. `target_depth` of 0 means one hop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChurnRequest {

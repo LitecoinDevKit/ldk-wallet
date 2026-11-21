@@ -1425,30 +1425,6 @@ mod tests {
         job
     }
 
-    const ALL_PHASES: [ChurnPhase; 7] = [
-        ChurnPhase::WaitingToBroadcast,
-        ChurnPhase::WaitingForCover,
-        ChurnPhase::WaitingConfirm,
-        ChurnPhase::PausedSolo,
-        ChurnPhase::PausedUnscored,
-        ChurnPhase::Done,
-        ChurnPhase::Cancelled,
-    ];
-
-    /// Fails to compile when a phase is added, so `ALL_PHASES` gets updated too.
-    #[allow(dead_code)]
-    fn all_phases_is_exhaustive(phase: ChurnPhase) {
-        match phase {
-            ChurnPhase::WaitingToBroadcast
-            | ChurnPhase::WaitingForCover
-            | ChurnPhase::WaitingConfirm
-            | ChurnPhase::PausedSolo
-            | ChurnPhase::PausedUnscored
-            | ChurnPhase::Done
-            | ChurnPhase::Cancelled => {}
-        }
-    }
-
     fn sample_event(kind: ChurnEventKind) -> ChurnEvent<'static> {
         use ChurnEventKind as E;
         let mixed = HopScore::Mixed {
@@ -1483,7 +1459,7 @@ mod tests {
     /// `transition` accepts exactly the table rows, and a rejected event leaves the job untouched.
     #[test]
     fn transition_accepts_exactly_the_table() {
-        for from in ALL_PHASES {
+        for from in ChurnPhase::ALL {
             for kind in ChurnEventKind::ALL {
                 // A mixed score finishes the job only when it reaches the target.
                 let target = if kind == ChurnEventKind::ScoredMixed {

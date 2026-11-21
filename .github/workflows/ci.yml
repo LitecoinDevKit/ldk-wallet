@@ -60,6 +60,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked
 
+      # Includes transition_table_matches_docs and lock_table_matches_docs,
+      # which fail when docs/CHURN.md or docs/LOCK_LIFECYCLE.md is stale.
       - name: Tests
         run: cargo test --workspace --locked
 
@@ -80,6 +82,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Includes transition_table_matches_docs and lock_table_matches_docs,
+      # which fail when docs/CHURN.md or docs/LOCK_LIFECYCLE.md is stale.
       - name: Tests
         run: cargo test --workspace --locked
 

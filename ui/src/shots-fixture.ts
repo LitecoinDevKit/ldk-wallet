@@ -378,7 +378,7 @@ function series(
     values,
     latest: values[values.length - 1] ?? null,
     change_pct: change,
-    litview_path: "/charts",
+    litview_path: "/studio/",
   };
 }
 

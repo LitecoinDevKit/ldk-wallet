@@ -197,6 +197,12 @@ async function capture(page, theme) {
     });
     await page.locator(".content").screenshot({ path: out("send.png"), animations: "disabled" });
 
+    await page.locator("#send-unit-usd").click();
+    await page.locator("#send-amount").fill("25");
+    await page.locator("#send-amount-fiat", { hasText: "at $" }).waitFor();
+    await page.locator(".content").screenshot({ path: out("send-usd.png"), animations: "disabled" });
+    await page.locator("#send-unit-coin").click();
+
     await page.locator("#nav-swap").waitFor({ state: "visible" });
     await page.locator("#nav-swap").click();
     await page.getByRole("button", { name: "Move to private" }).waitFor();
@@ -216,6 +222,12 @@ async function capture(page, theme) {
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     });
     await page.locator(".content").screenshot({ path: out("swap.png"), animations: "disabled" });
+
+    await page.locator("#pegin-unit-usd").click();
+    await page.locator("#pegin-amount").fill("100");
+    await page.locator("#pegin-amount-fiat", { hasText: "at $" }).waitFor();
+    await page.locator(".content").screenshot({ path: out("swap-usd.png"), animations: "disabled" });
+    await page.locator("#pegin-unit-coin").click();
 
     await page.locator("#nav-receive").click();
     await page.locator("#address", { hasText: "ltc1qsampledata" }).waitFor();

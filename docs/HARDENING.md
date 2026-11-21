@@ -14,7 +14,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 |---|------|----------|--------|----|-------|
 | 1 | Tighten `AGENTS.md` | Planned | Done | [#24](https://github.com/LitecoinDevKit/ldk-wallet/pull/24) | Also adds this file. |
 | 2 | `SyncPass` guard for `sync_phase` | Planned | Done | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | |
-| 3 | Property tests on transition tables | High | Not started | | |
+| 3 | Property tests on transition tables | High | In progress | [#26](https://github.com/LitecoinDevKit/ldk-wallet/pull/26) | churn done (500×30 walks). |
 | 4 | Coin-status tests | High | Not started | | |
 | 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
 | 6 | UI action-flag consistency checks | High | Not started | | |
@@ -36,7 +36,10 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## High-value automated checks
 
-**3. Property tests on transition tables.** For `churn::TRANSITIONS`, `lock::LOCK_TRANSITIONS` and `PHASE_FROM` in `ui/src/phases.ts`: every phase and event gives either a legal next phase or a clean rejection, and terminal states have no exits. Today `table_has_one_row_per_key_and_no_exit_from_finished` and `every_lock_ends_locked` cover parts of this; there is no proptest dependency yet.
+**3. Property tests on transition tables.** For `churn::TRANSITIONS`, `lock::LOCK_TRANSITIONS` and `PHASE_FROM` in `ui/src/phases.ts`: every phase and event gives either a legal next phase or a clean rejection, and terminal states have no exits. Uses seeded random walks with no new dependencies (existing `rand` crate in Rust, mulberry32 in Node). If a walk finds a real bug, report it with the failing seed instead of fixing the table or code in the test PR.
+- Churn (`churn_random_walks_hold_all_invariants` in `crates/wallet-core/src/churn.rs`): 500 seeds × 30 steps. Replay with `cargo test -p wallet-core churn_random_walks_hold_all_invariants` (or call `walk_churn(seed)` to isolate one seed).
+- Lock (`lock::LOCK_TRANSITIONS`): pending.
+- UI (`PHASE_FROM` in `ui/src/phases.ts`): pending.
 
 **4. Coin-status tests.** Cover the priority order documented on `mweb::coin_status` and `mweb::public_coin_status`, and the difference between an in-flight hold (`reserved`, `public_reserved`) and the user's Freeze. Assert that buttons come only from the returned flags.
 

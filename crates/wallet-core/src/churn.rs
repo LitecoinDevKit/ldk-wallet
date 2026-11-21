@@ -1617,6 +1617,204 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct WalkCoverage {
+        reached_scored_final: bool,
+        reached_done: bool,
+        reached_cancelled: bool,
+        reached_foreign_spend: bool,
+    }
+
+    /// Run one deterministic random walk over `ChurnEventKind::ALL`.
+    /// Replay a single failing seed by calling `walk_churn(seed)` in a test.
+    fn walk_churn(seed: u64) -> WalkCoverage {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let target_depth = rng.gen_range(1..=4);
+        let mut job = new_job(&"ab".repeat(32), false, target_depth, 50_000, 2, false).unwrap();
+        let mut steps: Vec<String> = Vec::with_capacity(30);
+        let mut cov = WalkCoverage::default();
+
+        for step in 0..30 {
+            let picked = ChurnEventKind::ALL[rng.gen_range(0..ChurnEventKind::ALL.len())];
+            let event = sample_event(picked);
+            // Classify against the current job before `transition` mutates depth.
+            let actual = event.kind(&job);
+            let before = job.clone();
+            let from = before.phase;
+            let expected = check(&before, actual);
+
+            let result = transition(&mut job, event);
+            steps.push(format!(
+                "#{step}: {from:?} picked={picked:?} actual={actual:?} -> {:?}",
+                result.as_ref().map(|()| job.phase)
+            ));
+
+            // 1. Result agrees with `check` and `next_phase`.
+            match expected {
+                Ok(to) => {
+                    assert!(
+                        result.is_ok(),
+                        "seed={seed} target={target_depth} expected Ok({to:?}), got {result:?}\nsteps={steps:#?}"
+                    );
+                    assert_eq!(
+                        next_phase(from, actual),
+                        Some(to),
+                        "seed={seed} target={target_depth} check/next_phase mismatch\nsteps={steps:#?}"
+                    );
+                    assert_eq!(
+                        job.phase, to,
+                        "seed={seed} target={target_depth} wrong target phase\nsteps={steps:#?}"
+                    );
+                }
+                Err(_) => {
+                    assert!(
+                        result.is_err(),
+                        "seed={seed} target={target_depth} expected Err, got Ok\nsteps={steps:#?}"
+                    );
+                    // 2. A rejected event leaves the whole job unchanged.
+                    assert_eq!(
+                        job, before,
+                        "seed={seed} target={target_depth} rejected event mutated job\nsteps={steps:#?}"
+                    );
+                }
+            }
+
+            // 3. Terminal states reject every event, never move, and offer no buttons.
+            if matches!(from, ChurnPhase::Done | ChurnPhase::Cancelled) {
+                assert!(
+                    result.is_err(),
+                    "seed={seed} target={target_depth} left terminal state {from:?}\nsteps={steps:#?}"
+                );
+                assert_eq!(
+                    job.phase, from,
+                    "seed={seed} target={target_depth} changed terminal phase\nsteps={steps:#?}"
+                );
+            }
+            if matches!(job.phase, ChurnPhase::Done | ChurnPhase::Cancelled) {
+                assert_eq!(
+                    allowed_actions(&job),
+                    ChurnActions {
+                        retry: false,
+                        cancel: false,
+                        open_settings: false,
+                    },
+                    "seed={seed} target={target_depth} terminal state offered actions\nsteps={steps:#?}"
+                );
+            }
+
+            // 4. `effective_depth` is monotonic and bounded by `target_depth`.
+            assert!(
+                job.effective_depth >= before.effective_depth,
+                "seed={seed} target={target_depth} effective_depth decreased\nsteps={steps:#?}"
+            );
+            assert!(
+                job.effective_depth <= job.target_depth,
+                "seed={seed} target={target_depth} effective_depth exceeded target\nsteps={steps:#?}"
+            );
+
+            // 5. `input_spent_elsewhere` is sticky and always blocks Retry with FOREIGN_SPEND.
+            if before.input_spent_elsewhere {
+                assert!(
+                    job.input_spent_elsewhere,
+                    "seed={seed} target={target_depth} cleared input_spent_elsewhere\nsteps={steps:#?}"
+                );
+            }
+            if job.input_spent_elsewhere {
+                let mut probe = job.clone();
+                let err = transition(&mut probe, ChurnEvent::Retry)
+                    .expect_err("foreign spend must reject Retry")
+                    .to_string();
+                assert!(
+                    err.contains(FOREIGN_SPEND),
+                    "seed={seed} target={target_depth} wrong foreign-spend error: {err}\nsteps={steps:#?}"
+                );
+                assert_eq!(
+                    probe, job,
+                    "seed={seed} target={target_depth} rejected Retry mutated job\nsteps={steps:#?}"
+                );
+            }
+
+            // 6. Backend action flags agree with the table in both directions.
+            let actions = allowed_actions(&job);
+            if actions.retry {
+                let mut probe = job.clone();
+                assert!(
+                    transition(&mut probe, ChurnEvent::Retry).is_ok(),
+                    "seed={seed} target={target_depth} allowed_actions offered Retry but table refused it\nsteps={steps:#?}"
+                );
+            }
+            if check(&job, ChurnEventKind::Retry).is_err() {
+                assert!(
+                    !actions.retry,
+                    "seed={seed} target={target_depth} table refused Retry but allowed_actions offered it\nsteps={steps:#?}"
+                );
+            }
+            if actions.cancel {
+                let mut probe = job.clone();
+                assert!(
+                    transition(&mut probe, ChurnEvent::Cancel).is_ok(),
+                    "seed={seed} target={target_depth} allowed_actions offered Cancel but table refused it\nsteps={steps:#?}"
+                );
+            }
+            if check(&job, ChurnEventKind::Cancel).is_err() {
+                assert!(
+                    !actions.cancel,
+                    "seed={seed} target={target_depth} table refused Cancel but allowed_actions offered it\nsteps={steps:#?}"
+                );
+            }
+
+            if result.is_ok() && actual == ChurnEventKind::ScoredFinal {
+                cov.reached_scored_final = true;
+            }
+            if job.phase == ChurnPhase::Done {
+                cov.reached_done = true;
+            }
+            if job.phase == ChurnPhase::Cancelled {
+                cov.reached_cancelled = true;
+            }
+            if job.input_spent_elsewhere {
+                cov.reached_foreign_spend = true;
+            }
+        }
+
+        cov
+    }
+
+    #[test]
+    fn churn_random_walks_hold_all_invariants() {
+        let mut reached_scored_final = 0u32;
+        let mut reached_done = 0u32;
+        let mut reached_cancelled = 0u32;
+        let mut reached_foreign_spend = 0u32;
+
+        for seed in 0..500u64 {
+            let cov = walk_churn(seed);
+            reached_scored_final += u32::from(cov.reached_scored_final);
+            reached_done += u32::from(cov.reached_done);
+            reached_cancelled += u32::from(cov.reached_cancelled);
+            reached_foreign_spend += u32::from(cov.reached_foreign_spend);
+        }
+
+        assert!(
+            reached_scored_final > 0,
+            "walks never reached ScoredFinal across 500 seeds"
+        );
+        assert!(
+            reached_done > 0,
+            "walks never reached Done across 500 seeds"
+        );
+        assert!(
+            reached_cancelled > 0,
+            "walks never reached Cancelled across 500 seeds"
+        );
+        assert!(
+            reached_foreign_spend > 0,
+            "walks never reached ForeignSpend across 500 seeds"
+        );
+    }
+
     #[test]
     fn done_ignores_retry() {
         let mut job = new_job(&"ab".repeat(32), false, 1, 50_000, 2, false).unwrap();

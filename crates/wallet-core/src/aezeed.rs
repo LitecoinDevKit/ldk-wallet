@@ -9,7 +9,10 @@
 //! The 16-byte entropy is used *directly* as the BIP32 master seed — this is
 //! not BIP39, despite sharing the English wordlist.
 
+use std::fmt;
+
 use bdk_wallet::keys::bip39::Language;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::WalletError;
 
@@ -30,7 +33,7 @@ const CHECKSUM_SIZE: usize = 4;
 pub const DEFAULT_PASSPHRASE: &str = "aezeed";
 
 /// A successfully deciphered aezeed seed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecodedAezeed {
     /// 16 bytes used directly as the BIP32 master seed.
     pub entropy: [u8; 16],
@@ -40,6 +43,31 @@ pub struct DecodedAezeed {
     /// Nexus stamps 1). Informational: lnd itself never validates it, and the
     /// plaintext layout is identical either way.
     pub internal_version: u8,
+}
+
+impl DecodedAezeed {
+    /// Overwrite deciphered entropy in memory. Called from [`Drop`].
+    pub fn wipe(&mut self) {
+        self.entropy.zeroize();
+        self.birthday_days = 0;
+        self.internal_version = 0;
+    }
+}
+
+impl Drop for DecodedAezeed {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl fmt::Debug for DecodedAezeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedAezeed")
+            .field("entropy", &"<redacted>")
+            .field("birthday_days", &self.birthday_days)
+            .field("internal_version", &self.internal_version)
+            .finish()
+    }
 }
 
 /// Decipher a 24-word aezeed mnemonic with the given passphrase
@@ -79,22 +107,25 @@ pub fn decode(words: &[&str], passphrase: Option<&str>) -> Result<DecodedAezeed,
     // scrypt(n=32768, r=8, p=1) -> 32-byte AEZ key.
     let params = scrypt::Params::new(15, 8, 1)
         .map_err(|e| WalletError::InvalidMnemonic(format!("scrypt params: {e}")))?;
-    let mut key = [0u8; 32];
-    scrypt::scrypt(pass.as_bytes(), salt, &params, &mut key)
+    let mut key = Zeroizing::new([0u8; 32]);
+    scrypt::scrypt(pass.as_bytes(), salt, &params, &mut *key)
         .map_err(|e| WalletError::InvalidMnemonic(format!("scrypt: {e}")))?;
 
-    let mut ad = [0u8; 1 + SALT_SIZE];
+    let mut ad = Zeroizing::new([0u8; 1 + SALT_SIZE]);
     ad[0] = ext_version;
     ad[1..].copy_from_slice(salt);
 
     let ciphertext = &bytes[1..SALT_OFFSET];
-    let plaintext = zears::Aez::new(&key)
-        .decrypt(&[], &[&ad], CIPHERTEXT_EXPANSION, ciphertext)
-        .ok_or_else(|| {
-            WalletError::InvalidMnemonic(
-                "could not decipher aezeed seed — wrong cipher-seed passphrase?".into(),
-            )
-        })?;
+    let plaintext = Zeroizing::new(
+        zears::Aez::new(&key[..])
+            .decrypt(&[], &[&*ad], CIPHERTEXT_EXPANSION, ciphertext)
+            .ok_or_else(|| {
+                WalletError::InvalidMnemonic(
+                    "could not decipher aezeed seed — wrong cipher-seed passphrase?".into(),
+                )
+            })?,
+    );
+    drop(key);
     if plaintext.len() != DECIPHERED_SIZE {
         return Err(WalletError::InvalidMnemonic(format!(
             "aezeed plaintext has unexpected size {}",
@@ -105,22 +136,22 @@ pub fn decode(words: &[&str], passphrase: Option<&str>) -> Result<DecodedAezeed,
     // decodes it without validation, and the authenticated decryption above
     // already guarantees the 19-byte layout. Nexus seeds carry version 1.
     let birthday_days = u16::from_be_bytes([plaintext[1], plaintext[2]]);
-    let mut entropy = [0u8; 16];
+    let mut entropy = Zeroizing::new([0u8; 16]);
     entropy.copy_from_slice(&plaintext[3..]);
     Ok(DecodedAezeed {
-        entropy,
+        entropy: *entropy,
         birthday_days,
         internal_version: plaintext[0],
     })
 }
 
 /// Pack 24 words (11 bits each, MSB first) into 33 bytes.
-fn words_to_bytes(words: &[&str]) -> Result<[u8; ENCIPHERED_SIZE], WalletError> {
-    let mut bytes = [0u8; ENCIPHERED_SIZE];
+fn words_to_bytes(words: &[&str]) -> Result<Zeroizing<[u8; ENCIPHERED_SIZE]>, WalletError> {
+    let mut bytes = Zeroizing::new([0u8; ENCIPHERED_SIZE]);
     let mut bit_pos = 0usize;
-    for word in words {
+    for (idx, word) in words.iter().enumerate() {
         let index = Language::English.find_word(word).ok_or_else(|| {
-            WalletError::InvalidMnemonic(format!("\"{word}\" is not in the seed wordlist"))
+            WalletError::InvalidMnemonic(format!("word {} is not in the seed wordlist", idx + 1))
         })?;
         for shift in (0..11).rev() {
             if (index >> shift) & 1 == 1 {
@@ -157,10 +188,14 @@ mod tests {
     #[test]
     fn lnd_vector_default_passphrase() {
         let words: Vec<&str> = VECTOR_NO_PASSPHRASE.split_whitespace().collect();
-        let decoded = decode(&words, None).unwrap();
+        let mut decoded = decode(&words, None).unwrap();
         assert_eq!(decoded.entropy, TEST_ENTROPY);
         assert_eq!(decoded.birthday_days, 0);
         assert_eq!(decoded.internal_version, 0);
+        let dbg = format!("{decoded:?}");
+        assert!(!dbg.contains("81") && dbg.contains("<redacted>"), "{dbg}");
+        decoded.wipe();
+        assert_eq!(decoded.entropy, [0u8; 16]);
     }
 
     #[test]
@@ -189,10 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_word_is_reported() {
+    fn unknown_word_is_reported_by_index_without_echoing_token() {
         let mut words: Vec<&str> = VECTOR_NO_PASSPHRASE.split_whitespace().collect();
         words[3] = "litecoin";
         let err = decode(&words, None).unwrap_err();
-        assert!(err.to_string().contains("litecoin"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("word 4"), "{msg}");
+        assert!(!msg.contains("litecoin"), "{msg}");
     }
 }

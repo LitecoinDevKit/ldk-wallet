@@ -108,7 +108,7 @@ fn restore_aezeed_matches_preview_and_reloads() {
     // The stored payload is tagged (`aezeed:`), and a fresh app instance must
     // reload the identical wallet from it.
     let stored = secrets.get_mnemonic().unwrap().unwrap();
-    assert!(stored.starts_with("aezeed:"), "stored payload: {stored}");
+    assert!(stored.starts_with("aezeed:"), "expected aezeed: prefix");
     let loaded = {
         let app = with_secrets(secrets);
         app.load(dir.path()).expect("reload aezeed wallet")
@@ -135,7 +135,7 @@ fn restore_root_zprv_matches_preview_and_reloads() {
     assert_eq!(restored.receive_address, preview.bip84_external[0]);
 
     let stored = secrets.get_mnemonic().unwrap().unwrap();
-    assert!(stored.starts_with("xprv:"), "stored payload: {stored}");
+    assert!(stored.starts_with("xprv:"), "expected xprv: prefix");
     let loaded = {
         let app = with_secrets(secrets);
         app.load(dir.path()).expect("reload zprv wallet")
@@ -175,8 +175,11 @@ fn reveal_mnemonic_requires_passphrase_and_returns_phrase() {
         passphrase: "wrong passphrase!!".into(),
     });
     assert!(matches!(wrong, Err(WalletError::IncorrectPassphrase)));
+    assert!(
+        !app.is_locked(),
+        "wrong passphrase in Settings must not lock an active session"
+    );
 
-    app.lock();
     let revealed = app
         .reveal_mnemonic(RevealMnemonicRequest {
             passphrase: "correct horse battery staple".into(),
@@ -189,6 +192,13 @@ fn reveal_mnemonic_requires_passphrase_and_returns_phrase() {
         !app.is_locked(),
         "successful reveal leaves the wallet unlocked"
     );
+
+    app.lock();
+    let locked_err = app.reveal_mnemonic(RevealMnemonicRequest {
+        passphrase: "correct horse battery staple".into(),
+    });
+    assert!(matches!(locked_err, Err(WalletError::Locked)));
+    assert!(app.is_locked(), "reveal while locked must stay locked");
 }
 
 #[test]

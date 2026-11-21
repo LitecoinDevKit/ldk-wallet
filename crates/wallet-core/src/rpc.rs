@@ -97,7 +97,7 @@ fn rpc_call(
         let msg = if method == "sendrawtransaction" {
             crate::error::humanize_broadcast_error(&msg)
         } else {
-            msg
+            crate::redact::scrub_log_line(&msg)
         };
         return Err(WalletError::Rpc(msg));
     }
@@ -121,25 +121,7 @@ pub fn normalize_rpc_url(url: &str) -> String {
 /// Strip `user:pass@` userinfo from any URL embedded in `msg` so RPC
 /// credentials never reach logs or UI error text.
 pub(crate) fn redact_userinfo(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some(idx) = rest.find("://") {
-        let (head, tail) = rest.split_at(idx + 3);
-        out.push_str(head);
-        let authority_end = tail
-            .find(['/', '?', '#', ' ', ')', '"'])
-            .unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str("[redacted]@");
-            out.push_str(&authority[at + 1..]);
-        } else {
-            out.push_str(authority);
-        }
-        rest = &tail[authority_end..];
-    }
-    out.push_str(rest);
-    out
+    crate::redact::redact_userinfo(msg)
 }
 
 /// True when the URL authority contains userinfo (`scheme://user:pass@host`).

@@ -28,6 +28,7 @@ mod mweb;
 mod mweb_frozen;
 mod mweb_history;
 mod network;
+mod redact;
 mod rpc;
 mod secrets;
 mod seed;
@@ -62,6 +63,7 @@ pub use secrets::{
     EncryptedFileSecretStore, FileSecretStore, MemoryStore, SecretStore, UnlockableSecretStore,
 };
 pub use seed::{derive_preview, DerivePreview, MasterSecret, MwebSchemePreview};
+pub use zeroize::Zeroizing;
 
 /// Filename for the legacy plaintext mnemonic store.
 pub const MNEMONIC_FILE: &str = "wallet.mnemonic";

@@ -50,7 +50,7 @@ fn default_explorer_base_url() -> String {
 }
 
 /// Lightweight metadata stored beside the BDK sqlite DB (never secrets).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletMeta {
     /// BIP84 / MWEB / LitVM account index for this wallet directory.
     #[serde(default)]
@@ -102,6 +102,41 @@ pub struct WalletMeta {
     /// Insights / litview pulse and charts.
     #[serde(default = "default_true")]
     pub insights_enabled: bool,
+}
+
+impl std::fmt::Debug for WalletMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletMeta")
+            .field("account_index", &self.account_index)
+            .field("network", &self.network)
+            .field(
+                "electrum_url",
+                &crate::redact::redact_userinfo(&self.electrum_url),
+            )
+            .field("electrum_validate_domain", &self.electrum_validate_domain)
+            .field(
+                "electrum_use_public_fallback",
+                &self.electrum_use_public_fallback,
+            )
+            .field("auto_lock_minutes", &self.auto_lock_minutes)
+            .field("needs_full_scan", &self.needs_full_scan)
+            .field("needs_mweb_scan", &self.needs_mweb_scan)
+            .field(
+                "litecoin_rpc_url",
+                &crate::redact::redact_opt_url(&self.litecoin_rpc_url),
+            )
+            .field("broadcast_via_own_node", &self.broadcast_via_own_node)
+            .field("mweb_peers", &self.mweb_peers)
+            .field("mweb_scheme", &self.mweb_scheme)
+            .field(
+                "explorer_base_url",
+                &crate::redact::redact_userinfo(&self.explorer_base_url),
+            )
+            .field("show_fiat", &self.show_fiat)
+            .field("use_explorer_fee_hints", &self.use_explorer_fee_hints)
+            .field("insights_enabled", &self.insights_enabled)
+            .finish()
+    }
 }
 
 impl WalletMeta {

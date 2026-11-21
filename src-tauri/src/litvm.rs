@@ -39,6 +39,10 @@ impl LitVmHandle {
 
     /// Blocking: drops the client (and its runtime). Call off the async runtime.
     pub fn drop_client(&self) {
+        let _gate = self
+            .attach_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old = self.slot().take();
         drop(old);
     }
@@ -53,8 +57,17 @@ fn map_litvm(err: wallet_litvm::LitVmError) -> String {
 ///
 /// `root` is the wallet data dir. The account directory is read under
 /// [`LitVmHandle`]'s attach gate, and again after open: if the active account
-/// changed, this client is dropped and the newer attach installs the right one.
+/// changed or the wallet locked while opening, this client is dropped.
 pub fn attach(wallet: &WalletApp, handle: &LitVmHandle, root: &Path) -> Result<(), String> {
+    attach_with_hook(wallet, handle, root, || {})
+}
+
+fn attach_with_hook(
+    wallet: &WalletApp,
+    handle: &LitVmHandle,
+    root: &Path,
+    before_install: impl FnOnce(),
+) -> Result<(), String> {
     let _gate = handle
         .attach_gate
         .lock()
@@ -62,13 +75,19 @@ pub fn attach(wallet: &WalletApp, handle: &LitVmHandle, root: &Path) -> Result<(
     let account_dir = wallet.active_account_dir(root).map_err(map_err)?;
     let secret = wallet.litvm_account_secret().map_err(map_err)?;
     let client = LitVmClient::open(&account_dir, secret).map_err(map_litvm)?;
+    before_install();
     let now = wallet.active_account_dir(root).map_err(map_err)?;
-    if now != account_dir {
+    if wallet.is_locked() || now != account_dir {
         drop(client);
         return Ok(());
     }
     let old = {
         let mut guard = handle.slot();
+        if wallet.is_locked() {
+            drop(guard);
+            drop(client);
+            return Ok(());
+        }
         guard.replace(client)
     };
     // Shut the previous runtime down outside the client slot.
@@ -219,4 +238,51 @@ pub async fn drop_from_app(app: &AppHandle) {
 
 pub fn wipe_sidecar(data_dir: &Path) {
     let _ = wipe_settings_file(data_dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wallet_core::{CreateWalletRequest, WalletNetwork};
+
+    #[test]
+    fn attach_racing_lock_does_not_install_signer_while_locked() {
+        let dir = std::env::temp_dir().join(format!(
+            "ltc-litvm-race-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wallet = WalletApp::new(&dir);
+        wallet
+            .create(
+                &dir,
+                CreateWalletRequest {
+                    network: WalletNetwork::Testnet,
+                    electrum_url: None,
+                },
+                "correct horse battery staple",
+            )
+            .expect("create wallet");
+
+        let handle = LitVmHandle::new();
+        attach_with_hook(&wallet, &handle, &dir, || {
+            // Simulate `lock_wallet` firing while `attach` was mid-open on a background thread.
+            wallet.lock();
+            handle.slot().take();
+        })
+        .expect("attach");
+
+        let has_client = handle.slot().is_some();
+        let locked = wallet.is_locked();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(locked);
+        assert!(
+            !has_client,
+            "LitVmHandle kept an unlocked signer after wallet locked mid-attach"
+        );
+    }
 }

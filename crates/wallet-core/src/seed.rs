@@ -1,9 +1,13 @@
-//! Wallet master secrets: BIP39 mnemonics, aezeed cipher seeds (Nexus), and
-//! root extended private keys (xprv/zprv/Ltpv…).
+//! Unified wallet seed representation: BIP39, aezeed (Nexus/lnd), or a root
+//! extended private key (`xprv`/`zprv`/`Ltpv`/…).
 //!
-//! Everything the wallet derives — BIP84 transparent descriptors and MWEB
-//! scan/spend keys — branches from one BIP32 master key, so any input that
-//! yields a *root* `Xpriv` can restore a full wallet.
+//! All three collapse to a BIP32 master `Xpriv` (depth 0), from which BIP84
+//! transparent descriptors and MWEB keys derive identically. The secret store
+//! persists a short tagged string (`aezeed:…`, `xprv:…`, or untagged BIP39 for
+//! backward compatibility with existing wallets).
+
+use std::fmt;
+use std::ops::Deref;
 
 use bdk_mweb::keys::MasterKeyScheme;
 use bdk_wallet::bitcoin::base58;
@@ -13,6 +17,7 @@ use bdk_wallet::bitcoin::{Network, NetworkKind};
 use bdk_wallet::keys::bip39::{Language, Mnemonic};
 use bdk_wallet::KeychainKind;
 use serde::Serialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::aezeed::{self, DecodedAezeed};
 use crate::error::WalletError;
@@ -22,22 +27,119 @@ use crate::network::WalletNetwork;
 /// 2009-01-03T18:15:05Z (`time.Unix(1231006505, 0)`).
 const AEZEED_GENESIS_UNIX: u64 = 1_231_006_505;
 
+/// Overwrite an extended private key's secret scalar and chain code in place.
+pub(crate) fn wipe_xpriv(xprv: &mut Xpriv) {
+    xprv.private_key.non_secure_erase();
+    let cc: &mut [u8] = xprv.chain_code.as_mut();
+    cc.zeroize();
+}
+
+/// Overwrite a `bip39::Mnemonic`'s internal word-index array in place.
+pub(crate) fn wipe_mnemonic(m: &mut Mnemonic) {
+    if let Ok(blank) = Mnemonic::from_entropy_in(Language::English, &[0u8; 32]) {
+        *m = blank;
+        std::hint::black_box(m);
+    }
+}
+
+/// RAII wrapper around `Xpriv` that erases key and chain-code bytes on drop.
+pub(crate) struct XprivGuard(Xpriv);
+
+impl XprivGuard {
+    pub(crate) fn new(xprv: Xpriv) -> Self {
+        Self(xprv)
+    }
+}
+
+impl Deref for XprivGuard {
+    type Target = Xpriv;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for XprivGuard {
+    fn drop(&mut self) {
+        wipe_xpriv(&mut self.0);
+    }
+}
+
+impl fmt::Debug for XprivGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("XprivGuard(<redacted>)")
+    }
+}
+
 /// A parsed wallet master secret.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum MasterSecret {
-    /// BIP39 mnemonic (12–24 words), seed derived with an empty passphrase.
-    Bip39(Mnemonic),
+    /// BIP39 mnemonic (12–24 words), normalized to single spaces; seed derived with an empty passphrase.
+    Bip39(Zeroizing<String>),
     /// aezeed cipher seed (24 words); entropy is the BIP32 seed directly.
     Aezeed {
         /// The original 24 words, normalized to single spaces.
-        words: String,
+        words: Zeroizing<String>,
         /// Cipher-seed passphrase when it is not the scheme default.
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         /// Deciphered entropy and birthday.
         decoded: DecodedAezeed,
     },
     /// A root (depth 0) extended private key.
     Xprv(Xpriv),
+}
+
+impl MasterSecret {
+    /// Overwrite secret material in place. Called from [`Drop`].
+    pub fn wipe(&mut self) {
+        match self {
+            Self::Bip39(words) => words.zeroize(),
+            Self::Aezeed {
+                words,
+                passphrase,
+                decoded,
+            } => {
+                words.zeroize();
+                if let Some(p) = passphrase.as_mut() {
+                    p.zeroize();
+                }
+                *passphrase = None;
+                decoded.wipe();
+            }
+            Self::Xprv(xprv) => wipe_xpriv(xprv),
+        }
+    }
+}
+
+impl Drop for MasterSecret {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl fmt::Debug for MasterSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bip39(_) => f.debug_tuple("Bip39").field(&"<redacted>").finish(),
+            Self::Aezeed {
+                passphrase,
+                decoded,
+                ..
+            } => f
+                .debug_struct("Aezeed")
+                .field("words", &"<redacted>")
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .field("decoded", decoded)
+                .finish(),
+            Self::Xprv(xprv) => f
+                .debug_struct("Xprv")
+                .field("network", &xprv.network)
+                .field("depth", &xprv.depth)
+                .field("private_key", &"<redacted>")
+                .field("chain_code", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl MasterSecret {
@@ -62,7 +164,11 @@ impl MasterSecret {
                 return Self::parse_aezeed(&words, explicit_pass);
             }
             match Mnemonic::parse_in(Language::English, trimmed) {
-                Ok(m) => return Ok(Self::Bip39(m)),
+                Ok(mut m) => {
+                    let phrase = Zeroizing::new(m.to_string());
+                    wipe_mnemonic(&mut m);
+                    return Ok(Self::Bip39(phrase));
+                }
                 Err(bip39_err) => {
                     return Self::parse_aezeed(&words, None).map_err(|aezeed_err| {
                         WalletError::InvalidMnemonic(format!(
@@ -74,16 +180,18 @@ impl MasterSecret {
             }
         }
 
-        Mnemonic::parse_in(Language::English, trimmed)
-            .map(Self::Bip39)
-            .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))
+        let mut m = Mnemonic::parse_in(Language::English, trimmed)
+            .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
+        let phrase = Zeroizing::new(m.to_string());
+        wipe_mnemonic(&mut m);
+        Ok(Self::Bip39(phrase))
     }
 
     fn parse_aezeed(words: &[&str], passphrase: Option<&str>) -> Result<Self, WalletError> {
         let decoded = aezeed::decode(words, passphrase)?;
         Ok(Self::Aezeed {
-            words: words.join(" "),
-            passphrase: passphrase.map(str::to_string),
+            words: Zeroizing::new(words.join(" ")),
+            passphrase: passphrase.map(|p| Zeroizing::new(p.to_string())),
             decoded,
         })
     }
@@ -102,23 +210,28 @@ impl MasterSecret {
             return parse_extended_key(rest.trim()).map(Self::Xprv);
         }
         let phrase = payload.strip_prefix("bip39:").unwrap_or(payload);
-        Mnemonic::parse_in(Language::English, phrase.trim())
-            .map(Self::Bip39)
-            .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))
+        let mut m = Mnemonic::parse_in(Language::English, phrase.trim())
+            .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
+        let normalized = Zeroizing::new(m.to_string());
+        wipe_mnemonic(&mut m);
+        Ok(Self::Bip39(normalized))
     }
 
     /// Serialize for the secret store. BIP39 stays untagged so wallets
     /// created before other seed kinds existed keep loading unchanged.
-    pub fn to_stored(&self) -> String {
+    pub fn to_stored(&self) -> Zeroizing<String> {
         match self {
-            Self::Bip39(m) => m.to_string(),
+            Self::Bip39(words) => words.clone(),
             Self::Aezeed {
                 words, passphrase, ..
             } => match passphrase {
-                Some(p) => format!("aezeed:{words}\n{p}"),
-                None => format!("aezeed:{words}"),
+                Some(p) => Zeroizing::new(format!("aezeed:{}\n{}", words.as_str(), p.as_str())),
+                None => Zeroizing::new(format!("aezeed:{}", words.as_str())),
             },
-            Self::Xprv(xprv) => format!("xprv:{xprv}"),
+            Self::Xprv(xprv) => {
+                let encoded = Zeroizing::new(xprv.to_string());
+                Zeroizing::new(format!("xprv:{}", encoded.as_str()))
+            }
         }
     }
 
@@ -128,7 +241,13 @@ impl MasterSecret {
     pub fn master_xprv(&self, network: Network) -> Result<Xpriv, WalletError> {
         let map_err = |e: bdk_wallet::bitcoin::bip32::Error| WalletError::Descriptor(e.to_string());
         match self {
-            Self::Bip39(m) => Xpriv::new_master(network, &m.to_seed("")).map_err(map_err),
+            Self::Bip39(words) => {
+                let mut m = Mnemonic::parse_in(Language::English, words.as_str())
+                    .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
+                let seed = Zeroizing::new(m.to_seed(""));
+                wipe_mnemonic(&mut m);
+                Xpriv::new_master(network, &*seed).map_err(map_err)
+            }
             Self::Aezeed { decoded, .. } => {
                 Xpriv::new_master(network, &decoded.entropy).map_err(map_err)
             }
@@ -138,6 +257,11 @@ impl MasterSecret {
                 Ok(key)
             }
         }
+    }
+
+    /// Guarded [`Self::master_xprv`] that wipes the stack `Xpriv` on drop.
+    pub(crate) fn master_xprv_guarded(&self, network: Network) -> Result<XprivGuard, WalletError> {
+        self.master_xprv(network).map(XprivGuard::new)
     }
 
     /// Wallet birthday as a unix timestamp, when the seed format carries one.
@@ -163,26 +287,28 @@ impl MasterSecret {
     ///
     /// Account 0 matches MetaMask/Rabby default. Network version bytes on the
     /// master xprv do not change the derived 32-byte key.
-    pub fn litvm_account_secret(&self, account: u32) -> Result<[u8; 32], WalletError> {
-        let master = self.master_xprv(Network::Bitcoin)?;
+    pub fn litvm_account_secret(&self, account: u32) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+        let master = self.master_xprv_guarded(Network::Bitcoin)?;
         let secp = Secp256k1::new();
         let path: DerivationPath = format!("m/44'/60'/{account}'/0/0").parse().map_err(
             |e: bdk_wallet::bitcoin::bip32::Error| WalletError::Descriptor(e.to_string()),
         )?;
-        let child = master
-            .derive_priv(&secp, &path)
-            .map_err(|e| WalletError::Descriptor(e.to_string()))?;
-        Ok(child.private_key.secret_bytes())
+        let child = XprivGuard::new(
+            master
+                .derive_priv(&secp, &path)
+                .map_err(|e| WalletError::Descriptor(e.to_string()))?,
+        );
+        Ok(Zeroizing::new(child.private_key.secret_bytes()))
     }
 
     /// Backup material without storage tags: phrase/key plus optional aezeed cipher passphrase.
-    pub fn backup_material(&self) -> (String, Option<String>) {
+    pub fn backup_material(&self) -> (Zeroizing<String>, Option<Zeroizing<String>>) {
         match self {
-            Self::Bip39(m) => (m.to_string(), None),
+            Self::Bip39(words) => (words.clone(), None),
             Self::Aezeed {
                 words, passphrase, ..
             } => (words.clone(), passphrase.clone()),
-            Self::Xprv(xprv) => (xprv.to_string(), None),
+            Self::Xprv(xprv) => (Zeroizing::new(xprv.to_string()), None),
         }
     }
 }
@@ -230,7 +356,7 @@ pub fn derive_preview(
     let secret = MasterSecret::parse(input, aezeed_passphrase)?;
     let bdk_net = network.to_bitcoin_network();
     let secp = Secp256k1::new();
-    let xprv = secret.master_xprv(bdk_net)?;
+    let xprv = secret.master_xprv_guarded(bdk_net)?;
 
     let wallet = crate::descriptors::create_params(&secret, network, account)?
         .create_wallet_no_persist()
@@ -278,31 +404,41 @@ pub fn derive_preview(
     })
 }
 
-/// Known SLIP-132 (and Litecoin) extended-key version bytes.
-/// Private versions are normalized; public ones get a targeted error.
-const PRIVATE_MAINNET: [(&str, [u8; 4]); 6] = [
-    ("xprv", [0x04, 0x88, 0xAD, 0xE4]),
-    ("yprv", [0x04, 0x9D, 0x78, 0x78]),
-    ("Yprv", [0x02, 0x95, 0xB0, 0x05]),
-    ("zprv", [0x04, 0xB2, 0x43, 0x0C]),
-    ("Zprv", [0x02, 0xAA, 0x7A, 0x99]),
-    ("Ltpv", [0x01, 0x9D, 0x9C, 0xFE]),
+/// SLIP-132 and Litecoin-specific BIP32 version prefixes.
+///
+/// The 74 bytes after the 4-byte version (`depth || parent_fp || child_num ||
+/// chain_code || 0x00 || secret_key`) are identical across every scheme, so
+/// rewriting the version bytes to Bitcoin's standard `xprv`/`tprv` lets
+/// `bitcoin::bip32::Xpriv::decode` parse any of them.
+const PRIVATE_MAINNET: &[(&str, [u8; 4])] = &[
+    ("xprv", [0x04, 0x88, 0xAD, 0xE4]), // BIP32 standard
+    ("yprv", [0x04, 0x9D, 0x78, 0x78]), // BIP49
+    ("zprv", [0x04, 0xB2, 0x43, 0x0C]), // BIP84 (Electrum-LTC, Sparrow, …)
+    ("Yprv", [0x02, 0x95, 0xB0, 0x05]), // SLIP-132 multisig P2SH-P2WSH
+    ("Zprv", [0x02, 0xAA, 0x7A, 0x99]), // SLIP-132 multisig P2WSH
+    ("Ltpv", [0x01, 0x9D, 0x9C, 0xFE]), // Litecoin legacy BIP32
+    ("Mtpv", [0x01, 0xB2, 0x67, 0x92]), // Litecoin P2SH-P2WPKH
 ];
-const PRIVATE_TESTNET: [(&str, [u8; 4]); 6] = [
-    ("tprv", [0x04, 0x35, 0x83, 0x94]),
-    ("uprv", [0x04, 0x4A, 0x4E, 0x28]),
+
+const PRIVATE_TESTNET: &[(&str, [u8; 4])] = &[
+    ("tprv", [0x04, 0x35, 0x83, 0x94]), // BIP32 testnet
+    ("uprv", [0x04, 0x4A, 0x4E, 0x28]), // BIP49 testnet
+    ("vprv", [0x04, 0x5F, 0x18, 0xBC]), // BIP84 testnet
     ("Uprv", [0x02, 0x42, 0x85, 0xB5]),
-    ("vprv", [0x04, 0x5F, 0x18, 0xBC]),
     ("Vprv", [0x02, 0x57, 0x50, 0x48]),
-    ("ttpv", [0x04, 0x36, 0xEF, 0x7D]),
+    ("ttpv", [0x04, 0x36, 0xEF, 0x7D]), // Litecoin testnet
 ];
-const PUBLIC_ANY: [(&str, [u8; 4]); 12] = [
+
+/// Public extended-key prefixes — recognized only so we can give a clear
+/// "that's a watch-only key, export the private key instead" error.
+const PUBLIC_ANY: &[(&str, [u8; 4])] = &[
     ("xpub", [0x04, 0x88, 0xB2, 0x1E]),
     ("ypub", [0x04, 0x9D, 0x7C, 0xB2]),
     ("Ypub", [0x02, 0x95, 0xB4, 0x3F]),
     ("zpub", [0x04, 0xB2, 0x47, 0x46]),
     ("Zpub", [0x02, 0xAA, 0x7E, 0xD3]),
     ("Ltub", [0x01, 0x9D, 0xA4, 0x62]),
+    ("Mtub", [0x01, 0xB2, 0x6E, 0xF6]),
     ("tpub", [0x04, 0x35, 0x87, 0xCF]),
     ("upub", [0x04, 0x4A, 0x52, 0x62]),
     ("Upub", [0x02, 0x42, 0x89, 0xEF]),
@@ -311,7 +447,6 @@ const PUBLIC_ANY: [(&str, [u8; 4]); 12] = [
     ("ttub", [0x04, 0x36, 0xF6, 0xE1]),
 ];
 
-/// Version bytes `Xpriv::decode` accepts natively.
 const STANDARD_MAINNET_PRIV: [u8; 4] = [0x04, 0x88, 0xAD, 0xE4];
 const STANDARD_TESTNET_PRIV: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 
@@ -320,8 +455,10 @@ const STANDARD_TESTNET_PRIV: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 pub fn parse_extended_key(s: &str) -> Result<Xpriv, WalletError> {
     let bad = |msg: String| WalletError::InvalidMnemonic(msg);
 
-    let mut data = base58::decode_check(s.trim())
-        .map_err(|e| bad(format!("not a valid extended key (base58 error: {e})")))?;
+    let mut data = Zeroizing::new(
+        base58::decode_check(s.trim())
+            .map_err(|_| bad("not a valid extended key (base58 check failed)".into()))?,
+    );
     if data.len() != 78 {
         return Err(bad(format!(
             "extended key payload is {} bytes, expected 78",
@@ -351,14 +488,16 @@ pub fn parse_extended_key(s: &str) -> Result<Xpriv, WalletError> {
     } else {
         &STANDARD_TESTNET_PRIV
     });
-    let xprv = Xpriv::decode(&data).map_err(|e| bad(format!("invalid extended key: {e}")))?;
+    let mut xprv = Xpriv::decode(&data).map_err(|e| bad(format!("invalid extended key: {e}")))?;
+    drop(data);
 
     if xprv.depth != 0 {
+        let depth = xprv.depth;
+        wipe_xpriv(&mut xprv);
         return Err(bad(format!(
-            "this is an account-level extended key (depth {}), not the wallet root. \
+            "this is an account-level extended key (depth {depth}), not the wallet root. \
              MWEB keys branch directly off the master key, so recovery needs the \
              root key (depth 0) — export the HD root / master key instead",
-            xprv.depth
         )));
     }
     Ok(xprv)
@@ -419,6 +558,7 @@ mod tests {
         let err = parse_extended_key(&zprv_child).unwrap_err().to_string();
         assert!(err.contains("depth 1"), "{err}");
         assert!(err.contains("root"), "{err}");
+        assert!(!err.contains(&zprv_child), "{err}");
     }
 
     #[test]
@@ -457,7 +597,7 @@ mod tests {
         assert_eq!(secret.birthday_unix(), Some(AEZEED_GENESIS_UNIX));
 
         let stored = secret.to_stored();
-        assert!(stored.starts_with("aezeed:"), "{stored}");
+        assert!(stored.starts_with("aezeed:"));
         let reloaded = MasterSecret::from_stored(&stored).unwrap();
         assert_eq!(
             reloaded.master_xprv(Network::Bitcoin).unwrap(),
@@ -486,7 +626,7 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let secret = MasterSecret::from_stored(stored).unwrap();
         assert!(matches!(secret, MasterSecret::Bip39(_)));
-        assert_eq!(secret.to_stored(), stored);
+        assert_eq!(secret.to_stored().as_str(), stored);
     }
 
     #[test]
@@ -495,11 +635,57 @@ mod tests {
         let on_testnet = secret.master_xprv(Network::Testnet4).unwrap();
         assert_eq!(on_testnet.network, NetworkKind::Test);
         let stored = secret.to_stored();
-        assert!(stored.starts_with("xprv:"), "{stored}");
+        assert!(stored.starts_with("xprv:"));
         let reloaded = MasterSecret::from_stored(&stored).unwrap();
         assert_eq!(
             reloaded.master_xprv(Network::Bitcoin).unwrap(),
             secret.master_xprv(Network::Bitcoin).unwrap()
         );
+    }
+
+    #[test]
+    fn wipe_erases_all_master_secret_variants() {
+        let mut s1 = MasterSecret::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            None,
+        )
+        .unwrap();
+        s1.wipe();
+        if let MasterSecret::Bip39(ref w) = s1 {
+            assert!(w.is_empty());
+        } else {
+            panic!("expected Bip39");
+        }
+
+        let phrase = "absorb century submit father path glove gloom super divert garden ice \
+                      mirror wisdom grass dice kit ugly castle success suggest drink monster \
+                      congress flight";
+        let mut s2 = MasterSecret::parse(phrase, Some("!very_safe_55345_password*")).unwrap();
+        s2.wipe();
+        if let MasterSecret::Aezeed {
+            ref words,
+            ref passphrase,
+            ref decoded,
+        } = s2
+        {
+            assert!(words.is_empty());
+            assert!(passphrase.is_none());
+            assert_eq!(decoded.entropy, [0u8; 16]);
+        } else {
+            panic!("expected Aezeed");
+        }
+
+        let mut s3 = MasterSecret::parse(ROOT_XPRV, None).unwrap();
+        let before = match s3 {
+            MasterSecret::Xprv(ref x) => x.private_key.secret_bytes(),
+            _ => unreachable!(),
+        };
+        s3.wipe();
+        if let MasterSecret::Xprv(ref x) = s3 {
+            assert_ne!(x.private_key.secret_bytes(), before);
+            assert_eq!(x.chain_code.to_bytes(), [0u8; 32]);
+        } else {
+            panic!("expected Xprv");
+        }
     }
 }

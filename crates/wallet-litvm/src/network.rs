@@ -55,12 +55,49 @@ impl LitVmNetwork {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Strip `user:pass@` userinfo from any URL embedded in `msg`.
+pub(crate) fn redact_userinfo(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(idx) = rest.find("://") {
+        let (head, tail) = rest.split_at(idx + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find([
+                '/', '?', '#', ' ', '\t', '\n', '\r', ')', ']', '}', '"', '\'', ',', ';',
+            ])
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("[redacted]@");
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LitVmSettingsFile {
     #[serde(default = "default_network_id")]
     pub network_id: String,
     #[serde(default)]
     pub rpc_http_override: Option<String>,
+}
+
+impl std::fmt::Debug for LitVmSettingsFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitVmSettingsFile")
+            .field("network_id", &self.network_id)
+            .field(
+                "rpc_http_override",
+                &self.rpc_http_override.as_deref().map(redact_userinfo),
+            )
+            .finish()
+    }
 }
 
 fn default_network_id() -> String {
@@ -76,12 +113,26 @@ impl Default for LitVmSettingsFile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LitVmSettings {
     pub network: LitVmNetwork,
     pub rpc_http: String,
     pub rpc_http_override: Option<String>,
     pub signing_enabled: bool,
+}
+
+impl std::fmt::Debug for LitVmSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitVmSettings")
+            .field("network", &self.network)
+            .field("rpc_http", &redact_userinfo(&self.rpc_http))
+            .field(
+                "rpc_http_override",
+                &self.rpc_http_override.as_deref().map(redact_userinfo),
+            )
+            .field("signing_enabled", &self.signing_enabled)
+            .finish()
+    }
 }
 
 impl LitVmSettings {

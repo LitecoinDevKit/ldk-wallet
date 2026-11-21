@@ -621,8 +621,14 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
     )));
     lines.push(wallet_core::Zeroizing::new(format!("E2E_MWEB_DEST={dest}")));
     lines.push(wallet_core::Zeroizing::new(String::new()));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("coinswapd.env");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_path);
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     // Scan/spend hex. Unix creates the file 0600; Windows leaves the
     // per-user profile ACL in place (there is no mode bit to set).
     #[cfg(unix)]
@@ -631,8 +637,8 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
         opts.mode(0o600);
     }
     let mut f = opts
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .open(&tmp_path)
+        .with_context(|| format!("open {}", tmp_path.display()))?;
     let joined = wallet_core::Zeroizing::new(
         lines
             .iter()
@@ -640,8 +646,20 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
             .collect::<Vec<_>>()
             .join("\n"),
     );
-    write!(f, "{}", joined.as_str()).context("write coinswapd env")?;
-    f.sync_all().context("sync coinswapd env")?;
+    let write_res = (|| -> Result<()> {
+        write!(f, "{}", joined.as_str()).context("write coinswapd env")?;
+        f.sync_all().context("sync coinswapd env")?;
+        Ok(())
+    })();
+    drop(f);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("rename {}", path.display()));
+    }
     Ok(())
 }
 

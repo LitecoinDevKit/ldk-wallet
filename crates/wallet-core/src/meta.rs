@@ -208,9 +208,8 @@ pub fn mweb_seal_counter_path(data_dir: &Path) -> PathBuf {
 }
 
 pub fn write_meta(data_dir: &Path, meta: &WalletMeta) -> Result<(), WalletError> {
-    fs::create_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(meta).map_err(|e| WalletError::Meta(e.to_string()))?;
-    fs::write(meta_path(data_dir), json)?;
+    crate::fs_atomic::write_atomic(&meta_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 
@@ -309,6 +308,7 @@ pub fn remove_wallet_files(data_dir: &Path) -> Result<(), WalletError> {
             Err(e) => return Err(WalletError::Io(e)),
         }
     }
+    crate::fs_atomic::sweep_temp_files(data_dir);
     Ok(())
 }
 

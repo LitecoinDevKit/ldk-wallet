@@ -49,9 +49,8 @@ pub fn read_labels(data_dir: &Path) -> Result<TxLabelsFile, WalletError> {
 }
 
 pub fn write_labels(data_dir: &Path, file: &TxLabelsFile) -> Result<(), WalletError> {
-    fs::create_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(file).map_err(|e| WalletError::Meta(e.to_string()))?;
-    fs::write(labels_path(data_dir), json)?;
+    crate::fs_atomic::write_atomic(&labels_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 

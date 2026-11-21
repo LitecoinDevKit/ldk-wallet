@@ -101,9 +101,8 @@ pub fn read_contacts(data_dir: &Path) -> Result<ContactsFile, WalletError> {
 }
 
 pub fn write_contacts(data_dir: &Path, file: &ContactsFile) -> Result<(), WalletError> {
-    fs::create_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(file).map_err(|e| WalletError::Meta(e.to_string()))?;
-    fs::write(contacts_path(data_dir), json)?;
+    crate::fs_atomic::write_atomic(&contacts_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 

@@ -66,7 +66,7 @@ impl MwebHistory {
     pub fn save(&self, path: &Path) -> Result<(), WalletError> {
         let json =
             serde_json::to_string_pretty(self).map_err(|e| WalletError::Mweb(e.to_string()))?;
-        fs::write(path, json)?;
+        crate::fs_atomic::write_atomic(path, json.as_bytes())?;
         Ok(())
     }
 

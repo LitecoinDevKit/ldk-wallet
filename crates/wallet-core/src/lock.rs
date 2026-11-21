@@ -53,6 +53,46 @@ fn every_lock_ends_locked() {
     }
 }
 
+/// Every `(from, event)` key appears at most once, and every `LockState` is
+/// reachable from `Locked`.
+#[test]
+fn lock_table_has_unique_keys_and_every_state_is_reachable() {
+    const ALL_STATES: [LockState; 4] = [Locked, UnlockedEmpty, Loaded, LockPending];
+    // Fails to compile if a new state is added without updating ALL_STATES.
+    for state in ALL_STATES {
+        match state {
+            Locked | UnlockedEmpty | Loaded | LockPending => {}
+        }
+    }
+
+    for (i, (from, event, _)) in LOCK_TRANSITIONS.iter().enumerate() {
+        assert!(
+            !LOCK_TRANSITIONS[i + 1..]
+                .iter()
+                .any(|(f, e, _)| f == from && e == event),
+            "duplicate row for {event:?} from {from:?}"
+        );
+    }
+
+    let mut reached = vec![Locked];
+    let mut cursor = 0;
+    while cursor < reached.len() {
+        let current = reached[cursor];
+        cursor += 1;
+        for (from, _, to) in LOCK_TRANSITIONS {
+            if *from == current && !reached.contains(to) {
+                reached.push(*to);
+            }
+        }
+    }
+    for state in ALL_STATES {
+        assert!(
+            reached.contains(&state),
+            "{state:?} is not reachable from Locked"
+        );
+    }
+}
+
 /// The diagram in `docs/LOCK_LIFECYCLE.md` is generated. Refresh it with
 /// `UPDATE_DIAGRAMS=1 cargo test -p wallet-core lock_table_matches_docs`.
 #[test]

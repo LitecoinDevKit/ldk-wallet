@@ -28,7 +28,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
 | 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). Redaction is in `redact.rs` (item 16). |
-| 16 | Secret hygiene and zeroization | High | Done | | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
+| 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
 | 17 | Persistence atomicity and crash recovery | High | Not started | | Restart after a kill mid-sync, mid-churn, or mid-persist. Extends items 5 and 11. |
 | 18 | Transaction construction and value invariants | High | Not started | | Amounts, fees, dust, change, and peg-in/peg-out shape. Beside the coin-status tests. |
 | 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Refines item 10. |

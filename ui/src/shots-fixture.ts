@@ -289,7 +289,6 @@ function privateCoins(): Coin[] {
     last_other_kernels: 4,
     last_other_outputs: 7,
     hops: [{ other_kernels: 4, other_outputs: 7 }],
-    churn_phase: "done",
   });
   const ordinary = quietCoin({
     output_id: id("g8"),

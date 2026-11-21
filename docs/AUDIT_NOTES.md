@@ -58,6 +58,7 @@ Severity: **H**igh / **M**edium / **L**ow / **I**nformational.
 | # | Sev | Finding | Fix |
 | --- | --- | --- | --- |
 | — | L | `set_mweb_utxo_locked` and `set_utxo_locked` accepted Freeze or Unfreeze when `coin_status` / `public_coin_status` left the flag off: a pending or maturing private coin, a coin a self-spend holds, and a repeat of the current freeze | The commands refuse unless the listed coin's `freeze` or `unfreeze` flag is set. A coin that is not listed can still be cleared, so a stale freeze does not get stuck |
+| — | L | `toggleUtxoLocked` and `toggleMwebLocked` in `ui/src/main.ts` read `!utxo.locked` / `!coin.locked` instead of `actions.freeze` / `actions.unfreeze`, and `renderMwebControlList` kept a previously selected private coin in `panel.selected` after `actions.select` turned false | `ui/src/actions.ts` derives the freeze target and button states from `CoinActions` and `ChurnActions`, `renderMwebControlList` prunes `panel.selected` when `select` is disabled, and `scripts/action-flags.test.mjs` enforces both in CI |
 
 ## `bdk_mweb` security hardening pass
 

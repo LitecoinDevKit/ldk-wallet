@@ -1,3 +1,17 @@
+import {
+  churnActionButtons,
+  churnPhaseActive,
+  freezeTargetLocked,
+  privateCoinActionState,
+  publicCoinActionState,
+  type ChurnActions,
+  type ChurnPending,
+  type ChurnPhase,
+  type CoinActions,
+  type CoinStatus,
+  type FreezeButtonSpec,
+  type SplitChain,
+} from "./actions";
 import { invoke } from "./ipc";
 import { canEnter, PHASE_LABELS, type Phase } from "./phases";
 import QRCode from "qrcode";
@@ -240,51 +254,6 @@ type MwebUtxoRecord = {
   actions: CoinActions;
 };
 
-/** Which self-spend buttons the backend allows. The UI never works this out itself. */
-type ChurnActions = {
-  retry: boolean;
-  cancel: boolean;
-  open_settings: boolean;
-};
-
-/** One status per coin, picked by `coin_status` / `public_coin_status` in the backend. */
-type CoinStatus =
-  | "churning"
-  | "sending"
-  | "pending"
-  | "maturing"
-  | "frozen"
-  | "tied-to-pegin"
-  | "ready";
-
-/** Why a coin's spend buttons are off. */
-type CoinBlock =
-  | { kind: "churning" }
-  | { kind: "sending" }
-  | { kind: "frozen" }
-  | { kind: "unconfirmed" }
-  | { kind: "maturing"; blocks_left: number };
-
-/** Which coin buttons the backend allows. The UI never works this out itself. */
-type CoinActions = {
-  spend_to_self: boolean;
-  split: boolean;
-  transfer: boolean;
-  select: boolean;
-  freeze: boolean;
-  unfreeze: boolean;
-  blocked: CoinBlock | null;
-};
-
-type ChurnPhase =
-  | "waiting-to-broadcast"
-  | "waiting-for-cover"
-  | "waiting-confirm"
-  | "paused-solo"
-  | "paused-unscored"
-  | "done"
-  | "cancelled";
-
 type ChurnPreview = {
   input_sats: number;
   hop_fee_sats: number;
@@ -317,8 +286,6 @@ type SplitResult = {
   fee_sats: number;
   output_count: number;
 };
-
-type SplitChain = "public" | "private";
 
 type TransferCoinPreview = {
   to_account_index: number;
@@ -5508,14 +5475,13 @@ function renderUtxoList(panel: CoinControlPanel) {
     if (extraClass) rowClass.push(extraClass);
     li.className = rowClass.join(" ");
 
-    if (!utxo.actions.select) panel.selected.delete(utxo.outpoint);
+    const actionState = publicCoinActionState(utxo);
+    if (actionState.select.disabled) panel.selected.delete(utxo.outpoint);
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.disabled = !utxo.actions.select;
+    check.disabled = actionState.select.disabled;
     check.checked = panel.selected.has(utxo.outpoint);
-    check.title = utxo.actions.select
-      ? "Include this coin"
-      : coinBlockedTitle(utxo.actions.blocked, "spend", PUBLIC_COIN_BLOCKED_COPY.spend);
+    check.title = actionState.select.title;
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(utxo.outpoint);
       else panel.selected.delete(utxo.outpoint);
@@ -5586,7 +5552,7 @@ function renderUtxoList(panel: CoinControlPanel) {
       renderUtxoList(panel);
     });
 
-    const freeze = publicFreezeButton(utxo, () => {
+    const freeze = coinFreezeButton(actionState.freeze, () => {
       more.open = false;
       void toggleUtxoLocked(utxo);
     });
@@ -5692,7 +5658,11 @@ function renderCoinsList() {
     main.append(amtRow, status);
     li.append(main);
 
-    if (spendPending) {
+    const actionState = publicCoinActionState(utxo, {
+      hasOtherWallets: otherWallets().length > 0,
+      inFlightSpend: !!spendPending,
+    });
+    if (actionState.jobHolds) {
       el.coinsUtxoList.appendChild(li);
       continue;
     }
@@ -5732,7 +5702,7 @@ function renderCoinsList() {
       renderCoinsList();
     });
 
-    const freeze = publicFreezeButton(utxo, () => {
+    const freeze = coinFreezeButton(actionState.freeze, () => {
       more.open = false;
       void toggleUtxoLocked(utxo);
     });
@@ -5742,10 +5712,8 @@ function renderCoinsList() {
     split.className = "btn btn-ghost btn-sm";
     split.setAttribute("role", "menuitem");
     split.textContent = "Split";
-    split.disabled = !utxo.actions.split;
-    split.title = utxo.actions.split
-      ? "Split this coin into multiple outputs"
-      : coinBlockedTitle(utxo.actions.blocked, "split", PUBLIC_COIN_BLOCKED_COPY.split);
+    split.disabled = actionState.split.disabled;
+    split.title = actionState.split.title;
     split.addEventListener("click", (event) => {
       event.stopPropagation();
       more.open = false;
@@ -5761,13 +5729,8 @@ function renderCoinsList() {
     transfer.className = "btn btn-ghost btn-sm";
     transfer.setAttribute("role", "menuitem");
     transfer.textContent = "Transfer to…";
-    const canTransfer = otherWallets().length > 0 && utxo.actions.transfer;
-    transfer.disabled = !canTransfer;
-    transfer.title = !utxo.actions.transfer
-      ? coinBlockedTitle(utxo.actions.blocked, "transfer", PUBLIC_COIN_BLOCKED_COPY.transfer)
-      : otherWallets().length === 0
-        ? "Add another wallet to transfer coins between them."
-        : "Send this coin to another wallet on this device";
+    transfer.disabled = actionState.transfer.disabled;
+    transfer.title = actionState.transfer.title;
     transfer.addEventListener("click", (event) => {
       event.stopPropagation();
       more.open = false;
@@ -5859,7 +5822,7 @@ function renderCoinsList() {
 
 const CHURN_BANNER_DISMISSED_KEY = "ltc-churn-banner-dismissed";
 
-let churnPending: "retry" | "cancel" | null = null;
+let churnPending: ChurnPending = null;
 
 /**
  * In-flight transfer, split, or private send, keyed by coin id. Several coins
@@ -5948,16 +5911,6 @@ let churnWatchId: string | null = null;
 let churnSettledId: string | null = null;
 let churnSettledNeedsScroll = false;
 
-function churnPhaseActive(phase: ChurnPhase | null | undefined): boolean {
-  return (
-    phase === "waiting-to-broadcast" ||
-    phase === "waiting-for-cover" ||
-    phase === "waiting-confirm" ||
-    phase === "paused-solo" ||
-    phase === "paused-unscored"
-  );
-}
-
 /** Show the wait on the confirmed coin before start_churn returns. */
 function stampChurnStarting() {
   if (!churnStartingId) return;
@@ -5978,7 +5931,6 @@ function stampChurnStarting() {
   coin.churn_cover_outputs = null;
   coin.churn_cover_error = null;
   coin.churn_spreading = false;
-  coin.locked = true;
   coin.status = "churning";
   coin.actions = {
     spend_to_self: false,
@@ -6219,49 +6171,8 @@ function coinBusyOrUnspendable(coin: MwebUtxoRecord): boolean {
   );
 }
 
-type CoinButton = "split" | "transfer" | "spend";
-
-const COIN_BLOCKED_COPY: Record<CoinButton, { frozen: string; unconfirmed: string }> = {
-  split: { frozen: "Unfreeze to split.", unconfirmed: "Cannot spend privately until confirmed." },
-  transfer: { frozen: "Unfreeze to transfer.", unconfirmed: "Cannot transfer until confirmed." },
-  spend: { frozen: "Unfreeze to spend.", unconfirmed: "Cannot spend privately until confirmed." },
-};
-
-const PUBLIC_COIN_BLOCKED_COPY: Record<CoinButton, { frozen: string; unconfirmed: string }> = {
-  split: { frozen: "Unfreeze to split.", unconfirmed: "Split is disabled until the coin is confirmed." },
-  transfer: {
-    frozen: "Unfreeze to transfer.",
-    unconfirmed: "Transfer is disabled until the coin is confirmed.",
-  },
-  spend: { frozen: "Unfreeze to spend.", unconfirmed: "Cannot spend until confirmed." },
-};
-
-/** Tooltip for a coin button the backend turned off. */
-function coinBlockedTitle(
-  blocked: CoinBlock | null,
-  button: CoinButton,
-  copy = COIN_BLOCKED_COPY[button],
-): string {
-  switch (blocked?.kind) {
-    case "churning":
-      return "A self-spend has this coin.";
-    case "sending":
-      return "A send is still using this coin.";
-    case "frozen":
-      return copy.frozen;
-    case "maturing":
-      return `Matures in ${blocked.blocks_left} block${blocked.blocks_left === 1 ? "" : "s"}.`;
-    default:
-      return copy.unconfirmed;
-  }
-}
-
 /** Session-only: which private coin rows show expanded technical detail. */
 const mwebCoinExpanded = new Set<string>();
-
-function freezeLabel(coin: MwebUtxoRecord): string {
-  return coin.actions.unfreeze ? "Unfreeze" : "Freeze";
-}
 
 const COIN_ROW_CLASS: Partial<Record<CoinStatus, string>> = {
   sending: "is-pending",
@@ -6323,15 +6234,15 @@ function publicRowStatusLine(utxo: UtxoRecord): string {
   return `${kind} · ${publicConfLabel(utxo)}`;
 }
 
-function publicFreezeButton(utxo: UtxoRecord, onClick: () => void): HTMLButtonElement {
+function coinFreezeButton(spec: FreezeButtonSpec, onClick: () => void): HTMLButtonElement {
   const freeze = document.createElement("button");
   freeze.type = "button";
   freeze.className = "btn btn-ghost btn-sm utxo-freeze";
   freeze.setAttribute("role", "menuitem");
-  freeze.textContent = utxo.actions.unfreeze ? "Unfreeze" : "Freeze";
-  freeze.disabled = !utxo.actions.freeze && !utxo.actions.unfreeze;
-  if (freeze.disabled) {
-    freeze.title = coinBlockedTitle(utxo.actions.blocked, "spend", PUBLIC_COIN_BLOCKED_COPY.spend);
+  freeze.textContent = spec.label;
+  freeze.disabled = spec.disabled;
+  if (spec.disabled && spec.title) {
+    freeze.title = spec.title;
   }
   freeze.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -6613,36 +6524,23 @@ function renderChurnStatus() {
 
   const actions = document.createElement("div");
   actions.className = "churn-status-actions";
-  const allowed = coin.churn_actions;
-  if (allowed?.retry) {
-    const again = document.createElement("button");
-    again.type = "button";
-    again.className = "btn btn-primary btn-sm";
-    again.textContent = "Try again";
-    again.disabled = churnPending != null;
-    again.addEventListener("click", () => void retryChurn());
-    actions.append(again);
-  }
-  if (allowed?.open_settings) {
-    const settings = document.createElement("button");
-    settings.type = "button";
-    settings.className = "btn btn-primary btn-sm";
-    settings.textContent = "Open Settings";
-    settings.disabled = churnPending != null;
-    settings.addEventListener("click", () => {
-      setView("settings");
-      el.settingsRpc.focus();
-    });
-    actions.append(settings);
-  }
-  if (allowed?.cancel) {
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.className = "btn btn-ghost btn-sm";
-    cancel.textContent = "Cancel";
-    cancel.disabled = churnPending != null;
-    cancel.addEventListener("click", () => void cancelChurn());
-    actions.append(cancel);
+  for (const spec of churnActionButtons(coin.churn_actions, churnPending)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `btn btn-${spec.kind} btn-sm`;
+    btn.textContent = spec.label;
+    btn.disabled = spec.disabled;
+    if (spec.id === "retry") {
+      btn.addEventListener("click", () => void retryChurn());
+    } else if (spec.id === "open-settings") {
+      btn.addEventListener("click", () => {
+        setView("settings");
+        el.settingsRpc.focus();
+      });
+    } else {
+      btn.addEventListener("click", () => void cancelChurn());
+    }
+    actions.append(btn);
   }
   if (actions.childElementCount > 0) card.append(actions);
 }
@@ -6660,9 +6558,12 @@ function renderMwebCoinsList() {
     if (coin.actions.unfreeze) frozenCount += 1;
     if (churnNeedsAttention(coin)) attentionCount += 1;
     const spendPending = pendingCoinSpend("private", coin.output_id);
-    const jobHolds = coin.status === "churning" || coin.status === "sending" || !!spendPending;
+    const actionState = privateCoinActionState(coin, {
+      hasOtherWallets: otherWallets().length > 0,
+      inFlightSpend: !!spendPending,
+    });
+    const { jobHolds } = actionState;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
-    const tied = coin.status === "tied-to-pegin";
     const expanded = mwebCoinExpanded.has(coin.output_id);
     const li = document.createElement("li");
     li.dataset.outputId = coin.output_id;
@@ -6706,12 +6607,12 @@ function renderMwebCoinsList() {
     if (!jobHolds) {
       const actions = document.createElement("div");
       actions.className = "split-actions split-actions-private";
-      if (coin.actions.spend_to_self) {
+      if (actionState.spendToSelf.visible) {
         const spend = document.createElement("button");
         spend.type = "button";
-        spend.className = tied ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm";
-        spend.textContent = "Spend to self";
-        spend.title = "Spend this coin to an address of this wallet";
+        spend.className = `btn btn-${actionState.spendToSelf.kind} btn-sm`;
+        spend.textContent = actionState.spendToSelf.label;
+        spend.title = actionState.spendToSelf.title;
         spend.addEventListener("click", () => void openChurnModal(coin));
         actions.append(spend);
       }
@@ -6749,14 +6650,7 @@ function renderMwebCoinsList() {
         renderMwebCoinsList();
       });
 
-      const freeze = document.createElement("button");
-      freeze.type = "button";
-      freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-      freeze.setAttribute("role", "menuitem");
-      freeze.textContent = freezeLabel(coin);
-      freeze.disabled = !coin.actions.freeze && !coin.actions.unfreeze;
-      freeze.addEventListener("click", (event) => {
-        event.stopPropagation();
+      const freeze = coinFreezeButton(actionState.freeze, () => {
         more.open = false;
         void toggleMwebLocked(coin);
       });
@@ -6766,10 +6660,8 @@ function renderMwebCoinsList() {
       split.className = "btn btn-ghost btn-sm";
       split.setAttribute("role", "menuitem");
       split.textContent = "Split";
-      split.disabled = !coin.actions.split;
-      split.title = coin.actions.split
-        ? "Split this private coin into multiple outputs"
-        : coinBlockedTitle(coin.actions.blocked, "split");
+      split.disabled = actionState.split.disabled;
+      split.title = actionState.split.title;
       split.addEventListener("click", (event) => {
         event.stopPropagation();
         more.open = false;
@@ -6785,13 +6677,8 @@ function renderMwebCoinsList() {
       transfer.className = "btn btn-ghost btn-sm";
       transfer.setAttribute("role", "menuitem");
       transfer.textContent = "Transfer to…";
-      const canTransfer = otherWallets().length > 0 && coin.actions.transfer;
-      transfer.disabled = !canTransfer;
-      transfer.title = !coin.actions.transfer
-        ? coinBlockedTitle(coin.actions.blocked, "transfer")
-        : otherWallets().length === 0
-            ? "Add another wallet to transfer coins between them."
-            : "Send this coin to another wallet on this device";
+      transfer.disabled = actionState.transfer.disabled;
+      transfer.title = actionState.transfer.title;
       transfer.addEventListener("click", (event) => {
         event.stopPropagation();
         more.open = false;
@@ -7189,7 +7076,8 @@ function renderMwebControlList(panel: CoinControlPanel) {
   panel.empty.hidden = mwebUtxoCache.length > 0;
   const sorted = sortMwebCoins(mwebUtxoCache);
   for (const coin of sorted) {
-    const jobHolds = coin.status === "churning" || coin.status === "sending";
+    const actionState = privateCoinActionState(coin);
+    const { jobHolds } = actionState;
     const justSpent = !jobHolds && coin.output_id === churnSettledId;
     const expanded = mwebCoinExpanded.has(coin.output_id);
     const li = document.createElement("li");
@@ -7200,13 +7088,12 @@ function renderMwebControlList(panel: CoinControlPanel) {
     if (justSpent) rowClass.push("is-just-spent");
     li.className = rowClass.join(" ");
 
+    if (actionState.select.disabled) panel.selected.delete(coin.output_id);
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.disabled = !coin.actions.select;
+    check.disabled = actionState.select.disabled;
     check.checked = panel.selected.has(coin.output_id);
-    check.title = coin.actions.select
-      ? "Include this coin"
-      : coinBlockedTitle(coin.actions.blocked, "spend");
+    check.title = actionState.select.title;
     check.addEventListener("change", () => {
       if (check.checked) panel.selected.add(coin.output_id);
       else panel.selected.delete(coin.output_id);
@@ -7282,14 +7169,7 @@ function renderMwebControlList(panel: CoinControlPanel) {
         renderMwebControlList(panel);
       });
 
-      const freeze = document.createElement("button");
-      freeze.type = "button";
-      freeze.className = "btn btn-ghost btn-sm utxo-freeze";
-      freeze.setAttribute("role", "menuitem");
-      freeze.textContent = freezeLabel(coin);
-      freeze.disabled = !coin.actions.freeze && !coin.actions.unfreeze;
-      freeze.addEventListener("click", (event) => {
-        event.stopPropagation();
+      const freeze = coinFreezeButton(actionState.freeze, () => {
         more.open = false;
         void toggleMwebLocked(coin);
       });
@@ -7412,32 +7292,36 @@ async function refreshUtxos() {
 }
 
 async function toggleUtxoLocked(utxo: UtxoRecord) {
+  const locked = freezeTargetLocked(utxo.actions);
+  if (locked == null) return;
   try {
     await invoke("set_utxo_locked", {
-      req: { outpoint: utxo.outpoint, locked: !utxo.locked },
+      req: { outpoint: utxo.outpoint, locked },
     });
-    if (!utxo.locked) {
+    if (locked) {
       sendSelectedOutpoints.delete(utxo.outpoint);
       peginSelectedOutpoints.delete(utxo.outpoint);
     }
     await refreshUtxos();
-    setStatus(utxo.locked ? "Coin unfrozen." : "Coin frozen.", "success");
+    setStatus(locked ? "Coin frozen." : "Coin unfrozen.", "success");
   } catch (e) {
     setStatus(String(e), "error");
   }
 }
 
 async function toggleMwebLocked(coin: MwebUtxoRecord) {
+  const locked = freezeTargetLocked(coin.actions);
+  if (locked == null) return;
   try {
     await invoke("set_mweb_utxo_locked", {
-      req: { output_id: coin.output_id, locked: !coin.locked },
+      req: { output_id: coin.output_id, locked },
     });
-    if (!coin.locked) {
+    if (locked) {
       mwebSendSelectedIds.delete(coin.output_id);
       pegoutSelectedIds.delete(coin.output_id);
     }
     await refreshUtxos();
-    setStatus(coin.locked ? "Coin unfrozen." : "Coin frozen.", "success");
+    setStatus(locked ? "Coin frozen." : "Coin unfrozen.", "success");
   } catch (e) {
     setStatus(String(e), "error");
   }

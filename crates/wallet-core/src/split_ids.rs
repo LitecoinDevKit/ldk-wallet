@@ -49,7 +49,7 @@ pub fn write_ids(data_dir: &Path, file: &SplitIdsFile) -> Result<(), WalletError
     } else {
         let json =
             serde_json::to_string_pretty(file).map_err(|e| WalletError::Meta(e.to_string()))?;
-        fs::write(split_ids_path(data_dir), json)?;
+        crate::fs_atomic::write_atomic(&split_ids_path(data_dir), json.as_bytes())?;
         Ok(())
     }
 }

@@ -8,6 +8,7 @@ mod app;
 mod broadcast_peers;
 mod churn;
 mod contacts;
+mod crashpoint;
 mod descriptors;
 mod diag;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod dto;
 mod electrum;
 mod error;
 pub mod explorer;
+mod fs_atomic;
 mod history_export;
 mod insights;
 mod labels;

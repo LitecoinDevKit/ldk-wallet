@@ -199,6 +199,8 @@ pub struct MwebRuntime {
     pub last_good_peer: Option<std::net::SocketAddr>,
     /// Full aggregate coin changeset mirrored on disk (sealed persistence).
     agg: ChangeSet,
+    /// Highest v2 envelope counter observed on open or written by `persist`.
+    loaded_seal_counter: u64,
     /// Key for encrypting MWEB files at rest; `None` falls back to the legacy
     /// plaintext formats (tests / plaintext-era wallets awaiting migration).
     sealing_key: Option<zeroize::Zeroizing<[u8; 32]>>,
@@ -374,10 +376,30 @@ impl MwebRuntime {
             .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
         let key_ref = sealing_key.as_deref();
-        let (store, agg) = load_store(data_dir, key_ref)?;
-        let sync_state = load_sync_state(data_dir, key_ref)?;
-        let receive_index = load_receive_index(data_dir, key_ref)?;
-        let history = load_history(data_dir, key_ref)?;
+        let saved_counter = if key_ref.is_some() {
+            load_seal_counter(data_dir)
+        } else {
+            0
+        };
+        let (store, agg, coins_counter) = load_store(data_dir, key_ref, saved_counter)?;
+        let (sync_state, sync_counter) = load_sync_state(data_dir, key_ref, saved_counter)?;
+        let (receive_index, index_counter) = load_receive_index(data_dir, key_ref, saved_counter)?;
+        let (history, history_counter) = load_history(data_dir, key_ref, saved_counter)?;
+
+        let v2_counters: Vec<u64> = [coins_counter, sync_counter, index_counter, history_counter]
+            .into_iter()
+            .flatten()
+            .collect();
+        if let (Some(&min_c), Some(&max_c)) = (v2_counters.iter().min(), v2_counters.iter().max()) {
+            // A kill mid-persist leaves at most a 1-step split ({C, C+1}) across the
+            // four blobs. A wider gap means an individual file was rolled back.
+            if max_c.saturating_sub(min_c) > 1 {
+                return Err(WalletError::Mweb(format!(
+                    "sealed MWEB files have inconsistent persist counters ({min_c} vs {max_c})"
+                )));
+            }
+        }
+        let loaded_seal_counter = v2_counters.into_iter().fold(saved_counter, u64::max);
 
         Ok(Self {
             store,
@@ -392,6 +414,7 @@ impl MwebRuntime {
             cross_check_warning: None,
             last_good_peer: None,
             agg,
+            loaded_seal_counter,
             sealing_key,
             secp,
         })
@@ -401,13 +424,38 @@ impl MwebRuntime {
         if let Some(ref key) = self.sealing_key {
             self.agg.merge(self.store.take_staged());
             // One counter for all four blobs, so a later read can tell whether
-            // they came from the same persist.
-            let counter = load_seal_counter(data_dir).saturating_add(1);
+            // they came from the same persist. Taking max(disk, loaded) ensures
+            // a restart after a crash right before save_seal_counter never
+            // reuses the interrupted persist's counter.
+            let counter = load_seal_counter(data_dir)
+                .max(self.loaded_seal_counter)
+                .saturating_add(1);
+
+            // Crash-safe write order: index -> coins -> history -> sync_state -> counter.
+            // SyncState is last among the blobs so a kill mid-persist never records
+            // a synced tip height ahead of the coins and history discovered at that tip.
+            let index_str = zeroize::Zeroizing::new(self.receive_index.to_string());
+            write_sealed(
+                &meta::mweb_index_enc_path(data_dir),
+                seal_bytes(key, index_str.as_bytes(), SealContext::Index, counter)?,
+            )?;
+            crate::crashpoint::maybe_crash("persist_after_index_enc");
 
             let coins =
                 bdk_mweb::seal_changeset_with_context(key, &self.agg, SealContext::Coins, counter)
                     .map_err(|e| WalletError::Mweb(e.to_string()))?;
             write_sealed(&meta::mweb_coins_enc_path(data_dir), coins)?;
+            crate::crashpoint::maybe_crash("persist_after_coins_enc");
+
+            let history_json = zeroize::Zeroizing::new(
+                serde_json::to_vec(&self.history).map_err(|e| WalletError::Mweb(e.to_string()))?,
+            );
+            write_sealed(
+                &meta::mweb_history_enc_path(data_dir),
+                seal_bytes(key, &history_json, SealContext::History, counter)?,
+            )?;
+            crate::crashpoint::maybe_crash("persist_after_history_enc");
+
             let sync_json = zeroize::Zeroizing::new(
                 serde_json::to_vec(&self.sync_state)
                     .map_err(|e| WalletError::Mweb(e.to_string()))?,
@@ -416,22 +464,13 @@ impl MwebRuntime {
                 &meta::mweb_sync_enc_path(data_dir),
                 seal_bytes(key, &sync_json, SealContext::SyncState, counter)?,
             )?;
-            let index_str = zeroize::Zeroizing::new(self.receive_index.to_string());
-            write_sealed(
-                &meta::mweb_index_enc_path(data_dir),
-                seal_bytes(key, index_str.as_bytes(), SealContext::Index, counter)?,
-            )?;
-            let history_json = zeroize::Zeroizing::new(
-                serde_json::to_vec(&self.history).map_err(|e| WalletError::Mweb(e.to_string()))?,
-            );
-            write_sealed(
-                &meta::mweb_history_enc_path(data_dir),
-                seal_bytes(key, &history_json, SealContext::History, counter)?,
-            )?;
+            crate::crashpoint::maybe_crash("persist_after_sync_enc");
+
             // Written last: a crash between the blobs and the counter leaves the
-            // counter behind, which reads as "not yet advanced" rather than as a
-            // rollback.
+            // counter behind by 1, which reads as an interrupted persist rather
+            // than a rollback.
             save_seal_counter(data_dir, counter)?;
+            self.loaded_seal_counter = counter;
             // Everything is sealed on disk now; drop plaintext-era leftovers.
             remove_legacy_plaintext_files(data_dir);
         } else {
@@ -687,6 +726,11 @@ impl MwebRuntime {
 
     pub fn disconnect_from(&mut self, height: u32) {
         self.store.disconnect_from(height);
+        self.sync_state.height_map.retain(|&h, _| h < height);
+        if self.sync_state.tip_height.is_some_and(|h| h >= height) {
+            self.sync_state.tip_height = height.checked_sub(1);
+            self.sync_state.invalidate_leafset();
+        }
         // Reorged-out entries must be re-resolved on the new chain.
         for entry in &mut self.history.entries {
             if entry.confirmed_height.is_some_and(|h| h >= height) {
@@ -845,14 +889,14 @@ fn restore_stale_unconfirmed_inputs(
         })
         .collect();
     for id in input_ids {
-        let Some(coin) = db.get_spent(&id).cloned() else {
+        let Some(coin) = db.get_spent(&id) else {
             continue;
         };
         let Some(leaf) = coin.leaf_index else {
             continue;
         };
         if leafset_has_leaf(leafset, leaf) {
-            db.insert(coin);
+            let _ = db.restore_spent(&id);
         }
     }
 }
@@ -2345,6 +2389,124 @@ mod tests {
     }
 
     #[test]
+    fn partial_rollback_of_any_sealed_blob_is_rejected_on_open() {
+        let (dir, secret, key) = sealed_fixture();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        let paths = [
+            meta::mweb_coins_enc_path(dir.path()),
+            meta::mweb_sync_enc_path(dir.path()),
+            meta::mweb_index_enc_path(dir.path()),
+            meta::mweb_history_enc_path(dir.path()),
+        ];
+        let v1_blobs: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+        // Advance to counter 2 and counter 3.
+        for _ in 0..2 {
+            let mut rt = MwebRuntime::open(
+                dir.path(),
+                &secret,
+                WalletNetwork::Testnet,
+                scheme,
+                0,
+                Some(zeroize::Zeroizing::new(key)),
+            )
+            .unwrap();
+            rt.persist(dir.path()).unwrap();
+        }
+        assert_eq!(load_seal_counter(dir.path()), 3);
+        let v3_blobs: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+        // Rolling back any single blob to counter 1 must fail open, both with
+        // mweb_seal_counter.txt intact (3) and if an attacker also rolled back
+        // mweb_seal_counter.txt to 1 while leaving the other blobs at 3.
+        for (idx, path) in paths.iter().enumerate() {
+            save_seal_counter(dir.path(), 3).unwrap();
+            std::fs::write(path, &v1_blobs[idx]).unwrap();
+            let res = MwebRuntime::open(
+                dir.path(),
+                &secret,
+                WalletNetwork::Testnet,
+                scheme,
+                0,
+                Some(zeroize::Zeroizing::new(key)),
+            );
+            assert!(
+                res.is_err(),
+                "rolling back {} below seal counter was accepted",
+                path.display()
+            );
+
+            // Even if mweb_seal_counter.txt is rolled back to 1 alongside that
+            // single blob, a 2-step spread (1 vs 3) across the four blobs must
+            // be rejected as a partial rollback rather than a mid-persist crash.
+            save_seal_counter(dir.path(), 1).unwrap();
+            let res_spread = MwebRuntime::open(
+                dir.path(),
+                &secret,
+                WalletNetwork::Testnet,
+                scheme,
+                0,
+                Some(zeroize::Zeroizing::new(key)),
+            );
+            assert!(
+                res_spread.is_err(),
+                "rolling back {} + seal_counter (spread 1 vs 3) was accepted",
+                path.display()
+            );
+
+            // Restore v3 blob before testing the next one.
+            std::fs::write(path, &v3_blobs[idx]).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_persist_before_seal_counter_recovers_and_advances_monotonically() {
+        let (dir, secret, key) = sealed_fixture();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        assert_eq!(load_seal_counter(dir.path()), 1);
+
+        // Advance to counter 2, then simulate a kill right before save_seal_counter
+        // by restoring mweb_seal_counter.txt to 1 while the blobs carry counter 2.
+        let mut rt = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            WalletNetwork::Testnet,
+            scheme,
+            0,
+            Some(zeroize::Zeroizing::new(key)),
+        )
+        .unwrap();
+        rt.receive_index = 11;
+        rt.persist(dir.path()).unwrap();
+        save_seal_counter(dir.path(), 1).unwrap();
+
+        // Reopen and persist again: must open cleanly and write counter 3 (never
+        // reusing counter 2).
+        let mut recovered = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            WalletNetwork::Testnet,
+            scheme,
+            0,
+            Some(zeroize::Zeroizing::new(key)),
+        )
+        .unwrap();
+        assert_eq!(recovered.receive_index, 11);
+        recovered.persist(dir.path()).unwrap();
+        assert_eq!(load_seal_counter(dir.path()), 3);
+        for path in [
+            meta::mweb_coins_enc_path(dir.path()),
+            meta::mweb_sync_enc_path(dir.path()),
+            meta::mweb_index_enc_path(dir.path()),
+            meta::mweb_history_enc_path(dir.path()),
+        ] {
+            let blob = std::fs::read(&path).unwrap();
+            let counter = u64::from_le_bytes(blob[10..18].try_into().unwrap());
+            assert_eq!(counter, 3, "{} did not advance to 3", path.display());
+        }
+    }
+
+    #[test]
     fn legacy_sealed_blobs_still_open() {
         // Wallets written before the v2 envelope must keep working with no
         // migration step; the next persist rewrites them as v2.
@@ -2451,19 +2613,29 @@ fn seal_bytes(
         .map_err(|e| WalletError::Mweb(e.to_string()))
 }
 
+struct OpenedSealed {
+    plain: zeroize::Zeroizing<Vec<u8>>,
+    counter: Option<u64>,
+}
+
 /// Open a sealed file; `Ok(None)` when the file does not exist.
 ///
-/// Reads both envelope versions. A v2 blob must carry `context`; a legacy blob
-/// predates the tag and is accepted as-is, so wallets written by an older build
-/// keep opening with no migration step. The next `persist` rewrites it as v2.
+/// Reads both envelope versions. A v2 blob must carry `context` and a counter
+/// at least `min_counter`; a legacy blob predates the tag and is accepted only
+/// when `min_counter == 0` (before the first v2 persist). The next `persist`
+/// rewrites it as v2.
 fn read_sealed(
     path: &Path,
     key: &[u8; 32],
     context: SealContext,
-) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, WalletError> {
+    min_counter: u64,
+) -> Result<Option<OpenedSealed>, WalletError> {
     match fs::read(path) {
-        Ok(blob) => open_sealed_blob(&blob, key, context)
-            .map(zeroize::Zeroizing::new)
+        Ok(blob) => open_sealed_blob(&blob, key, context, min_counter)
+            .map(|(pt, counter)| OpenedSealed {
+                plain: zeroize::Zeroizing::new(pt),
+                counter,
+            })
             .map(Some)
             .map_err(|e| WalletError::Mweb(format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2475,11 +2647,17 @@ fn open_sealed_blob(
     blob: &[u8],
     key: &[u8; 32],
     context: SealContext,
-) -> Result<Vec<u8>, bdk_mweb::Error> {
+    min_counter: u64,
+) -> Result<(Vec<u8>, Option<u64>), bdk_mweb::Error> {
     if bdk_mweb::is_v2(blob) {
-        bdk_mweb::open_with_context(key, blob, context)
+        bdk_mweb::open_with_context_at_least(key, blob, context, min_counter)
+            .map(|(pt, counter)| (pt, Some(counter)))
+    } else if min_counter > 0 {
+        Err(bdk_mweb::Error::Crypto(
+            "legacy v1 sealed blob rejected after v2 upgrade".into(),
+        ))
     } else {
-        bdk_mweb::open(key, blob)
+        bdk_mweb::open(key, blob).map(|pt| (pt, None))
     }
 }
 
@@ -2503,9 +2681,9 @@ fn load_seal_counter(data_dir: &Path) -> u64 {
 }
 
 fn save_seal_counter(data_dir: &Path, counter: u64) -> Result<(), WalletError> {
-    fs::write(
-        meta::mweb_seal_counter_path(data_dir),
-        format!("{counter}\n"),
+    crate::fs_atomic::write_atomic(
+        &meta::mweb_seal_counter_path(data_dir),
+        format!("{counter}\n").as_bytes(),
     )?;
     Ok(())
 }
@@ -2536,24 +2714,29 @@ fn remove_legacy_plaintext_files(data_dir: &Path) {
 fn load_store(
     data_dir: &Path,
     sealing_key: Option<&[u8; 32]>,
-) -> Result<(MwebStore, ChangeSet), WalletError> {
+    min_counter: u64,
+) -> Result<(MwebStore, ChangeSet, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
         let path = meta::mweb_coins_enc_path(data_dir);
         if path.is_file() {
             let blob = fs::read(&path)?;
-            let cs = if bdk_mweb::is_v2(&blob) {
-                bdk_mweb::open_changeset_with_context(key, &blob, SealContext::Coins, 0)
-                    .map(|(cs, _counter)| cs)
+            let (cs, counter) = if bdk_mweb::is_v2(&blob) {
+                bdk_mweb::open_changeset_with_context(key, &blob, SealContext::Coins, min_counter)
+                    .map(|(cs, counter)| (cs, Some(counter)))
+            } else if min_counter > 0 {
+                Err(bdk_mweb::Error::Crypto(
+                    "legacy v1 sealed store rejected after v2 upgrade".into(),
+                ))
             } else {
-                bdk_mweb::open_changeset(key, &blob)
+                bdk_mweb::open_changeset(key, &blob).map(|cs| (cs, None))
             }
             .map_err(|e| WalletError::Mweb(format!("sealed MWEB store: {e}")))?;
-            return Ok((MwebStore::from_changeset(cs.clone()), cs));
+            return Ok((MwebStore::from_changeset(cs.clone()), cs, counter));
         }
     }
     let path = meta::mweb_db_path(data_dir);
     if !path.is_file() {
-        return Ok((MwebStore::new(), ChangeSet::default()));
+        return Ok((MwebStore::new(), ChangeSet::default(), None));
     }
     let mut conn = Connection::open(&path).map_err(|e| WalletError::Mweb(e.to_string()))?;
     let tx = conn
@@ -2562,7 +2745,7 @@ fn load_store(
     ChangeSet::init_sqlite_tables(&tx).map_err(|e| WalletError::Mweb(e.to_string()))?;
     let cs = ChangeSet::from_sqlite(&tx).map_err(|e| WalletError::Mweb(e.to_string()))?;
     tx.commit().map_err(|e| WalletError::Mweb(e.to_string()))?;
-    Ok((MwebStore::from_changeset(cs.clone()), cs))
+    Ok((MwebStore::from_changeset(cs.clone()), cs, None))
 }
 
 fn persist_store(data_dir: &Path, store: &mut MwebStore) -> Result<(), WalletError> {
@@ -2581,68 +2764,87 @@ fn persist_store(data_dir: &Path, store: &mut MwebStore) -> Result<(), WalletErr
 fn load_sync_state(
     data_dir: &Path,
     sealing_key: Option<&[u8; 32]>,
-) -> Result<SyncState, WalletError> {
+    min_counter: u64,
+) -> Result<(SyncState, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(plain) = read_sealed(
+        if let Some(opened) = read_sealed(
             &meta::mweb_sync_enc_path(data_dir),
             key,
             SealContext::SyncState,
+            min_counter,
         )? {
-            return serde_json::from_slice(&plain).map_err(|e| WalletError::Mweb(e.to_string()));
+            let state = serde_json::from_slice(&opened.plain)
+                .map_err(|e| WalletError::Mweb(e.to_string()))?;
+            return Ok((state, opened.counter));
         }
     }
     let path = meta::mweb_sync_path(data_dir);
     match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| WalletError::Mweb(e.to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SyncState::default()),
+        Ok(s) => {
+            let state = serde_json::from_str(&s).map_err(|e| WalletError::Mweb(e.to_string()))?;
+            Ok((state, None))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((SyncState::default(), None)),
         Err(e) => Err(WalletError::Io(e)),
     }
 }
 
 fn save_sync_state(data_dir: &Path, state: &SyncState) -> Result<(), WalletError> {
     let json = serde_json::to_string_pretty(state).map_err(|e| WalletError::Mweb(e.to_string()))?;
-    fs::write(meta::mweb_sync_path(data_dir), json)?;
+    crate::fs_atomic::write_atomic(&meta::mweb_sync_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 
-fn load_receive_index(data_dir: &Path, sealing_key: Option<&[u8; 32]>) -> Result<u32, WalletError> {
+fn load_receive_index(
+    data_dir: &Path,
+    sealing_key: Option<&[u8; 32]>,
+    min_counter: u64,
+) -> Result<(u32, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(plain) = read_sealed(
+        if let Some(opened) = read_sealed(
             &meta::mweb_index_enc_path(data_dir),
             key,
             SealContext::Index,
+            min_counter,
         )? {
-            let s = String::from_utf8_lossy(&plain);
-            return Ok(s.trim().parse().unwrap_or(0));
+            let s = String::from_utf8_lossy(&opened.plain);
+            return Ok((s.trim().parse().unwrap_or(0), opened.counter));
         }
     }
     let path = meta::mweb_index_path(data_dir);
     match fs::read_to_string(&path) {
-        Ok(s) => Ok(s.trim().parse().unwrap_or(0)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Ok(s) => Ok((s.trim().parse().unwrap_or(0), None)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
         Err(e) => Err(WalletError::Io(e)),
     }
 }
 
 fn save_receive_index(data_dir: &Path, index: u32) -> Result<(), WalletError> {
-    fs::write(meta::mweb_index_path(data_dir), format!("{index}\n"))?;
+    crate::fs_atomic::write_atomic(
+        &meta::mweb_index_path(data_dir),
+        format!("{index}\n").as_bytes(),
+    )?;
     Ok(())
 }
 
 fn load_history(
     data_dir: &Path,
     sealing_key: Option<&[u8; 32]>,
-) -> Result<MwebHistory, WalletError> {
+    min_counter: u64,
+) -> Result<(MwebHistory, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(plain) = read_sealed(
+        if let Some(opened) = read_sealed(
             &meta::mweb_history_enc_path(data_dir),
             key,
             SealContext::History,
+            min_counter,
         )? {
-            return serde_json::from_slice(&plain).map_err(|e| WalletError::Mweb(e.to_string()));
+            let history = serde_json::from_slice(&opened.plain)
+                .map_err(|e| WalletError::Mweb(e.to_string()))?;
+            return Ok((history, opened.counter));
         }
     }
-    MwebHistory::load(&meta::mweb_history_path(data_dir))
+    Ok((MwebHistory::load(&meta::mweb_history_path(data_dir))?, None))
 }
 
 fn resolve_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>, WalletError> {
@@ -3545,9 +3747,7 @@ pub fn recall_unlanded_spend(
         let Some(id) = decode_output_id(id_hex) else {
             continue;
         };
-        if let Some(coin) = db.get_spent(&id).cloned() {
-            db.insert(coin);
-        }
+        let _ = db.restore_spent(&id);
     }
     for id_hex in &entry.output_ids {
         let Some(id) = decode_output_id(id_hex) else {

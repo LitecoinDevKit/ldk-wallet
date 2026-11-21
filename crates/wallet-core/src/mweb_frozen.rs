@@ -86,7 +86,7 @@ pub fn write_ids(data_dir: &Path, file: &MwebFrozenFile) -> Result<(), WalletErr
     } else {
         let json =
             serde_json::to_string_pretty(file).map_err(|e| WalletError::Meta(e.to_string()))?;
-        fs::write(frozen_path(data_dir), json)?;
+        crate::fs_atomic::write_atomic(&frozen_path(data_dir), json.as_bytes())?;
         Ok(())
     }
 }
@@ -111,12 +111,12 @@ fn edit(
 pub fn set_locked(data_dir: &Path, output_id: &str, locked: bool) -> Result<(), WalletError> {
     let id = normalize_output_id(output_id)?;
     edit(data_dir, |file| {
-        if locked {
-            file.ids.insert(id);
+        let changed = if locked {
+            file.ids.insert(id)
         } else {
-            file.ids.remove(&id);
-        }
-        Ok(true)
+            file.ids.remove(&id)
+        };
+        Ok(changed)
     })
 }
 

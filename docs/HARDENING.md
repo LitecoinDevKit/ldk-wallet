@@ -4,10 +4,10 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Persistence atomicity and crash recovery (item 17).
-2. Transaction construction and value invariants (item 18).
-3. Diagram and table checks on every PR (item 7).
-4. Logging for phase changes, holds and rejections (item 15).
+1. Transaction construction and value invariants (item 18).
+2. Diagram and table checks on every PR (item 7).
+3. Logging for phase changes, holds and rejections (item 15).
+4. Untrusted input bounds (item 19).
 
 ## Status
 
@@ -29,7 +29,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
 | 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). Redaction is in `redact.rs` (item 16). |
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
-| 17 | Persistence atomicity and crash recovery | High | Not started | | Restart after a kill mid-sync, mid-churn, or mid-persist. Extends items 5 and 11. |
+| 17 | Persistence atomicity and crash recovery | High | Done | | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. |
 | 18 | Transaction construction and value invariants | High | Not started | | Amounts, fees, dust, change, and peg-in/peg-out shape. Beside the coin-status tests. |
 | 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Refines item 10. |
 | 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. |
@@ -133,6 +133,10 @@ Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Can
 **16. Secret hygiene and zeroization.** Tests that lock, auto-lock, wipe, and error returns clear the decrypted seed, the MWEB sealing key, and intermediate buffers. `Debug`, error strings, and the logs from item 15 must not contain a mnemonic, a private key, raw MWEB payloads, or a full sensitive buffer. A CI check covers this if it can run without a new harness.
 
 **17. Persistence atomicity and crash recovery.** Kill the process mid-sync, mid-churn, and mid-persist, then restart. Holds are not orphaned, phases are not stuck, and coin status matches the recovered files. Job and sealed files use a temp file and rename where they do not already. Whole-directory rollback stays the residual recorded in `docs/AUDIT_NOTES.md`.
+- `fs_atomic` (`write_atomic`, `write_atomic_0600`, `sweep_temp_files` in `crates/wallet-core/src/fs_atomic.rs`), plus atomic `0600` temp-file + `sync_all` + rename in `crates/wallet-litvm/src/settings.rs` and `crates/wallet-cli/src/main.rs`, replace in-place truncation across `wallet.mnemonic.enc`, `mweb_*.enc`, `mweb_seal_counter.txt`, `churn_job.json`, `churn_armed.json`, `churn_depth.json`, `mweb_frozen.json`, `wallet_meta.json`, `accounts.json`, and metadata sidecars. Leftover `*.tmp.*` files are swept on `load` and `wipe`.
+- `MwebRuntime::open` enforces `mweb_seal_counter.txt` (`open_changeset_with_context` and `open_with_context_at_least`), rejects legacy v1 downgrades once upgraded, and rejects a `>1` counter spread across the four sealed blobs while recovering cleanly from a `{C, C+1}` mid-persist cut (`Index -> Coins -> History -> SyncState -> save_seal_counter`). `open_wallet_state` and `create_or_restore` propagate `MwebRuntime::open` errors instead of silently loading with `mweb: None`.
+- Fixed a persistence bug in `mweb::recall_unlanded_spend` and `mweb::restore_stale_unconfirmed_inputs`: both called `db.insert(coin)` instead of `db.restore_spent(&id)`, which omitted `id` from `ChangeSet.restored` so `ChangeSet::merge` discarded the recall on `persist` and left cancelled, expired, or dropped-spend coins marked spent in `mweb_coins.enc` after restart.
+- `reconcile_churn_on_load` (plus idempotent `churn::inherit_depth`, `churn::revert_depth`, and `churn::commit_score`), `reconcile_mweb_chain_with_wallet`, `resync_mweb` pre-wipe `needs_mweb_scan` persistence, and cross-account stale-hold cleanup recover cleanly from process aborts and `SIGKILL` across `crash_recovery_tests.rs` and `crates/wallet-core/tests/crash_recovery.rs`.
 
 **18. Transaction construction and value invariants.** Checked arithmetic on amounts and fees, dust limits, and change selection. Constructed transactions, especially peg-in and peg-out, meet the expected shape and do not leave a stuck or attacker-spendable output when the path returns an error. MWEB commitment and kernel balance sit here, beside the coin-status tests.
 

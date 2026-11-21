@@ -82,10 +82,9 @@ pub fn read_registry(root: &Path) -> Result<AccountsRegistry, WalletError> {
 }
 
 pub fn write_registry(root: &Path, registry: &AccountsRegistry) -> Result<(), WalletError> {
-    fs::create_dir_all(root)?;
     let json =
         serde_json::to_string_pretty(registry).map_err(|e| WalletError::Meta(e.to_string()))?;
-    fs::write(accounts_path(root), json)?;
+    crate::fs_atomic::write_atomic(&accounts_path(root), json.as_bytes())?;
     Ok(())
 }
 

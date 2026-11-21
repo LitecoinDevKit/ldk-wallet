@@ -84,14 +84,11 @@ fn write(data_dir: &Path, peers: &[SocketAddr]) -> Result<(), WalletError> {
             Err(e) => Err(WalletError::Io(e)),
         };
     }
-    fs::create_dir_all(data_dir)?;
     let file = PeersFile {
         peers: peers.iter().map(SocketAddr::to_string).collect(),
     };
     let json = serde_json::to_string(&file).map_err(|e| WalletError::Meta(e.to_string()))?;
-    let tmp = data_dir.join(format!("{BROADCAST_PEERS_FILE}.tmp"));
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, path(data_dir))?;
+    crate::fs_atomic::write_atomic(&path(data_dir), json.as_bytes())?;
     Ok(())
 }
 

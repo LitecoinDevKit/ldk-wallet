@@ -957,6 +957,7 @@ impl WalletApp {
         self.forget_electrum();
         self.secrets.delete_mnemonic()?;
         accounts::remove_all_accounts(data_dir)?;
+        crate::fs_atomic::sweep_temp_files(data_dir);
         Ok(())
     }
 
@@ -1015,7 +1016,15 @@ impl WalletApp {
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
+        crate::fs_atomic::sweep_temp_files(data_dir);
         accounts::ensure_layout(data_dir)?;
+        if let Ok(reg) = accounts::read_registry(data_dir) {
+            for entry in &reg.accounts {
+                let dir = accounts::account_dir(data_dir, entry.index);
+                crate::fs_atomic::sweep_temp_files(&dir);
+                let _ = mweb_frozen::clear_stale(&dir, &self.session);
+            }
+        }
         let account_dir = accounts::active_account_dir(data_dir)?;
         let mut guard = self.lock_state()?;
         let state = self.read_account_state(&account_dir)?;
@@ -1059,6 +1068,7 @@ impl WalletApp {
     }
 
     fn read_account_state(&self, account_dir: &Path) -> Result<WalletState, WalletError> {
+        crate::fs_atomic::sweep_temp_files(account_dir);
         let meta = meta::read_meta(account_dir)?;
         let stored = self
             .secrets
@@ -1067,10 +1077,9 @@ impl WalletApp {
         let secret = MasterSecret::from_stored(&stored)?;
         mweb_frozen::clear_stale(account_dir, &self.session)?;
         let mut state = open_wallet_state(account_dir, &meta, &secret, self.secrets.sealing_key())?;
-        // A hop can expire or land while the wallet is locked, when the pump has
-        // no `WalletState` to update. Catch the coin store up before anyone lists it.
-        let _ = undo_expired_local(&mut state);
-        let _ = apply_pending_local(&mut state);
+        // A hop can expire or land while the wallet is locked, or the process may
+        // have died mid-persist / mid-churn. Reconcile before anyone lists coins.
+        let _ = reconcile_churn_on_load(&mut state);
         Ok(state)
     }
 
@@ -1580,6 +1589,7 @@ impl WalletApp {
             .wallet
             .persist(&mut state.db)
             .map_err(|e| WalletError::Persist(e.to_string()))?;
+        crate::crashpoint::maybe_crash("sync_after_electrum_persist");
         let electrum_ms = electrum_started.elapsed().as_millis() as u64;
 
         let tip_height = state.wallet.latest_checkpoint().height();
@@ -1589,6 +1599,8 @@ impl WalletApp {
             if let Some(ref mut mweb) = state.mweb {
                 mweb.disconnect_from(tip_height.saturating_add(1));
             }
+        } else if let Some(ref mut mweb) = state.mweb {
+            reconcile_mweb_chain_with_wallet(&state.wallet, mweb);
         }
         state.last_tip_height = tip_height;
         let timed_height = state.wallet.local_chain().tip().height();
@@ -1729,10 +1741,6 @@ impl WalletApp {
         let mut guard = self.lock_state()?;
         let pass = self.sync_pass();
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        mweb::wipe_mweb_files(&state.data_dir)?;
-        // A manual resync usually means something looked wrong, so re-crawl
-        // rather than reusing peers that may be part of the problem.
-        crate::discovery::clear_cache();
         let stored = self
             .secrets
             .get_mnemonic()?
@@ -1740,10 +1748,14 @@ impl WalletApp {
         let secret = MasterSecret::from_stored(&stored)?;
         if let Some(scheme) = new_scheme {
             state.mweb_scheme = scheme;
-            let mut meta = meta_from_state(state);
-            meta.needs_mweb_scan = true;
-            meta::write_meta(&state.data_dir, &meta)?;
         }
+        state.needs_mweb_scan = true;
+        meta::write_meta(&state.data_dir, &meta_from_state(state))?;
+        mweb::wipe_mweb_files(&state.data_dir)?;
+        crate::crashpoint::maybe_crash("resync_mweb_after_wipe");
+        // A manual resync usually means something looked wrong, so re-crawl
+        // rather than reusing peers that may be part of the problem.
+        crate::discovery::clear_cache();
         state.mweb = Some(MwebRuntime::open(
             &state.data_dir,
             &secret,
@@ -1752,7 +1764,6 @@ impl WalletApp {
             state.account_index,
             self.secrets.sealing_key(),
         )?);
-        state.needs_mweb_scan = true;
         let tip_height = state.wallet.latest_checkpoint().height();
         let tip_hash = state.wallet.latest_checkpoint().hash();
         if let Some(ref mut mweb) = state.mweb {
@@ -1778,6 +1789,7 @@ impl WalletApp {
         guard.check_lock()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         state.needs_mweb_scan = false;
+        meta::write_meta(&state.data_dir, &meta_from_state(state))?;
         pass.finish();
         Ok(())
     }
@@ -2396,14 +2408,22 @@ impl WalletApp {
         // Reject the transition before recalling the hop. Cancel only changes the
         // phase, so a refusal leaves the coin store and the freeze file alone.
         churn::request_cancel(&mut job)?;
+        let has_armed = churn::armed_path(&state.data_dir).is_file();
+        if !has_armed {
+            mweb_frozen::set_locked(&state.data_dir, &shown, false)?;
+        }
+        churn::write_job(&state.data_dir, &job)?;
+        crate::crashpoint::maybe_crash("cancel_churn_after_write_job");
         revert_unbroadcast_hop(state, &mut job)?;
         let restored = job.current_output_id.clone();
-        churn::write_job(&state.data_dir, &job)?;
-        let _ = churn::remove_armed(&state.data_dir);
+        if restored != shown {
+            churn::write_job(&state.data_dir, &job)?;
+        }
         mweb_frozen::set_locked(&state.data_dir, &shown, false)?;
         if restored != shown {
             mweb_frozen::set_locked(&state.data_dir, &restored, false)?;
         }
+        let _ = churn::remove_armed(&state.data_dir);
         Ok(churn::status_view(&job))
     }
 
@@ -2473,15 +2493,20 @@ impl WalletApp {
             }
         };
 
-        let mweb = MwebRuntime::open(
+        let mweb = match MwebRuntime::open(
             &account_dir,
             secret,
             network,
             mweb_scheme.to_master_scheme(),
             0,
             self.secrets.sealing_key(),
-        )
-        .ok();
+        ) {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                rollback(self);
+                return Err(e);
+            }
+        };
 
         let mut state = WalletState {
             last_tip_height: wallet.latest_checkpoint().height(),
@@ -2695,6 +2720,31 @@ impl Drop for StateGuard<'_> {
     }
 }
 
+fn reconcile_mweb_chain_with_wallet(
+    wallet: &PersistedWallet<Connection>,
+    mweb: &mut MwebRuntime,
+) -> bool {
+    let wallet_tip = wallet.latest_checkpoint().height();
+    let Some(mweb_tip) = mweb.sync_state.tip_height else {
+        return false;
+    };
+    if mweb_tip > wallet_tip {
+        mweb.disconnect_from(wallet_tip.saturating_add(1));
+        return true;
+    }
+    if let Some(mweb_hash) = mweb.sync_state.tip_hash {
+        if wallet
+            .local_chain()
+            .get(mweb_tip)
+            .is_some_and(|cp| cp.hash() != mweb_hash)
+        {
+            mweb.disconnect_from(mweb_tip);
+            return true;
+        }
+    }
+    false
+}
+
 fn open_wallet_state(
     account_dir: &Path,
     meta: &WalletMeta,
@@ -2708,15 +2758,17 @@ fn open_wallet_state(
     let wallet = PersistedWallet::load(&mut db, params)
         .map_err(|e| WalletError::Persist(e.to_string()))?
         .ok_or(WalletError::NotFound)?;
-    let mweb = MwebRuntime::open(
+    let mut mweb = MwebRuntime::open(
         account_dir,
         secret,
         meta.network,
         meta.mweb_scheme.to_master_scheme(),
         account,
         sealing,
-    )
-    .ok();
+    )?;
+    if reconcile_mweb_chain_with_wallet(&wallet, &mut mweb) {
+        let _ = mweb.persist(account_dir);
+    }
     Ok(WalletState {
         last_tip_height: wallet.latest_checkpoint().height(),
         tip_time: None,
@@ -2742,7 +2794,7 @@ fn open_wallet_state(
         data_dir: account_dir.to_path_buf(),
         needs_full_scan: meta.needs_full_scan,
         needs_mweb_scan: meta.needs_mweb_scan,
-        mweb,
+        mweb: Some(mweb),
     })
 }
 
@@ -5141,6 +5193,7 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
     let from_pegin = job.from_pegin;
     let hops = job.target_depth;
     let tip = state.wallet.latest_checkpoint().height();
+    let unconfirmed = unconfirmed_history_ids(state);
     let mweb = state
         .mweb
         .as_mut()
@@ -5151,25 +5204,12 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
         .first()
         .cloned()
         .ok_or_else(|| WalletError::BuildTx("A self-spend must create one output.".into()))?;
-    mweb::apply_prepared_output(
-        mweb,
-        &first.wtxid,
-        &first.spent_output_id,
-        first.created.clone(),
-        first.fee_sats,
-    )?;
-    mweb.persist(&data_dir)?;
-    mweb_frozen::set_locked(&data_dir, &spent_id, true)?;
-    mweb_frozen::set_locked(&data_dir, &first.created_output_id, true)?;
-    churn::inherit_depth(&data_dir, &spent_id, &first.created_output_id, from_pegin)?;
-    let _ = utxo_labels::move_label(&data_dir, &spent_id, &first.created_output_id);
     let armed_hops: Vec<churn::ArmedHop> = prepared
         .iter()
-        .enumerate()
-        .map(|(i, hop)| hop_from_prepared(hop, i == 0))
+        .map(|hop| hop_from_prepared(hop, false))
         .collect();
-    let own_ids = churn::snapshot_own_ids(unconfirmed_history_ids(state), &armed_hops);
-    let armed = churn::ArmedRecord {
+    let own_ids = churn::snapshot_own_ids(unconfirmed, &armed_hops);
+    let mut armed = churn::ArmedRecord {
         version: 1,
         hops: armed_hops,
         armed_index: 0,
@@ -5180,9 +5220,30 @@ fn prepare_churn(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<(
         own_ids,
         expired: false,
     };
+    churn::write_armed(&data_dir, &armed)?;
+    mweb::apply_prepared_output(
+        mweb,
+        &first.wtxid,
+        &first.spent_output_id,
+        first.created.clone(),
+        first.fee_sats,
+    )?;
+    if let Err(e) = mweb.persist(&data_dir) {
+        let _ = mweb::recall_unlanded_spend(&mut mweb.history, mweb.store.db_mut(), &first.wtxid);
+        let _ = churn::remove_armed(&data_dir);
+        return Err(e);
+    }
+    crate::crashpoint::maybe_crash("prepare_churn_after_mweb_persist");
+    if let Some(first_hop) = armed.hops.first_mut() {
+        first_hop.local_applied = true;
+    }
+    churn::write_armed(&data_dir, &armed)?;
+    mweb_frozen::set_locked(&data_dir, &spent_id, true)?;
+    mweb_frozen::set_locked(&data_dir, &first.created_output_id, true)?;
+    churn::inherit_depth(&data_dir, &spent_id, &first.created_output_id, from_pegin)?;
+    let _ = utxo_labels::move_label(&data_dir, &spent_id, &first.created_output_id);
     job.current_output_id = first.created_output_id.clone();
     job.created_output_id = Some(first.created_output_id);
-    churn::write_armed(&data_dir, &armed)?;
     churn::write_job(&data_dir, job)?;
     Ok(())
 }
@@ -5198,6 +5259,8 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
     let from_pegin = job.from_pegin;
     let tip = state.wallet.latest_checkpoint().height();
     let cover_min = job.cover_min;
+    let unconfirmed = unconfirmed_history_ids(state);
+    let prev_armed = churn::read_armed(&data_dir)?;
     let mweb = state
         .mweb
         .as_mut()
@@ -5208,24 +5271,9 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
         .into_iter()
         .next()
         .ok_or_else(|| WalletError::BuildTx("A self-spend must create one output.".into()))?;
-    mweb::apply_prepared_output(
-        mweb,
-        &hop.wtxid,
-        &hop.spent_output_id,
-        hop.created.clone(),
-        hop.fee_sats,
-    )?;
-    mweb.persist(&data_dir)?;
-    mweb_frozen::set_locked(&data_dir, &spent_id, true)?;
-    mweb_frozen::set_locked(&data_dir, &hop.created_output_id, true)?;
-    churn::inherit_depth(&data_dir, &spent_id, &hop.created_output_id, from_pegin)?;
-    let _ = utxo_labels::move_label(&data_dir, &spent_id, &hop.created_output_id);
-    let armed_hop = hop_from_prepared(&hop, true);
-    let own_ids = churn::snapshot_own_ids(
-        unconfirmed_history_ids(state),
-        std::slice::from_ref(&armed_hop),
-    );
-    let armed = churn::ArmedRecord {
+    let armed_hop = hop_from_prepared(&hop, false);
+    let own_ids = churn::snapshot_own_ids(unconfirmed, std::slice::from_ref(&armed_hop));
+    let mut armed = churn::ArmedRecord {
         version: 1,
         hops: vec![armed_hop],
         armed_index: 0,
@@ -5236,9 +5284,38 @@ fn resign_one_hop(state: &mut WalletState, job: &mut churn::ChurnJob) -> Result<
         own_ids,
         expired: false,
     };
+    churn::write_armed(&data_dir, &armed)?;
+    mweb::apply_prepared_output(
+        mweb,
+        &hop.wtxid,
+        &hop.spent_output_id,
+        hop.created.clone(),
+        hop.fee_sats,
+    )?;
+    if let Err(e) = mweb.persist(&data_dir) {
+        let _ = mweb::recall_unlanded_spend(&mut mweb.history, mweb.store.db_mut(), &hop.wtxid);
+        match prev_armed {
+            Some(prev) => {
+                let _ = churn::write_armed(&data_dir, &prev);
+            }
+            None => {
+                let _ = churn::remove_armed(&data_dir);
+            }
+        }
+        return Err(e);
+    }
+    crate::crashpoint::maybe_crash("resign_churn_after_mweb_persist");
+    if let Some(first_hop) = armed.hops.first_mut() {
+        first_hop.local_applied = true;
+    }
+    churn::write_armed(&data_dir, &armed)?;
+    mweb_frozen::set_locked(&data_dir, &spent_id, true)?;
+    mweb_frozen::set_locked(&data_dir, &hop.created_output_id, true)?;
+    churn::inherit_depth(&data_dir, &spent_id, &hop.created_output_id, from_pegin)?;
+    let _ = utxo_labels::move_label(&data_dir, &spent_id, &hop.created_output_id);
     job.current_output_id = hop.created_output_id.clone();
     job.created_output_id = Some(hop.created_output_id);
-    churn::write_armed(&data_dir, &armed)?;
+    churn::write_job(&data_dir, job)?;
     Ok(())
 }
 
@@ -5257,7 +5334,6 @@ fn revert_unbroadcast_hop(
     }
     let wtxid = hop.wtxid.clone();
     let phantom = hop.created_output_id.clone();
-    let from_pegin = job.from_pegin;
     let data_dir = state.data_dir.clone();
     let restored = state.mweb.as_mut().and_then(|mweb| {
         let restored = mweb::recall_unlanded_spend(&mut mweb.history, mweb.store.db_mut(), &wtxid);
@@ -5267,7 +5343,7 @@ fn revert_unbroadcast_hop(
         restored
     });
     if let Some(restored) = restored {
-        let _ = churn::inherit_depth(&data_dir, &phantom, &restored, from_pegin);
+        let _ = churn::revert_depth(&data_dir, &phantom, &restored);
         let _ = utxo_labels::move_label(&data_dir, &phantom, &restored);
         let _ = mweb_frozen::set_locked(&data_dir, &phantom, false);
         let _ = mweb_frozen::set_locked(&data_dir, &restored, true);
@@ -5275,6 +5351,141 @@ fn revert_unbroadcast_hop(
         job.created_output_id = None;
     }
     Ok(())
+}
+
+fn rollback_uncommitted_armed(
+    state: &mut WalletState,
+    record: &churn::ArmedRecord,
+    active_job: Option<&churn::ChurnJob>,
+) -> Result<(), WalletError> {
+    let Some(hop) = record.current() else {
+        return Ok(());
+    };
+    if hop.broadcast {
+        return Ok(());
+    }
+    let data_dir = state.data_dir.clone();
+    if let Some(mweb) = state.mweb.as_mut() {
+        if mweb::recall_unlanded_spend(&mut mweb.history, mweb.store.db_mut(), &hop.wtxid).is_some()
+        {
+            mweb.persist(&data_dir)?;
+        }
+    }
+    let _ = churn::revert_depth(&data_dir, &hop.created_output_id, &hop.spent_output_id);
+    let _ = utxo_labels::move_label(&data_dir, &hop.created_output_id, &hop.spent_output_id);
+    let _ = mweb_frozen::set_locked(&data_dir, &hop.created_output_id, false);
+    let keep_spent_locked = active_job.is_some_and(|job| {
+        job.phase().is_active()
+            && !job.input_spent_elsewhere
+            && job.current_output_id == hop.spent_output_id
+    });
+    let _ = mweb_frozen::set_locked(&data_dir, &hop.spent_output_id, keep_spent_locked);
+    Ok(())
+}
+
+/// Reconcile an interrupted or locked self-spend pass against the coin store,
+/// freeze sidecar, and armed WAL record on account load.
+fn reconcile_churn_on_load(state: &mut WalletState) -> Result<(), WalletError> {
+    let data_dir = state.data_dir.clone();
+    let job_opt = churn::read_job(&data_dir)?;
+    let record_opt = churn::read_armed(&data_dir)?;
+
+    match (job_opt, record_opt) {
+        (None, None) => Ok(()),
+        (None, Some(record)) => {
+            rollback_uncommitted_armed(state, &record, None)?;
+            churn::remove_armed(&data_dir)
+        }
+        (Some(mut job), Some(record)) if !job.phase().is_active() => {
+            let shown = job.current_output_id.clone();
+            revert_unbroadcast_hop(state, &mut job)?;
+            let restored = job.current_output_id.clone();
+            if restored != shown {
+                churn::write_job(&data_dir, &job)?;
+            }
+            if let Some(hop) = record.current() {
+                let _ = mweb_frozen::set_locked(&data_dir, &hop.spent_output_id, false);
+                let _ = mweb_frozen::set_locked(&data_dir, &hop.created_output_id, false);
+            }
+            let _ = mweb_frozen::set_locked(&data_dir, &shown, false);
+            if restored != shown {
+                let _ = mweb_frozen::set_locked(&data_dir, &restored, false);
+            }
+            churn::remove_armed(&data_dir)
+        }
+        (Some(mut job), Some(mut record)) => {
+            if job.input_spent_elsewhere {
+                if let Some(hop) = record.current() {
+                    if !hop.broadcast {
+                        if let Some(mweb) = state.mweb.as_mut() {
+                            mweb::drop_unbroadcast_output(mweb, &hop.wtxid, &hop.created_output_id);
+                            let _ = mweb.persist(&data_dir);
+                        }
+                        let _ = mweb_frozen::set_locked(&data_dir, &hop.spent_output_id, false);
+                        let _ = mweb_frozen::set_locked(&data_dir, &hop.created_output_id, false);
+                    }
+                }
+                return churn::remove_armed(&data_dir);
+            }
+
+            if record.expired {
+                return expire_armed(Some(state), &data_dir, &mut job, &mut record);
+            }
+
+            if let Some(hop) = record.current().cloned() {
+                if !hop.broadcast {
+                    if job.needs_resign
+                        || (record.armed_index == 0
+                            && job.current_output_id != hop.created_output_id)
+                    {
+                        rollback_uncommitted_armed(state, &record, Some(&job))?;
+                        return churn::remove_armed(&data_dir);
+                    }
+                } else {
+                    if matches!(
+                        job.phase(),
+                        ChurnPhase::WaitingForCover | ChurnPhase::WaitingToBroadcast
+                    ) && (job.current_output_id != hop.created_output_id
+                        || (record.armed_index == 0
+                            && job.effective_depth == 0
+                            && job.pending_wtxid.is_none()))
+                    {
+                        churn::note_broadcast(
+                            &mut job,
+                            &hop.wtxid,
+                            &hop.created_output_id,
+                            record.armed_height,
+                        )?;
+                        churn::write_job(&data_dir, &job)?;
+                    }
+
+                    if !hop.local_applied {
+                        apply_pending_local(state)?;
+                    } else {
+                        let _ = mweb_frozen::set_locked(&data_dir, &hop.spent_output_id, false);
+                        let _ = mweb_frozen::set_locked(&data_dir, &hop.created_output_id, true);
+                    }
+
+                    if matches!(
+                        job.phase(),
+                        ChurnPhase::WaitingForCover | ChurnPhase::PausedSolo
+                    ) {
+                        promote_after_score(state, &mut job)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        (Some(mut job), None) => {
+            if job.phase().is_active() && !job.input_spent_elsewhere {
+                let _ = mweb_frozen::set_locked(&data_dir, &job.current_output_id, true);
+                if job.phase() == ChurnPhase::WaitingForCover && !job.needs_resign {
+                    promote_after_score(state, &mut job)?;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn undo_expired_local(state: &mut WalletState) -> Result<(), WalletError> {
@@ -5351,8 +5562,8 @@ fn expire_armed(
     if revert {
         if let Some(state) = state {
             revert_unbroadcast_hop(state, job)?;
-            let _ = churn::remove_armed(&state.data_dir);
             churn::write_job(&state.data_dir, job)?;
+            let _ = churn::remove_armed(&state.data_dir);
             return Ok(());
         }
     }
@@ -5367,6 +5578,7 @@ fn note_foreign_spend(
     record: &mut churn::ArmedRecord,
 ) -> Result<(), WalletError> {
     churn::transition(job, churn::ChurnEvent::ForeignSpend)?;
+    churn::write_job(&state.data_dir, job)?;
     if let Some(hop) = record.current() {
         if hop.local_applied && !hop.broadcast {
             let wtxid = hop.wtxid.clone();
@@ -5379,11 +5591,11 @@ fn note_foreign_spend(
             // The hop froze the spent coin when it was signed. Nothing else
             // unlocks it: this hop never reaches `apply_pending_local`.
             mweb_frozen::set_locked(&state.data_dir, &spent, false)?;
+            mweb_frozen::set_locked(&state.data_dir, &created, false)?;
         }
     }
     // An expired record would make the next pass report this as an expiry.
     churn::remove_armed(&state.data_dir)?;
-    churn::write_job(&state.data_dir, job)?;
     Ok(())
 }
 
@@ -5416,8 +5628,10 @@ fn send_armed_hop(
             record.own_ids.insert(wtxid);
             record.own_ids.insert(txid);
             record.send_after = None;
-            churn::write_job(data_dir, job)?;
             churn::write_armed(data_dir, record)?;
+            crate::crashpoint::maybe_crash("send_armed_after_write_armed");
+            churn::write_job(data_dir, job)?;
+            crate::crashpoint::maybe_crash("send_armed_after_write_job");
             if local_applied {
                 // Hop 0 is already in the coin store, so it skips
                 // `apply_pending_local`, which is what unlocks later hops.
@@ -5444,8 +5658,8 @@ fn promote_after_score(
     let Some(mut record) = churn::read_armed(&data_dir)? else {
         if job.phase() == ChurnPhase::WaitingForCover {
             churn::transition(job, churn::ChurnEvent::Finished)?;
-            mweb_frozen::set_locked(&data_dir, &job.current_output_id, false)?;
             churn::write_job(&data_dir, job)?;
+            mweb_frozen::set_locked(&data_dir, &job.current_output_id, false)?;
         }
         return Ok(());
     };
@@ -5459,15 +5673,15 @@ fn promote_after_score(
         churn::ScoreFollow::ArmNext => {
             if churn::arm_next(&mut record, churn::unix_now(), tip) {
                 churn::transition(job, churn::ChurnEvent::ArmedNext)?;
-                churn::write_armed(&data_dir, &record)?;
                 churn::write_job(&data_dir, job)?;
+                churn::write_armed(&data_dir, &record)?;
             }
         }
         churn::ScoreFollow::FinishShort => {
             churn::transition(job, churn::ChurnEvent::Finished)?;
+            churn::write_job(&data_dir, job)?;
             mweb_frozen::set_locked(&data_dir, &job.current_output_id, false)?;
             let _ = churn::remove_armed(&data_dir);
-            churn::write_job(&data_dir, job)?;
         }
     }
     Ok(())
@@ -5613,8 +5827,7 @@ fn drive_churn(
     state: &mut WalletState,
     electrum: Option<&electrum::ElectrumClient>,
 ) -> Result<(), WalletError> {
-    let _ = undo_expired_local(state);
-    let _ = apply_pending_local(state);
+    let _ = reconcile_churn_on_load(state);
     let Some(mut job) = churn::read_job(&state.data_dir)? else {
         return Ok(());
     };
@@ -5638,15 +5851,16 @@ fn drive_churn(
                     }
                     let from_pegin = job.from_pegin;
                     churn::commit_score(&state.data_dir, &output_id, from_pegin, score)?;
+                    crate::crashpoint::maybe_crash("drive_churn_after_commit_score");
+                    churn::write_job(&state.data_dir, &job)?;
+                    crate::crashpoint::maybe_crash("drive_churn_before_promote");
                     if job.phase() == ChurnPhase::Done {
                         mweb_frozen::set_locked(&state.data_dir, &output_id, false)?;
                     }
-                    churn::write_job(&state.data_dir, &job)?;
                 }
             }
             ResolvedHop::NotIncluded => {
                 let phantom = output_id;
-                let from_pegin = job.from_pegin;
                 let restored = job.pending_wtxid.clone().and_then(|wtxid| {
                     let mweb = state.mweb.as_mut()?;
                     let restored =
@@ -5657,13 +5871,13 @@ fn drive_churn(
                     restored
                 });
                 if let Some(restored) = restored {
-                    let _ = churn::inherit_depth(&state.data_dir, &phantom, &restored, from_pegin);
+                    let _ = churn::revert_depth(&state.data_dir, &phantom, &restored);
                     let _ = utxo_labels::move_label(&state.data_dir, &phantom, &restored);
                     let _ = mweb_frozen::set_locked(&state.data_dir, &phantom, false);
                     let _ = mweb_frozen::set_locked(&state.data_dir, &restored, true);
                     churn::note_not_included(&mut job, &restored)?;
-                    let _ = churn::remove_armed(&state.data_dir);
                     churn::write_job(&state.data_dir, &job)?;
+                    let _ = churn::remove_armed(&state.data_dir);
                 }
             }
             ResolvedHop::NotYet if job.phase() == ChurnPhase::PausedUnscored => {
@@ -6936,6 +7150,7 @@ mod tests {
         app.cancel_churn().expect("cancel still works");
     }
 
+    mod crash_recovery_tests;
     mod error_path_tests;
 }
 

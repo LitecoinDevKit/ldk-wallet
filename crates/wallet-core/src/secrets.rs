@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -484,35 +483,8 @@ impl SecretStore for MemoryStore {
 }
 
 pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    // Create with 0600 atomically rather than chmod-after-create, so the file
-    // is never observable with default (umask) permissions. Windows has no
-    // mode bits; the wallet directory is the per-user roaming profile, which
-    // other users cannot read.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|e| WalletError::SecretStore(e.to_string()))?;
-    // mode() only applies on create; normalize pre-existing files too.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| WalletError::SecretStore(e.to_string()))?;
-    }
-    file.write_all(bytes)
-        .map_err(|e| WalletError::SecretStore(e.to_string()))?;
-    file.sync_all()
-        .map_err(|e| WalletError::SecretStore(e.to_string()))?;
-    Ok(())
+    crate::fs_atomic::write_atomic_0600(path, bytes)
+        .map_err(|e| WalletError::SecretStore(e.to_string()))
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), WalletError> {

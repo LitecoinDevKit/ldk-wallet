@@ -5,8 +5,7 @@
 //! output MMR sizes did not each grow by exactly one.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -263,9 +262,8 @@ pub fn read_job(data_dir: &Path) -> Result<Option<ChurnJob>, WalletError> {
 }
 
 pub fn write_job(data_dir: &Path, job: &ChurnJob) -> Result<(), WalletError> {
-    fs::create_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(job).map_err(|e| WalletError::Meta(e.to_string()))?;
-    fs::write(job_path(data_dir), json)?;
+    crate::fs_atomic::write_atomic(&job_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 
@@ -292,7 +290,7 @@ fn write_depth_file(data_dir: &Path, file: &ChurnDepthFile) -> Result<(), Wallet
     } else {
         let json =
             serde_json::to_string_pretty(file).map_err(|e| WalletError::Meta(e.to_string()))?;
-        fs::write(depth_path(data_dir), json)?;
+        crate::fs_atomic::write_atomic(&depth_path(data_dir), json.as_bytes())?;
         Ok(())
     }
 }
@@ -1014,8 +1012,20 @@ pub fn inherit_depth(
 ) -> Result<(), WalletError> {
     let from_id = mweb_frozen::normalize_output_id(from_output_id)?;
     let to_id = mweb_frozen::normalize_output_id(to_output_id)?;
+    if from_id == to_id {
+        return Ok(());
+    }
     let mut file = read_depth_file(data_dir)?;
-    let prev = file.coins.remove(&from_id).unwrap_or_default();
+    let prev = match file.coins.remove(&from_id) {
+        Some(prev) => prev,
+        None => {
+            if let Some(existing) = file.coins.get_mut(&to_id) {
+                existing.from_pegin = existing.from_pegin || from_pegin;
+                return write_depth_file(data_dir, &file);
+            }
+            StoredDepth::default()
+        }
+    };
     file.coins.insert(
         to_id,
         StoredDepth {
@@ -1026,6 +1036,27 @@ pub fn inherit_depth(
             from_pegin: from_pegin || prev.from_pegin,
         },
     );
+    write_depth_file(data_dir, &file)
+}
+
+/// Move a depth record back from a recalled phantom output onto the restored coin.
+pub fn revert_depth(
+    data_dir: &Path,
+    phantom_output_id: &str,
+    restored_output_id: &str,
+) -> Result<(), WalletError> {
+    let phantom_id = mweb_frozen::normalize_output_id(phantom_output_id)?;
+    let restored_id = mweb_frozen::normalize_output_id(restored_output_id)?;
+    if phantom_id == restored_id {
+        return Ok(());
+    }
+    let mut file = read_depth_file(data_dir)?;
+    let Some(moved) = file.coins.remove(&phantom_id) else {
+        return Ok(());
+    };
+    if moved.non_solo_blocks > 0 || !moved.hops.is_empty() || moved.from_pegin {
+        file.coins.insert(restored_id, moved);
+    }
     write_depth_file(data_dir, &file)
 }
 
@@ -1057,13 +1088,15 @@ pub fn commit_score(
             other_kernels,
             other_outputs,
         } => {
-            entry.non_solo_blocks = entry.non_solo_blocks.saturating_add(1);
-            entry.hops.push(ChurnHop {
-                other_kernels,
-                other_outputs,
-            });
-            entry.last_other_kernels = Some(other_kernels);
-            entry.last_other_outputs = Some(other_outputs);
+            if entry.last_other_kernels.is_none() {
+                entry.non_solo_blocks = entry.non_solo_blocks.saturating_add(1);
+                entry.hops.push(ChurnHop {
+                    other_kernels,
+                    other_outputs,
+                });
+                entry.last_other_kernels = Some(other_kernels);
+                entry.last_other_outputs = Some(other_outputs);
+            }
         }
     }
     file.coins.insert(id, entry);
@@ -1407,26 +1440,11 @@ pub fn read_armed(data_dir: &Path) -> Result<Option<ArmedRecord>, WalletError> {
 }
 
 pub fn write_armed(data_dir: &Path, record: &ArmedRecord) -> Result<(), WalletError> {
-    fs::create_dir_all(data_dir)?;
     let json =
         serde_json::to_string_pretty(record).map_err(|e| WalletError::Meta(e.to_string()))?;
-    let path = armed_path(data_dir);
     // Create with 0600 on Unix so the armed hop is never world-readable.
     // Windows has no mode bits; the wallet directory is the per-user profile.
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(WalletError::Io)?;
-    file.write_all(json.as_bytes()).map_err(WalletError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(WalletError::Io)?;
-    }
+    crate::fs_atomic::write_atomic_0600(&armed_path(data_dir), json.as_bytes())?;
     Ok(())
 }
 

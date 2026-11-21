@@ -4,7 +4,10 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. UI action-flag consistency checks (item 6).
+1. Secret hygiene and zeroization (item 16).
+2. Persistence atomicity and crash recovery (item 17).
+3. Transaction construction and value invariants (item 18).
+4. Diagram and table checks on every PR (item 7).
 
 ## Status
 
@@ -15,7 +18,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 3 | Property tests on transition tables | High | Done | [#26](https://github.com/LitecoinDevKit/ldk-wallet/pull/26), [#27](https://github.com/LitecoinDevKit/ldk-wallet/pull/27), [#28](https://github.com/LitecoinDevKit/ldk-wallet/pull/28) | churn (500×30), lock (5×8), UI (500×30). |
 | 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
 | 5 | Error-path integration tests | High | Done | [#30](https://github.com/LitecoinDevKit/ldk-wallet/pull/30) | Offline lock races, persist failures, bad peers, foreign spend, and rejected commands. Three state-cleanup bugs fixed. |
-| 6 | UI action-flag consistency checks | High | Not started | | |
+| 6 | UI action-flag consistency checks | High | Done | [#31](https://github.com/LitecoinDevKit/ldk-wallet/pull/31) | Pure flag-to-button mapping in `ui/src/actions.ts` and static checks in `scripts/action-flags.test.mjs`. |
 | 7 | Diagram and table checks on every PR | CI | Mostly done | | Confirm and record. |
 | 8 | Screenshot regression in CI | CI | Not started | | |
 | 9 | `cargo miri` on pure logic | CI | Not started | | |
@@ -24,7 +27,50 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 12 | `docs/MWEB_E2E.md` as a pre-release gate | Process | Not started | | |
 | 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
-| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). |
+| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). Redaction is item 16. |
+| 16 | Secret hygiene and zeroization | High | Not started | | Lock, wipe, and error paths clear seed material. Logs and `Debug` stay redacted. |
+| 17 | Persistence atomicity and crash recovery | High | Not started | | Restart after a kill mid-sync, mid-churn, or mid-persist. Extends items 5 and 11. |
+| 18 | Transaction construction and value invariants | High | Not started | | Amounts, fees, dust, change, and peg-in/peg-out shape. Beside the coin-status tests. |
+| 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Refines item 10. |
+| 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. |
+| 21 | Static analysis expansion | Medium | Not started | | Unsafe surface, and optionally mutation testing of the tables. |
+| 22 | Error-message sanitization | Lower | Not started | | UI and logs omit stack traces and extra address or amount detail. |
+| 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
+| 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
+
+## Model and effort
+
+How to staff items 6–24. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
+
+- **Carbon:** Gemini 4 Carbon, or an equivalent high-reasoning model.
+- **Argon:** Gemini 4 Argon, or another strong coding model.
+- **Light:** a faster model, including the default Cursor model.
+
+Effort is Low, Medium, or High, relative to the size of the change and the reasoning it needs.
+
+| # | Item | Planning | Implementation | Notes |
+|---|------|----------|----------------|-------|
+| 6 | UI action-flag consistency | Argon · Low–Medium | Argon · Medium | Map flags to buttons, and a static check that `main.ts` does not infer an action from a phase. A light model covers most of it. |
+| 7 | Diagram and table checks | Light · Low | Light · Low | Confirm the existing CI checks and record them. |
+| 8 | Screenshot regression in CI | Light · Low | Light · Low–Medium | Wire `npm run screenshots` into CI and cover the fixture scenes. |
+| 9 | `cargo miri` on pure logic | Argon · Low | Argon · Low–Medium | Name the pure modules, add the CI job, and fix whatever Miri reports. |
+| 10 | Fuzz and structure-aware property tests | Argon · Medium | Argon · Medium–High | Structure-aware fuzz on transitions and parsers. Use Carbon if a parser stays stubborn. |
+| 11 | Chaos tests (lock or failure mid-pass) | Carbon · Medium | Argon · Medium–High | Planning lists the failure cases. Implementation follows that list. |
+| 12 | `MWEB_E2E.md` as a pre-release gate | Light · Low | Light · Low | Process and documentation. |
+| 13 | Review notes (holds vs freezes, lock lifecycle) | Argon · Low–Medium | Light · Low | Write the notes and link the tests that already pin the behavior. |
+| 14 | Keep `AUDIT_NOTES.md` and `SECURITY.md` current | Light · Low | Light · Low | Ongoing documentation. |
+| 15 | Logging for phase, holds, and rejections | Argon · Low–Medium | Argon · Medium | Follows once the redaction rules in item 16 are set. |
+| 16 | Secret hygiene and zeroization | Carbon · Medium | Argon · Medium–High | Enumerate every lock, wipe, error path, and buffer. Implementation is tests plus careful `zeroize` use. |
+| 17 | Persistence atomicity and crash recovery | Carbon · Medium–High | Argon · High | Plan the kill points and the residual risk, then test kill, restart, and consistency. |
+| 18 | Transaction construction and value invariants | Carbon · Medium | Argon · Medium–High | Checked arithmetic, dust, change, and peg-in/peg-out shape. Carbon finds the edge cases; Argon writes the property tests. |
+| 19 | Untrusted input bounds | Carbon · Medium | Argon · Medium | Size, timeout, and structure limits, plus structure-aware fuzz. |
+| 20 | Backup and restore round-trips | Argon · Medium | Argon · Medium–High | Seed and metadata restore under interrupted operations and holds. |
+| 21 | Static analysis expansion | Light–Argon · Low | Light · Low–Medium | `cargo-geiger` and optional mutants. CI and documentation. |
+| 22 | Error-message sanitization | Light · Low | Light · Low–Medium | Redaction rules and a few tests. |
+| 23 | Lookalike addresses and confirmations | Argon · Low–Medium | Argon · Medium | UI warnings and extra confirmation flows. |
+| 24 | Release SBOM | Light · Low | Light · Low | On top of the supply-chain CI already in place. |
+
+Plan items 16, 17, and 18 with Carbon. Items 11 and 19 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
 
 ## Already planned
 
@@ -52,9 +98,9 @@ Those command tests found the mismatch: Freeze was accepted on a pending or matu
 - A failed churn broadcast pauses at `WaitingToBroadcast` until Retry. Unread headers leave `WaitingConfirm` waiting. `PausedUnscored` inside the inclusion grace returns to `WaitingConfirm`. After the grace, `NotIncluded` restores the original coin and sets `needs_resign`.
 - A foreign spend drops the phantom, refuses Retry, and `cancel_churn` removes `mweb_frozen.json`. Rejected `retry_churn` and `cancel_churn`, and the spend validations that return before signing, leave the job files and coins unchanged.
 
-Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Cancel` before it recalls an unbroadcast hop. `load` and `retry_churn` run `undo_expired_local` and `apply_pending_local`, so a hop that expired or was broadcast while locked is applied before the next command. `note_foreign_spend` and a broadcast of hop 0 clear the `spent_output_id` freeze, which `apply_pending_local` only cleared for later hops.
+Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Cancel` before it recalls an unbroadcast hop. `load` and `retry_churn` run `undo_expired_local` and `apply_pending_local`, so a hop that expired or was broadcast while locked is applied before the next command. `note_foreign_spend` and a broadcast of hop 0 clear the `spent_output_id` freeze, which `apply_pending_local` only cleared for later hops. A process killed mid-write is item 17.
 
-**6. UI action-flag consistency.** Check that backend flags map to the expected buttons and that `ui/src/main.ts` never infers an action from a phase. The known exception is LitVM's Speed up (see `AGENTS.md`).
+**6. UI action-flag consistency.** `ui/src/actions.ts` maps `ChurnActions` and `CoinActions` to the buttons and checkboxes rendered in `ui/src/main.ts` (`churnActionButtons`, `privateCoinActionState`, `publicCoinActionState`, `freezeTargetLocked`). `scripts/action-flags.test.mjs` (run by `npm run test:ui` in CI) checks every flag combination and statically checks `ui/src/main.ts` and `ui/src/shots-fixture.ts`: no `.locked` or `.mature` reads on coins, coin `.confirmations` read only for the `"N conf"` label, `churn_phase` read only in allowlisted status/copy functions (never in `.churn-status-actions` or coin button builders), and LitVM's Speed up (`tx.pending && !tx.failed && !tx.incoming` in `renderLitvmHistory`) pinned as the sole remaining UI-inferred action button. Fixed two gaps found during the check: `toggleUtxoLocked` and `toggleMwebLocked` now derive the target `locked` boolean from `actions.freeze` / `actions.unfreeze` instead of `!utxo.locked` / `!coin.locked`, and `renderMwebControlList` now prunes `panel.selected` when `!coin.actions.select` (matching `renderUtxoList`).
 
 ## CI and regression
 
@@ -66,9 +112,9 @@ Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Can
 
 ## Fuzzing and chaos
 
-**10. Fuzz or structure-aware property tests** on `churn::transition`, the coin status functions, and pure parsers used by holds and phases.
+**10. Fuzz or structure-aware property tests** on `churn::transition`, the coin status functions, and pure parsers used by holds and phases. Size, timeout, and structure limits on Electrum responses, MWEB peer messages, address and seed parsers, and local job and settings files are item 19.
 
-**11. Chaos tests.** Inject a lock or a failure mid-sync and mid-churn, then check that no phase is stuck and no reserved hold is orphaned.
+**11. Chaos tests.** Inject a lock or a failure mid-sync and mid-churn, then check that no phase is stuck and no reserved hold is orphaned. Restart after a kill mid-persist is item 17.
 
 ## Process and audit readiness
 
@@ -80,4 +126,28 @@ Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Can
 
 ## Observability
 
-**15.** Log phase changes, hold take and release, and transition rejections with the job or coin id, from and to, and the reason, so support bundles and post-mortems are useful.
+**15.** Log phase changes, hold take and release, and transition rejections with the job or coin id, from and to, and the reason, so support bundles and post-mortems are useful. Those logs follow the redaction rules in item 16.
+
+## Secrets, persistence, and value
+
+**16. Secret hygiene and zeroization.** Tests that lock, auto-lock, wipe, and error returns clear the decrypted seed, the MWEB sealing key, and intermediate buffers. `Debug`, error strings, and the logs from item 15 must not contain a mnemonic, a private key, raw MWEB payloads, or a full sensitive buffer. A CI check covers this if it can run without a new harness.
+
+**17. Persistence atomicity and crash recovery.** Kill the process mid-sync, mid-churn, and mid-persist, then restart. Holds are not orphaned, phases are not stuck, and coin status matches the recovered files. Job and sealed files use a temp file and rename where they do not already. Whole-directory rollback stays the residual recorded in `docs/AUDIT_NOTES.md`.
+
+**18. Transaction construction and value invariants.** Checked arithmetic on amounts and fees, dust limits, and change selection. Constructed transactions, especially peg-in and peg-out, meet the expected shape and do not leave a stuck or attacker-spendable output when the path returns an error. MWEB commitment and kernel balance sit here, beside the coin-status tests.
+
+## Untrusted input, restore, and static analysis
+
+**19. Untrusted input bounds.** Size, timeout, and structure limits on Electrum responses, MWEB peer messages, address and seed parsers, and local job and settings files. Structure-aware fuzz or property tests on those parsers. This is defense in depth on the kind of validation mismatch seen in the 2026 MWEB incident, and it refines item 10.
+
+**20. Backup and restore round-trips.** A seed plus metadata restore recovers the same spendable transparent and MWEB coins, including after an interrupted operation, a reserved hold, and more than one account under one seed.
+
+**21. Static analysis.** `cargo-geiger`, or the same kind of check, on the unsafe surface, and optionally `cargo-mutants` on the transition tables and status functions. Record that constant-time behavior comes from the crypto crates, or add a light test where this repo owns the comparison.
+
+## Further surfaces
+
+**22. Error-message sanitization.** UI text and logs omit stack traces and extra address or amount detail.
+
+**23. Lookalike addresses and confirmations.** Warn on address lookalikes, and confirm high-value or irreversible actions beyond the existing wipe phrase.
+
+**24. Release SBOM.** Attach an SBOM, or an explicit check of the pinned dependencies, to releases. The supply-chain CI already in place stays as it is.

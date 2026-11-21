@@ -18,7 +18,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 4 | Coin-status tests | High | Done | [#29](https://github.com/LitecoinDevKit/ldk-wallet/pull/29) | Exhaustive fact combinations, hold vs freeze, and freeze commands that follow the flags. |
 | 5 | Error-path integration tests | High | Done | [#30](https://github.com/LitecoinDevKit/ldk-wallet/pull/30) | Offline lock races, persist failures, bad peers, foreign spend, and rejected commands. Three state-cleanup bugs fixed. |
 | 6 | UI action-flag consistency checks | High | Done | [#31](https://github.com/LitecoinDevKit/ldk-wallet/pull/31) | Pure flag-to-button mapping in `ui/src/actions.ts` and static checks in `scripts/action-flags.test.mjs`. |
-| 7 | Diagram and table checks on every PR | CI | Done | | Churn and lock diagram tests run in both Rust jobs; the frontend job checks the UI diagram and the phase table. |
+| 7 | Diagram and table checks on every PR | CI | Done | [#35](https://github.com/LitecoinDevKit/ldk-wallet/pull/35) | Churn and lock diagram tests run in both Rust jobs; the frontend job checks the UI diagram and the phase table. |
 | 8 | Screenshot regression in CI | CI | Not started | | |
 | 9 | `cargo miri` on pure logic | CI | Not started | | |
 | 10 | Fuzz or property tests on transitions and parsers | Fuzzing | Not started | | |

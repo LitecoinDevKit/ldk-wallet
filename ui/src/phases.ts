@@ -32,3 +32,8 @@ export const PHASE_FROM: Record<Phase, readonly Phase[]> = {
   ready: ["boot", "unlock", "migrate", "onboarding", "mnemonic", "ready"],
   fatal: ALL_PHASES,
 };
+
+/** Whether the UI may transition from `from` into `to`. */
+export function canEnter(from: Phase, to: Phase): boolean {
+  return PHASE_FROM[to].includes(from);
+}

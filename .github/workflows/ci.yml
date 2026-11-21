@@ -128,3 +128,6 @@ jobs:
 
       - name: UI phase diagram is current
         run: npm run check:diagrams
+
+      - name: UI phase table tests
+        run: npm run test:ui

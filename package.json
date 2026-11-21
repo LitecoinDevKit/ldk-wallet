@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "screenshots": "node scripts/screenshots.mjs",
     "check:diagrams": "node scripts/phase-diagram.mjs",
+    "test:ui": "node --test \"scripts/*.test.mjs\"",
     "tauri": "tauri"
   },
   "dependencies": {

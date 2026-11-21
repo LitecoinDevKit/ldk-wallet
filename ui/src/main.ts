@@ -12,6 +12,17 @@ import {
   type FreezeButtonSpec,
   type SplitChain,
 } from "./actions";
+import {
+  DUST_LITOSHIS,
+  formatAmountInputForUnit,
+  formatLitoshis,
+  formatLitoshisPlain,
+  formatLtc,
+  parseLitoshisToSats,
+  parseLtcToSats,
+  satsToBip21Amount,
+  type DisplayUnit,
+} from "./amounts";
 import { invoke } from "./ipc";
 import { canEnter, PHASE_LABELS, type Phase } from "./phases";
 import QRCode from "qrcode";
@@ -407,8 +418,6 @@ type AddressReuseHint = {
   reused: boolean;
 };
 
-type DisplayUnit = "ltc" | "litoshis";
-
 type ParsedPaymentUri = {
   address: string;
   amountSats: number | null;
@@ -476,7 +485,6 @@ const FIRST_RECEIVE_SEEN_KEY = "ltc-first-receive-seen";
 const HIDDEN_AMOUNT = "••••";
 const MAX_TX_LABEL_CHARS = 140;
 
-const DUST_LITOSHIS = 2940;
 const MAX_SPLIT_OUTPUTS = 50;
 const MIN_EQUAL_SPLIT = 2;
 const SPLIT_PREFS_KEY = "ltc-split-prefs";
@@ -1476,23 +1484,6 @@ async function refreshFeeLadder() {
   }
 }
 
-function formatLtc(sats: number): string {
-  const whole = Math.trunc(sats / 100_000_000);
-  const frac = Math.abs(sats % 100_000_000)
-    .toString()
-    .padStart(8, "0");
-  const sign = sats < 0 ? "-" : "";
-  return `${sign}${whole}.${frac} LTC`;
-}
-
-function formatLitoshisPlain(sats: number): string {
-  return `${sats.toLocaleString("en-US")} litoshis`;
-}
-
-function formatLitoshis(sats: number): string {
-  return `(${formatLitoshisPlain(sats)})`;
-}
-
 /** Primary amount display respecting unit preference (and hide-balances). */
 function formatAmount(sats: number): string {
   if (hideBalances) return HIDDEN_AMOUNT;
@@ -1517,43 +1508,13 @@ function unitLabel(): string {
   return displayUnit === "litoshis" ? "litoshis" : "LTC";
 }
 
-/** Parse LTC decimal string to litoshis. Rejects commas, negatives, >8 decimals. */
-function parseLtcToSats(input: string): number | null {
-  // Strip all whitespace (incl. non-breaking/narrow spaces from pasted text).
-  const raw = input.replace(/[\s\u00a0\u202f]+/g, "");
-  if (!raw || raw === "." || raw.includes(",") || raw.startsWith("-")) return null;
-  // Allow ".009" and "5." in addition to "0.009".
-  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(raw)) return null;
-  const [wholePart = "", fracPart = ""] = raw.split(".");
-  if (fracPart.length > 8) return null;
-  const whole = wholePart ? Number(wholePart) : 0;
-  if (!Number.isSafeInteger(whole)) return null;
-  const frac = fracPart.padEnd(8, "0");
-  return whole * 100_000_000 + Number(frac);
-}
-
-/** Parse integer litoshis (no decimals). */
-function parseLitoshisToSats(input: string): number | null {
-  const raw = input.replace(/[\s\u00a0\u202f,]+/g, "");
-  if (!raw || raw.startsWith("-") || !/^\d+$/.test(raw)) return null;
-  const n = Number(raw);
-  if (!Number.isSafeInteger(n)) return null;
-  return n;
-}
-
 function parseAmountToSats(input: string): number | null {
   return displayUnit === "litoshis" ? parseLitoshisToSats(input) : parseLtcToSats(input);
 }
 
 /** Format sats into the active unit for amount input fields. */
 function formatAmountInput(sats: number): string {
-  if (displayUnit === "litoshis") return String(sats);
-  const whole = Math.trunc(sats / 100_000_000);
-  const frac = Math.abs(sats % 100_000_000)
-    .toString()
-    .padStart(8, "0")
-    .replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : String(whole);
+  return formatAmountInputForUnit(sats, displayUnit);
 }
 
 function amountError(field: string, rawValue: string): string {
@@ -2922,16 +2883,6 @@ function setMwebVisible(visible: boolean) {
 
 function isMwebAddress(address: string): boolean {
   return address.startsWith("ltcmweb") || address.startsWith("tmweb");
-}
-
-/** BIP21 amount is always LTC decimal (not litoshis). */
-function satsToBip21Amount(sats: number): string {
-  const whole = Math.trunc(sats / 100_000_000);
-  const frac = Math.abs(sats % 100_000_000)
-    .toString()
-    .padStart(8, "0")
-    .replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : String(whole);
 }
 
 function buildPaymentUri(
@@ -8617,6 +8568,12 @@ el.sendForm.addEventListener("submit", async (event) => {
     el.sendAddress.value = "";
     openLitvmSend(address);
     setStatus("Opened LitVM Send with that 0x address.", "success");
+    return;
+  }
+  if (isMwebAddress(address)) {
+    setError(
+      "That is a Private (MWEB) stealth address — switch to Private send to pay an ltcmweb1 / tmweb1 address.",
+    );
     return;
   }
 

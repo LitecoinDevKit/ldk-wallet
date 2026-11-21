@@ -4,7 +4,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::str::FromStr;
 
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ use bdk_wallet::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::secp256k1::All;
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
+use bdk_wallet::bitcoin::{Amount, NetworkKind, ScriptBuf, Transaction};
 use bdk_wallet::chain::Merge;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{extract_prepared_mweb_pegin, select_mweb_coins, MwebStore, PersistedWallet};
@@ -74,17 +73,7 @@ pub fn spendable_mweb_sats(
 }
 
 pub fn normalize_selected_ids(ids: Option<&[String]>) -> Option<Vec<String>> {
-    let v: Vec<String> = ids
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
+    crate::tx_invariants::normalize_and_dedup_ids(ids)
 }
 
 /// Resolve coins for a private send or peg-out.
@@ -99,12 +88,17 @@ pub fn resolve_spend_coins(
     needed: u64,
     action: &str,
 ) -> Result<Vec<bdk_mweb::MwebCoin>, WalletError> {
-    if let Some(ids) = selected_ids.filter(|v| !v.is_empty()) {
+    crate::tx_invariants::check_money(needed, "private spend needed")?;
+    let deduped = normalize_selected_ids(selected_ids);
+    if let Some(ids) = deduped.as_deref() {
         let mut coins = Vec::with_capacity(ids.len());
         for id in ids {
             coins.push(select_mweb_coin(db, id, tip_height, frozen, action)?);
         }
-        let sum: u64 = coins.iter().map(|c| c.amount).sum();
+        let sum = crate::tx_invariants::checked_sum_sats(
+            coins.iter().map(|c| c.amount),
+            "selected private coins",
+        )?;
         if sum < needed {
             return Err(WalletError::BuildTx(format!(
                 "need {needed} litoshis from the selected private coins but they only total {sum}"
@@ -113,6 +107,10 @@ pub fn resolve_spend_coins(
         Ok(coins)
     } else {
         let pool = spendable_pool(db, tip_height, frozen);
+        crate::tx_invariants::checked_sum_sats(
+            pool.iter().map(|c| c.amount),
+            "spendable private pool",
+        )?;
         select_mweb_coins(&pool, needed).map_err(|e| WalletError::Mweb(e.to_string()))
     }
 }
@@ -127,13 +125,11 @@ pub struct PegoutPerCoinPlan {
 
 /// P2WPKH dust at the same 30 sat/vB relay rate used for typed peg-outs.
 pub fn p2wpkh_dust_sats() -> Result<u64, WalletError> {
-    let dust_relay = FeeRate::from_sat_per_vb(30)
-        .ok_or_else(|| WalletError::BuildTx("internal dust fee rate".into()))?;
     let mut bytes = vec![0x00, 0x14];
     bytes.extend_from_slice(&[0u8; 20]);
-    Ok(ScriptBuf::from_bytes(bytes)
-        .minimal_non_dust_custom(dust_relay)
-        .to_sat())
+    Ok(crate::tx_invariants::ltc_dust_threshold(
+        &ScriptBuf::from_bytes(bytes),
+    ))
 }
 
 /// Map each spent private coin to a public HogEx amount.
@@ -149,6 +145,17 @@ pub fn plan_pegout_per_coin(
         return Err(WalletError::BuildTx(
             "no spendable private coins to peg out".into(),
         ));
+    }
+    crate::tx_invariants::check_money(fee_sats, "peg-out fee")?;
+    crate::tx_invariants::check_money(dust_sats, "peg-out dust")?;
+    crate::tx_invariants::checked_sum_sats(coin_amounts.iter().copied(), "peg-out coins")?;
+    let min_weight =
+        bdk_mweb::policy::KERNEL_WITH_STEALTH_WEIGHT.saturating_add(coin_amounts.len() as u64);
+    let min_fee = bdk_mweb::policy::min_mweb_fee(min_weight);
+    if fee_sats < min_fee {
+        return Err(WalletError::BuildTx(format!(
+            "peg-out fee {fee_sats} litoshis is below the MWEB minimum of {min_fee} litoshis"
+        )));
     }
     let fee_output_index = coin_amounts
         .iter()
@@ -773,7 +780,8 @@ impl MwebRuntime {
                 } else {
                     TxKind::MwebReceive
                 },
-                net_sats: coin.amount as i64,
+                net_sats: i64::try_from(coin.amount.min(crate::tx_invariants::MAX_MONEY))
+                    .unwrap_or(i64::MAX),
                 fee_sats: None,
                 timestamp: now_ts(),
                 output_ids: vec![id_hex],
@@ -1982,6 +1990,380 @@ mod tests {
         assert_eq!(pegin_blocks_left(TxKind::Transparent, 1), None);
     }
 
+    /// Verify all Litecoin Core MWEB consensus equations on an authored transaction:
+    /// 1. Pedersen commitment balance: `Σ C_out + (fee + Σ pegout)·H == Σ C_in + pegin·H + Σ excess + kernel_offset·G`
+    /// 2. Stealth excess balance: `Σ Ks + Σ Ki == Σ stealth_excess + Σ Ko_in + stealth_offset·G`
+    /// 3. 675-byte Bulletproof rangeproof verification on every output (`extra_data = serialize(&output.message)`)
+    /// 4. Strict canonical sorting of inputs and outputs by `output_id`, plus wire serialize/deserialize round-trip.
+    fn assert_mweb_tx_consensus_and_balance(tx: &Transaction, secp: &Secp256k1<All>) {
+        use bdk_mweb::crypto::{bulletproof_verify, commitment_to_pubkey, pedersen_commit};
+        use bdk_wallet::bitcoin::consensus::encode::serialize;
+        use bdk_wallet::bitcoin::secp256k1::{PublicKey, SecretKey};
+
+        let raw = serialize(tx);
+        let roundtripped: Transaction = deserialize(&raw).expect("consensus MWEB tx round-trip");
+        assert_eq!(roundtripped.compute_wtxid(), tx.compute_wtxid());
+
+        let mw = tx.mw_tx.as_ref().expect("mw_tx present");
+        for win in mw.body.inputs.windows(2) {
+            assert!(
+                win[0].output_id < win[1].output_id,
+                "inputs not strictly sorted"
+            );
+        }
+        for win in mw.body.outputs.windows(2) {
+            assert!(
+                bdk_mweb::output_id(&win[0]) < bdk_mweb::output_id(&win[1]),
+                "outputs not strictly sorted"
+            );
+        }
+
+        for out in &mw.body.outputs {
+            let extra = serialize(&out.message);
+            assert!(
+                bulletproof_verify(&out.commitment, &out.range_proof, &extra)
+                    .expect("bulletproof FFI"),
+                "bulletproof failed to verify on output {}",
+                hex::encode(bdk_mweb::output_id(out))
+            );
+        }
+
+        // Fixed blind r for value-only terms: C(v, r) - C(0, r) = v·H.
+        let r = [0x11u8; 32];
+        let zero_r = commitment_to_pubkey(&pedersen_commit(0, &r, secp).unwrap()).unwrap();
+        let value_h = |v: u64| -> Option<PublicKey> {
+            (v > 0).then(|| {
+                let with_v = commitment_to_pubkey(&pedersen_commit(v, &r, secp).unwrap()).unwrap();
+                with_v.combine(&zero_r.negate(secp)).unwrap()
+            })
+        };
+
+        let mut fee_and_pegout = 0u64;
+        let mut pegin_total = 0u64;
+        for k in &mw.body.kernels {
+            if let Some(f) = k.fee {
+                assert!(f >= 0, "negative kernel fee");
+                fee_and_pegout = fee_and_pegout.checked_add(f as u64).unwrap();
+            }
+            for po in &k.pegouts {
+                assert!(po.amount > 0, "non-positive pegout");
+                fee_and_pegout = fee_and_pegout.checked_add(po.amount as u64).unwrap();
+            }
+            if let Some(p) = k.pegin {
+                assert!(p > 0, "non-positive pegin");
+                pegin_total = pegin_total.checked_add(p as u64).unwrap();
+            }
+        }
+
+        let mut commit_lhs: Vec<PublicKey> = mw
+            .body
+            .outputs
+            .iter()
+            .map(|o| commitment_to_pubkey(&o.commitment).unwrap())
+            .collect();
+        commit_lhs.extend(value_h(fee_and_pegout));
+
+        let mut commit_rhs: Vec<PublicKey> = mw
+            .body
+            .inputs
+            .iter()
+            .map(|i| commitment_to_pubkey(&i.commitment).unwrap())
+            .collect();
+        commit_rhs.extend(value_h(pegin_total));
+        commit_rhs.extend(
+            mw.body
+                .kernels
+                .iter()
+                .map(|k| commitment_to_pubkey(&k.excess).unwrap()),
+        );
+        if mw.kernel_offset != [0u8; 32] {
+            commit_rhs.push(PublicKey::from_secret_key(
+                secp,
+                &SecretKey::from_slice(&mw.kernel_offset).unwrap(),
+            ));
+        }
+        let sum_keys = |keys: &[PublicKey]| -> PublicKey {
+            let refs: Vec<&PublicKey> = keys.iter().collect();
+            PublicKey::combine_keys(&refs).unwrap()
+        };
+        assert_eq!(
+            sum_keys(&commit_lhs),
+            sum_keys(&commit_rhs),
+            "Pedersen commitments and kernel excess do not balance"
+        );
+
+        let mut stealth_lhs: Vec<PublicKey> = mw
+            .body
+            .outputs
+            .iter()
+            .map(|o| o.sender_public_key)
+            .collect();
+        stealth_lhs.extend(mw.body.inputs.iter().filter_map(|i| i.input_public_key));
+
+        let mut stealth_rhs: Vec<PublicKey> = mw
+            .body
+            .kernels
+            .iter()
+            .filter_map(|k| k.stealth_excess)
+            .collect();
+        stealth_rhs.extend(mw.body.inputs.iter().map(|i| i.output_public_key));
+        if mw.stealth_offset != [0u8; 32] {
+            stealth_rhs.push(PublicKey::from_secret_key(
+                secp,
+                &SecretKey::from_slice(&mw.stealth_offset).unwrap(),
+            ));
+        }
+        assert_eq!(
+            sum_keys(&stealth_lhs),
+            sum_keys(&stealth_rhs),
+            "Stealth excess and offset do not balance"
+        );
+    }
+
+    #[test]
+    fn mweb_constructed_spends_balance_commitments_stealth_and_rangeproofs() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::chain::BlockId;
+        use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mnemonic = crate::descriptors::generate_mnemonic().unwrap();
+        let secret = crate::seed::MasterSecret::parse(&mnemonic, None).unwrap();
+        let network = WalletNetwork::Testnet;
+        let meta = crate::meta::WalletMeta::new(network, None);
+        let mut db = Connection::open(meta::db_path(dir.path())).unwrap();
+        let params = crate::descriptors::create_params(&secret, network, 0).unwrap();
+        let mut wallet = PersistedWallet::create(&mut db, params).unwrap();
+        insert_checkpoint(
+            &mut wallet,
+            BlockId {
+                height: 100,
+                hash: BlockHash::all_zeros(),
+            },
+        );
+        let _utxo = receive_output_in_latest_block(&mut wallet, Amount::from_sat(10_000_000));
+        wallet.persist(&mut db).unwrap();
+        let signer = crate::descriptors::signer(&secret, network, 0).unwrap();
+
+        let mut runtime = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            network,
+            crate::dto::MwebScheme::default().to_master_scheme(),
+            0,
+            None,
+        )
+        .unwrap();
+        let _ = meta;
+
+        // 1. Peg-in: prepare -> sign transparent -> extract -> verify consensus & rewind.
+        let mut prepared_pegin = prepare_pegin(
+            &mut wallet,
+            &runtime.keys,
+            runtime.receive_index,
+            2_000_000,
+            50_000,
+            1_000,
+            &[],
+            Vec::new(),
+            network,
+            &runtime.secp,
+        )
+        .unwrap();
+        sign_and_finalize(&wallet, &signer, &mut prepared_pegin.psbt).unwrap();
+        let pegin_tx = extract_prepared_mweb_pegin(&prepared_pegin.psbt).unwrap();
+        crate::tx_invariants::verify_pegin_tx(
+            &prepared_pegin.psbt,
+            &pegin_tx,
+            &prepared_pegin.kernel_id,
+            2_000_000,
+            50_000,
+            1_000,
+            &prepared_pegin.outputs,
+            &runtime.secp,
+        )
+        .unwrap();
+        assert_mweb_tx_consensus_and_balance(&pegin_tx, &runtime.secp);
+
+        // Rewind / scan the peg-in tx with our AddressBook and confirm the credited coin matches.
+        let mut scan_db = MwebCoinDatabase::default();
+        let scanned_pegin = bdk_mweb::scan_litecoin_tx(
+            &runtime.keys,
+            &runtime.book,
+            &pegin_tx,
+            &mut scan_db,
+            &runtime.secp,
+        )
+        .unwrap();
+        assert_eq!(scanned_pegin.len(), 1);
+        assert_eq!(scanned_pegin[0].amount, 1_950_000);
+        assert_eq!(
+            scanned_pegin[0].output_id,
+            prepared_pegin.outputs[0].output_id
+        );
+
+        // Insert mature peg-in coin into store for subsequent spends.
+        let mut pegin_coin = prepared_pegin.outputs[0].clone();
+        pegin_coin.is_pegin = true;
+        pegin_coin.block_height = Some(50);
+        pegin_coin.leaf_index = Some(1);
+        let pegin_id_hex = hex::encode(pegin_coin.output_id);
+        runtime.store.db_mut().insert(pegin_coin.clone());
+
+        // 2. Private send with change: 1,950,000 -> 500,000 recipient + 50,000 fee + 1,400,000 change.
+        let mweb_dest = runtime.receive_address(network).unwrap();
+        let signed_send = sign_mweb_send(
+            &wallet,
+            &mut runtime,
+            dir.path(),
+            &MwebSendRequest {
+                address: mweb_dest,
+                amount_sats: 500_000,
+                fee_sats: 50_000,
+                drain: false,
+                selected_output_ids: Some(vec![pegin_id_hex.clone()]),
+            },
+            network,
+        )
+        .unwrap();
+        assert_mweb_tx_consensus_and_balance(&signed_send.tx, &runtime.secp);
+        assert_eq!(signed_send.change.as_ref().unwrap().amount, 1_400_000);
+
+        // 3. Private split (1-in-3): 1,950,000 -> [600,000, 600,000, 700,000] + 50,000 fee.
+        let signed_split = sign_mweb_split(
+            &wallet,
+            &mut runtime,
+            dir.path(),
+            &pegin_id_hex,
+            &[600_000, 600_000, 700_000],
+            50_000,
+            network,
+        )
+        .unwrap();
+        assert_mweb_tx_consensus_and_balance(&signed_split.tx, &runtime.secp);
+        assert_eq!(signed_split.outputs.len(), 3);
+
+        // 4. Typed peg-out with private change: 1,950,000 -> 400,000 public + 50,000 fee + 1,500,000 change.
+        let pub_dest = wallet
+            .peek_address(bdk_wallet::KeychainKind::External, 0)
+            .address
+            .to_string();
+        let signed_pegout = sign_pegout(
+            &wallet,
+            &runtime,
+            dir.path(),
+            PegoutRequest {
+                address: pub_dest.clone(),
+                amount_sats: 400_000,
+                fee_sats: 50_000,
+                drain: false,
+                selected_output_ids: Some(vec![pegin_id_hex.clone()]),
+                output_amounts: vec![400_000],
+                addresses: Vec::new(),
+                per_coin: false,
+                fee_output_index: None,
+            },
+            network,
+        )
+        .unwrap();
+        assert_mweb_tx_consensus_and_balance(&signed_pegout.tx, &runtime.secp);
+        assert_eq!(signed_pegout.change.as_ref().unwrap().amount, 1_500_000);
+
+        // 5. Per-coin peg-out (drain, no private change): 1,950,000 -> 1,900,000 public + 50,000 fee.
+        let signed_per_coin = sign_pegout(
+            &wallet,
+            &runtime,
+            dir.path(),
+            PegoutRequest {
+                address: String::new(),
+                amount_sats: 1_900_000,
+                fee_sats: 50_000,
+                drain: true,
+                selected_output_ids: Some(vec![pegin_id_hex]),
+                output_amounts: vec![1_900_000],
+                addresses: vec![pub_dest],
+                per_coin: true,
+                fee_output_index: Some(0),
+            },
+            network,
+        )
+        .unwrap();
+        assert_mweb_tx_consensus_and_balance(&signed_per_coin.tx, &runtime.secp);
+        assert!(signed_per_coin.change.is_none());
+
+        // 6. Multi-hop self-spend chain (2 hops): 1,950,000 -> 1,900,000 -> 1,850,000.
+        let hops = sign_self_spend_hops(
+            &wallet,
+            &mut runtime,
+            dir.path(),
+            pegin_coin,
+            2,
+            50_000,
+            network,
+        )
+        .unwrap();
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].created.amount, 1_900_000);
+        assert_eq!(hops[1].created.amount, 1_850_000);
+        for hop in &hops {
+            let tx: Transaction = deserialize(&hex::decode(&hop.raw_hex).unwrap()).unwrap();
+            assert_mweb_tx_consensus_and_balance(&tx, &runtime.secp);
+        }
+    }
+
+    #[test]
+    fn plan_pegout_per_coin_seeded_property_holds_invariants() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let dust = p2wpkh_dust_sats().unwrap();
+        for seed in 0..250u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let n = rng.gen_range(1..=12usize);
+            let fee_sats = rng.gen_range(0..=150_000u64);
+            let coins: Vec<u64> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.2) {
+                        rng.gen_range(0..=dust + fee_sats)
+                    } else {
+                        rng.gen_range(dust..=50_000_000)
+                    }
+                })
+                .collect();
+
+            let res = plan_pegout_per_coin(&coins, fee_sats, dust);
+            let min_fee = bdk_mweb::policy::min_mweb_fee(
+                bdk_mweb::policy::KERNEL_WITH_STEALTH_WEIGHT + n as u64,
+            );
+            let max_coin = coins.iter().copied().max().unwrap();
+            let min_coin = coins.iter().copied().min().unwrap();
+            let should_succeed = fee_sats >= min_fee
+                && max_coin >= fee_sats.saturating_add(dust)
+                && min_coin >= dust;
+
+            assert_eq!(
+                res.is_ok(),
+                should_succeed,
+                "seed={seed} coins={coins:?} fee={fee_sats} dust={dust}: {res:?}"
+            );
+            if let Ok(plan) = res {
+                assert_eq!(plan.amounts.len(), n);
+                assert!(plan.fee_output_index < n);
+                let in_sum: u64 = coins.iter().sum();
+                let out_sum: u64 = plan.amounts.iter().sum();
+                assert_eq!(out_sum + fee_sats, in_sum, "seed={seed}");
+                for (i, &amt) in plan.amounts.iter().enumerate() {
+                    assert!(amt >= dust, "seed={seed} output {i} below dust: {amt}");
+                    if i == plan.fee_output_index {
+                        assert_eq!(amt + fee_sats, coins[i], "seed={seed}");
+                    } else {
+                        assert_eq!(amt, coins[i], "seed={seed}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn fund_mweb_split_spends_only_the_selected_coin() {
         use crate::descriptors;
@@ -2889,6 +3271,81 @@ fn resolve_reachable_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>
     Ok(probe_reachable(resolve_peers(peers)?))
 }
 
+/// Prepare a hybrid peg-in PSBT with [`crate::tx_invariants::LitecoinDustCoinSelection`]
+/// and `unspendable` holds, without touching BDK's `lock_outpoint`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_pegin(
+    wallet: &mut PersistedWallet<Connection>,
+    keys: &MasterKeys,
+    receive_index: u32,
+    pegin_amount_sats: u64,
+    mweb_fee_sats: u64,
+    transparent_fee_sats: u64,
+    selected_outpoints: &[bdk_wallet::bitcoin::OutPoint],
+    unspendable_outpoints: Vec<bdk_wallet::bitcoin::OutPoint>,
+    network: WalletNetwork,
+    secp: &Secp256k1<All>,
+) -> Result<bdk_wallet::PreparedMwebPegin, WalletError> {
+    crate::tx_invariants::check_money(pegin_amount_sats, "peg-in amount")?;
+    crate::tx_invariants::check_money(mweb_fee_sats, "peg-in MWEB fee")?;
+    crate::tx_invariants::check_money(transparent_fee_sats, "peg-in transparent fee")?;
+    if pegin_amount_sats <= mweb_fee_sats {
+        return Err(WalletError::BuildTx(format!(
+            "peg-in amount {pegin_amount_sats} litoshis must exceed the MWEB fee ({mweb_fee_sats} litoshis) so a private coin remains"
+        )));
+    }
+    if pegin_amount_sats < crate::tx_invariants::PEGIN_V9_DUST_SATS {
+        return Err(WalletError::BuildTx(format!(
+            "peg-in amount {pegin_amount_sats} litoshis is below the {} litoshis dust limit",
+            crate::tx_invariants::PEGIN_V9_DUST_SATS
+        )));
+    }
+    let kind = match network {
+        WalletNetwork::Mainnet => NetworkKind::Main,
+        WalletNetwork::Testnet => NetworkKind::Test,
+    };
+    let mut funded = bdk_mweb::fund_mweb_pegin(
+        keys,
+        receive_index,
+        pegin_amount_sats,
+        mweb_fee_sats,
+        kind,
+        secp,
+    )
+    .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let kernel_id = bdk_mweb::sign_funded_mweb_pegin(&mut funded, keys, secp)
+        .map_err(|e| WalletError::Mweb(e.to_string()))?;
+
+    let mut builder = wallet
+        .build_tx()
+        .coin_selection(crate::tx_invariants::LitecoinDustCoinSelection);
+    if !selected_outpoints.is_empty() {
+        builder
+            .add_utxos(selected_outpoints)
+            .map_err(|e| WalletError::BuildTx(e.to_string()))?;
+        builder.manually_selected_only();
+    }
+    builder.unspendable(unspendable_outpoints);
+    builder.add_mweb_pegin(kernel_id, Amount::from_sat(pegin_amount_sats));
+    builder.fee_absolute(Amount::from_sat(transparent_fee_sats));
+    let mut psbt = builder
+        .finish()
+        .map_err(|e| WalletError::BuildTx(e.to_string()))?;
+
+    psbt.mweb_tx_offset = funded.psbt.mweb_tx_offset;
+    psbt.mweb_stealth_offset = funded.psbt.mweb_stealth_offset;
+    psbt.mweb_kernels = funded.psbt.mweb_kernels;
+    psbt.mweb_inputs = funded.psbt.mweb_inputs;
+    psbt.mweb_outputs = funded.psbt.mweb_outputs;
+
+    Ok(bdk_wallet::PreparedMwebPegin {
+        psbt,
+        kernel_id,
+        pegin_amount: Amount::from_sat(pegin_amount_sats),
+        outputs: funded.outputs,
+    })
+}
+
 pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
     signer: &ZeroizingSigner,
@@ -2896,42 +3353,42 @@ pub fn pegin(
     route: &BroadcastRoute,
     req: PeginRequest,
 ) -> Result<PeginResult, WalletError> {
-    let selected = req
-        .selected_outpoints
-        .as_ref()
-        .map(|v| {
-            v.iter()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| {
-                    use std::str::FromStr;
-                    bdk_wallet::bitcoin::OutPoint::from_str(s.trim()).map_err(|e| {
-                        WalletError::BuildTx(format!(
-                            "invalid outpoint '{s}' (expected txid:vout): {e}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let selected =
+        crate::tx_invariants::parse_and_dedup_outpoints(req.selected_outpoints.as_deref())?
+            .unwrap_or_default();
+    let held: Vec<bdk_wallet::bitcoin::OutPoint> =
+        mweb_frozen::public_reserved_outpoints(&route.data_dir)?
+            .into_iter()
+            .collect();
 
-    let mut prepared = wallet
-        .prepare_mweb_pegin_with_utxos(
-            &runtime.keys,
-            runtime.receive_index,
-            Amount::from_sat(req.amount_sats),
-            Amount::from_sat(req.mweb_fee_sats),
-            Amount::from_sat(req.transparent_fee_sats),
-            &selected,
-            &runtime.secp,
-        )
-        .map_err(|e| WalletError::Mweb(e.to_string()))?;
-    // MWEB components were signed inside prepare_mweb_pegin; the transparent inputs are
+    let mut prepared = prepare_pegin(
+        wallet,
+        &runtime.keys,
+        runtime.receive_index,
+        req.amount_sats,
+        req.mweb_fee_sats,
+        req.transparent_fee_sats,
+        &selected,
+        held,
+        route.network,
+        &runtime.secp,
+    )?;
+    // MWEB components were signed inside prepare_pegin; the transparent inputs are
     // signed here with the caller-owned keys.
     sign_and_finalize(wallet, signer, &mut prepared.psbt)
         .map_err(|e| WalletError::Sign(format!("peg-in: {e}")))?;
     let tx = extract_prepared_mweb_pegin(&prepared.psbt)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    crate::tx_invariants::verify_pegin_tx(
+        &prepared.psbt,
+        &tx,
+        &prepared.kernel_id,
+        req.amount_sats,
+        req.mweb_fee_sats,
+        req.transparent_fee_sats,
+        &prepared.outputs,
+        &runtime.secp,
+    )?;
     // A peg-in tx carries MWEB extension data that Electrum servers reject
     // ("TX decode failed"), so it must take the RPC/P2P path like other MWEB txs.
     broadcast_mweb_tx(&tx, route)?;
@@ -2962,14 +3419,24 @@ pub(crate) fn apply_pegin_locally(
     // while transparent UTXOs remain, and Total roughly doubles.
     wallet.apply_unconfirmed_txs([(tx.clone(), ts)]);
     let txid = tx.compute_txid().to_string();
-    let fee_sats = req.transparent_fee_sats.saturating_add(req.mweb_fee_sats);
+    let fee_sats = crate::tx_invariants::checked_add_money(
+        req.transparent_fee_sats,
+        req.mweb_fee_sats,
+        "peg-in fee",
+    )?;
+    let total_out = crate::tx_invariants::checked_add_money(
+        req.amount_sats,
+        fee_sats,
+        "peg-in transparent spend",
+    )?;
+    let net_sats = crate::tx_invariants::neg_net_sats(total_out)?;
     // Net matches the transparent spend: peg-in amount + both fees. Deduped
     // against the BDK history row by txid once the graph has the tx.
     if !runtime.history.entries.iter().any(|e| e.id == txid) {
         runtime.history.record(MwebHistoryEntry {
             id: txid.clone(),
             kind: TxKind::Pegin,
-            net_sats: -((req.amount_sats.saturating_add(fee_sats)) as i64),
+            net_sats,
             fee_sats: Some(fee_sats),
             timestamp: ts,
             output_ids,
@@ -3266,15 +3733,20 @@ pub fn sign_mweb_send(
     req: &MwebSendRequest,
     network: WalletNetwork,
 ) -> Result<SignedMwebSend, WalletError> {
-    let net = network.to_bitcoin_network();
-    let dest = Address::from_str(&req.address)
-        .map_err(|e| WalletError::InvalidAddress(e.to_string()))?
-        .require_network(net)
-        .map_err(|e| WalletError::InvalidAddress(e.to_string()))?;
+    let dest = crate::tx_invariants::validate_mweb_recipient(&req.address, network)?;
+    if req.amount_sats == 0 {
+        return Err(WalletError::BuildTx(
+            "private send amount must be greater than zero".into(),
+        ));
+    }
     let tip = wallet.latest_checkpoint().height();
     let frozen = mweb_frozen::unavailable_ids(data_dir)?;
     let selected = normalize_selected_ids(req.selected_output_ids.as_deref());
-    let needed = req.amount_sats.saturating_add(req.fee_sats);
+    let needed = crate::tx_invariants::checked_add_money(
+        req.amount_sats,
+        req.fee_sats,
+        "private send total",
+    )?;
     let coins = resolve_spend_coins(
         runtime.store.db(),
         tip,
@@ -3302,6 +3774,15 @@ pub fn sign_mweb_send(
     let (tx, change) = wallet
         .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    crate::tx_invariants::verify_mweb_spend_tx(
+        &tx,
+        &funded.spent_coins,
+        &[req.amount_sats],
+        &[],
+        req.fee_sats,
+        change.as_slice(),
+        &runtime.secp,
+    )?;
     Ok(SignedMwebSend {
         wtxid: tx.compute_wtxid().to_string(),
         tx,
@@ -3326,10 +3807,13 @@ pub fn apply_signed_mweb_send(
         output_ids.push(hex::encode(change.output_id));
         runtime.store.db_mut().insert(change);
     }
+    let net_sats =
+        crate::tx_invariants::neg_net_sats(signed.amount_sats.saturating_add(signed.fee_sats))
+            .unwrap_or(i64::MIN);
     runtime.history.record(MwebHistoryEntry {
         id: signed.wtxid.clone(),
         kind: TxKind::MwebSend,
-        net_sats: -((signed.amount_sats.saturating_add(signed.fee_sats)) as i64),
+        net_sats,
         fee_sats: Some(signed.fee_sats),
         timestamp: now_ts(),
         output_ids,
@@ -4129,7 +4613,7 @@ impl SignedMwebSplit {
     }
 }
 
-/// 1-in-N-out MWEB self-split. Persists `receive_index` before the caller broadcasts.
+/// 1-in-N-out MWEB self-split. Persists `receive_index` after building & signing, before broadcast.
 pub fn sign_mweb_split(
     wallet: &PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
@@ -4163,9 +4647,6 @@ pub fn sign_mweb_split(
         recipients.push((addr, *amount));
         indexes.push(idx);
     }
-    runtime.receive_index = start.saturating_add(recipient_amounts.len() as u32);
-    // Persist indexes before broadcast so a landed tx cannot reuse them.
-    runtime.persist(data_dir)?;
 
     let mut funded = bdk_mweb::fund_mweb_spend(
         vec![coin],
@@ -4201,6 +4682,24 @@ pub fn sign_mweb_split(
         owned.block_height = None;
         outputs.push(owned);
     }
+    crate::tx_invariants::verify_mweb_spend_tx(
+        &tx,
+        &funded.spent_coins,
+        recipient_amounts,
+        &[],
+        fee_sats,
+        &outputs,
+        &runtime.secp,
+    )?;
+
+    // Advance and persist receive_index only after building & signing succeed,
+    // still before returning to the caller for broadcast.
+    runtime.receive_index = start.saturating_add(recipient_amounts.len() as u32);
+    if let Err(e) = runtime.persist(data_dir) {
+        runtime.receive_index = start;
+        return Err(e);
+    }
+
     let wtxid = tx.compute_wtxid().to_string();
     Ok(SignedMwebSplit {
         tx,
@@ -4226,7 +4725,7 @@ pub fn apply_signed_mweb_split(runtime: &mut MwebRuntime, signed: &SignedMwebSpl
     runtime.history.record(MwebHistoryEntry {
         id: signed.wtxid.clone(),
         kind: TxKind::MwebSplit,
-        net_sats: -(signed.fee_sats as i64),
+        net_sats: crate::tx_invariants::neg_net_sats(signed.fee_sats).unwrap_or(i64::MIN),
         fee_sats: Some(signed.fee_sats),
         timestamp: now_ts(),
         output_ids,
@@ -4264,7 +4763,7 @@ impl std::fmt::Debug for PreparedHop {
 }
 
 /// Sign `hops` dependent self-spends. The receive index advances and is persisted
-/// before the function returns, including when a later hop fails to build.
+/// once all hops build and sign, before the function returns.
 pub fn sign_self_spend_hops(
     wallet: &PersistedWallet<Connection>,
     runtime: &mut MwebRuntime,
@@ -4284,8 +4783,6 @@ pub fn sign_self_spend_hops(
         WalletNetwork::Testnet => NetworkKind::Test,
     };
     let start = runtime.receive_index;
-    runtime.receive_index = start.saturating_add(hops);
-    runtime.persist(data_dir)?;
 
     let mut prepared = Vec::with_capacity(hops as usize);
     for offset in 0..hops {
@@ -4323,6 +4820,15 @@ pub fn sign_self_spend_hops(
         let staged = &funded.staged_outputs[0];
         let mut owned = owned_coin_from_staged(staged, index, &runtime.keys, &runtime.secp)?;
         owned.block_height = None;
+        crate::tx_invariants::verify_mweb_spend_tx(
+            &tx,
+            &funded.spent_coins,
+            &[amount],
+            &[],
+            fee_sats,
+            std::slice::from_ref(&owned),
+            &runtime.secp,
+        )?;
         let created_output_id = hex::encode(owned.output_id);
         prepared.push(PreparedHop {
             raw_hex: serialize_hex(&tx),
@@ -4336,6 +4842,13 @@ pub fn sign_self_spend_hops(
         });
         coin = owned;
     }
+
+    runtime.receive_index = start.saturating_add(hops);
+    if let Err(e) = runtime.persist(data_dir) {
+        runtime.receive_index = start;
+        return Err(e);
+    }
+
     Ok(prepared)
 }
 
@@ -4352,6 +4865,7 @@ pub fn apply_prepared_output(
             "invalid MWEB output id '{spent_output_id}' (expected 32-byte hex)"
         ))
     })?;
+    let net_sats = crate::tx_invariants::neg_net_sats(fee_sats)?;
     let _ = runtime.store.db_mut().mark_spent(&spent);
     let output_id = hex::encode(created.output_id);
     runtime.store.db_mut().insert(created);
@@ -4364,7 +4878,7 @@ pub fn apply_prepared_output(
         runtime.history.record(MwebHistoryEntry {
             id: wtxid.to_string(),
             kind: TxKind::MwebChurn,
-            net_sats: -(fee_sats as i64),
+            net_sats,
             fee_sats: Some(fee_sats),
             timestamp: now_ts(),
             output_ids: vec![output_id],
@@ -4622,17 +5136,6 @@ pub fn sign_pegout(
     req: PegoutRequest,
     network: WalletNetwork,
 ) -> Result<SignedPegout, WalletError> {
-    let net = network.to_bitcoin_network();
-    let dust_relay = FeeRate::from_sat_per_vb(30)
-        .ok_or_else(|| WalletError::BuildTx("internal dust fee rate".into()))?;
-
-    let parse_dest = |raw: &str| -> Result<Address, WalletError> {
-        Address::from_str(raw)
-            .map_err(|e| WalletError::InvalidAddress(e.to_string()))?
-            .require_network(net)
-            .map_err(|e| WalletError::InvalidAddress(e.to_string()))
-    };
-
     let pegouts: Vec<(ScriptBuf, u64)> = if req.per_coin {
         if req.addresses.len() != req.output_amounts.len() || req.output_amounts.is_empty() {
             return Err(WalletError::BuildTx(
@@ -4641,35 +5144,44 @@ pub fn sign_pegout(
         }
         let mut out = Vec::with_capacity(req.output_amounts.len());
         for (addr, amount) in req.addresses.iter().zip(req.output_amounts.iter()) {
-            let dest = parse_dest(addr)?;
-            let min_non_dust = dest.script_pubkey().minimal_non_dust_custom(dust_relay);
-            if Amount::from_sat(*amount) < min_non_dust {
+            let (_dest, spk, min_non_dust) =
+                crate::tx_invariants::validate_public_recipient(addr, network)?;
+            crate::tx_invariants::check_money(*amount, "peg-out output amount")?;
+            if *amount < min_non_dust {
                 return Err(WalletError::BuildTx(format!(
-                    "peg-out amount {} litoshis is below dust limit ({})",
-                    amount,
-                    min_non_dust.to_sat()
+                    "peg-out amount {} litoshis is below dust limit ({min_non_dust})",
+                    amount
                 )));
             }
-            out.push((dest.script_pubkey(), *amount));
+            out.push((spk, *amount));
         }
         out
     } else {
-        let dest = parse_dest(&req.address)?;
-        let min_non_dust = dest.script_pubkey().minimal_non_dust_custom(dust_relay);
-        if Amount::from_sat(req.amount_sats) < min_non_dust {
+        let (_dest, spk, min_non_dust) =
+            crate::tx_invariants::validate_public_recipient(&req.address, network)?;
+        crate::tx_invariants::check_money(req.amount_sats, "peg-out amount")?;
+        if req.amount_sats < min_non_dust {
             return Err(WalletError::BuildTx(format!(
-                "peg-out amount {} litoshis is below dust limit ({})",
-                req.amount_sats,
-                min_non_dust.to_sat()
+                "peg-out amount {} litoshis is below dust limit ({min_non_dust})",
+                req.amount_sats
             )));
         }
-        vec![(dest.script_pubkey(), req.amount_sats)]
+        vec![(spk, req.amount_sats)]
     };
 
+    let pegout_sum =
+        crate::tx_invariants::checked_sum_sats(pegouts.iter().map(|(_, a)| *a), "peg-out outputs")?;
+    if pegout_sum != req.amount_sats {
+        return Err(WalletError::BuildTx(format!(
+            "peg-out output sum ({pegout_sum}) does not match amount_sats ({})",
+            req.amount_sats
+        )));
+    }
     let tip = wallet.latest_checkpoint().height();
     let frozen = mweb_frozen::unavailable_ids(data_dir)?;
     let selected = normalize_selected_ids(req.selected_output_ids.as_deref());
-    let needed = req.amount_sats.saturating_add(req.fee_sats);
+    let needed =
+        crate::tx_invariants::checked_add_money(req.amount_sats, req.fee_sats, "peg-out total")?;
     let coins = resolve_spend_coins(
         runtime.store.db(),
         tip,
@@ -4690,7 +5202,7 @@ pub fn sign_pegout(
     let mut funded = bdk_mweb::fund_mweb_spend(
         coins,
         vec![],
-        pegouts,
+        pegouts.clone(),
         req.fee_sats,
         &runtime.keys,
         CHANGE_ADDRESS_INDEX,
@@ -4702,6 +5214,15 @@ pub fn sign_pegout(
     let (tx, change) = wallet
         .sign_and_extract_funded_mweb(&mut funded, &runtime.keys, &runtime.secp)
         .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    crate::tx_invariants::verify_mweb_spend_tx(
+        &tx,
+        &funded.spent_coins,
+        &[],
+        &pegouts,
+        req.fee_sats,
+        change.as_slice(),
+        &runtime.secp,
+    )?;
     let addresses = if req.per_coin {
         req.addresses
     } else if !req.address.is_empty() {
@@ -4734,10 +5255,13 @@ pub fn apply_signed_pegout(
         output_ids.push(hex::encode(change.output_id));
         runtime.store.db_mut().insert(change);
     }
+    let net_sats =
+        crate::tx_invariants::neg_net_sats(signed.amount_sats.saturating_add(signed.fee_sats))
+            .unwrap_or(i64::MIN);
     runtime.history.record(MwebHistoryEntry {
         id: signed.wtxid.clone(),
         kind: TxKind::Pegout,
-        net_sats: -((signed.amount_sats.saturating_add(signed.fee_sats)) as i64),
+        net_sats,
         fee_sats: Some(signed.fee_sats),
         timestamp: now_ts(),
         output_ids,

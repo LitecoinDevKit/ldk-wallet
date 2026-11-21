@@ -36,6 +36,7 @@ mod secrets;
 mod seed;
 mod split;
 mod split_ids;
+mod tx_invariants;
 mod utxo_labels;
 
 pub use app::{MemoryBackedApp, WalletApp};

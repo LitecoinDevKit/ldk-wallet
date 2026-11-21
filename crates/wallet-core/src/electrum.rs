@@ -188,7 +188,7 @@ pub fn estimate_fee_rate_sat_vb(client: &ElectrumClient) -> Result<(u64, bool), 
     if !btc_per_kb.is_finite() || btc_per_kb <= 0.0 {
         return Ok((MIN_FEE_RATE_SAT_VB, true));
     }
-    // LTC/kB → litoshis/vB: * 1e8 / 1000 = * 1e5
-    let sat_vb = (btc_per_kb * 100_000.0).ceil().max(1.0) as u64;
+    // LTC/kB → litoshis/vB: * 1e8 / 1000 = * 1e5, clamped to [1, MAX_FEE_RATE_SAT_VB].
+    let sat_vb = crate::tx_invariants::clamp_estimated_fee_rate(btc_per_kb * 100_000.0);
     Ok((sat_vb.max(MIN_FEE_RATE_SAT_VB), false))
 }

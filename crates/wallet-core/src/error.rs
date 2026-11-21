@@ -187,7 +187,8 @@ fn clean_server_message(raw: &str) -> String {
     if let Some(pos) = msg.find("\n[") {
         msg.truncate(pos);
     }
-    msg.split_whitespace().collect::<Vec<_>>().join(" ")
+    let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::redact::scrub_log_line(&collapsed)
 }
 
 #[cfg(test)]

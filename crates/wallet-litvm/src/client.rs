@@ -10,7 +10,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::address::{format_address, parse_evm_address};
 use crate::amount::{format_zkltc, parse_zkltc};
@@ -21,9 +21,7 @@ use crate::dto::{
 use crate::error::LitVmError;
 use crate::fees::{bump_eip1559, cap_max_fee_gwei, cap_priority_gwei, check_total_fee};
 use crate::history::fetch_txlist;
-use crate::network::{
-    LitVmNetwork, LitVmSettings, LitVmSettingsFile, GAS_PAD_BPS, MAX_GAS_LIMIT,
-};
+use crate::network::{LitVmNetwork, LitVmSettings, LitVmSettingsFile, GAS_PAD_BPS, MAX_GAS_LIMIT};
 use crate::settings::{load_settings_file, save_settings_file};
 
 const RECEIPT_POLL_MS: u64 = 250;
@@ -41,18 +39,37 @@ pub struct LitVmClient {
     local_pending: Mutex<Vec<LitVmHistoryTx>>,
 }
 
+impl std::fmt::Debug for LitVmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitVmClient")
+            .field("address", &format_address(self.address))
+            .field("network", &self.network.id)
+            .field("rpc_http", &crate::network::redact_userinfo(&self.rpc_http))
+            .field(
+                "rpc_override",
+                &self
+                    .rpc_override
+                    .as_deref()
+                    .map(crate::network::redact_userinfo),
+            )
+            .field("signing_enabled", &self.signing_enabled)
+            .field("signer", &"<redacted>")
+            .finish()
+    }
+}
+
 impl LitVmClient {
-    pub fn open(data_dir: &Path, mut secret: [u8; 32]) -> Result<Self, LitVmError> {
+    pub fn open(data_dir: &Path, secret: Zeroizing<[u8; 32]>) -> Result<Self, LitVmError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| LitVmError::Rpc(e.to_string()))?;
         let file = load_settings_file(data_dir)?;
         let settings = LitVmSettings::from_file(&file, false).map_err(LitVmError::Settings)?;
-        let signer = PrivateKeySigner::from_slice(&secret)
+        let signer = PrivateKeySigner::from_slice(&*secret)
             .map_err(|e| LitVmError::Rpc(e.to_string()))?
             .with_chain_id(Some(settings.network.chain_id));
-        secret.zeroize();
+        drop(secret);
         let address = signer.address();
         Ok(Self {
             runtime,
@@ -156,9 +173,9 @@ impl LitVmClient {
                 LitVmProbe {
                     expected_chain_id: self.network.chain_id,
                     rpc_chain_id: None,
-                    rpc_http: self.rpc_http.clone(),
+                    rpc_http: crate::network::redact_userinfo(&self.rpc_http),
                     matches: false,
-                    error: Some(e.to_string()),
+                    error: Some(crate::network::redact_userinfo(&e.to_string())),
                 }
             }
         }
@@ -256,10 +273,12 @@ impl LitVmClient {
     }
 
     fn provider(&self) -> Result<impl Provider + Clone, LitVmError> {
-        let url = self
-            .rpc_http
-            .parse()
-            .map_err(|e| LitVmError::Rpc(format!("invalid RPC URL: {e}")))?;
+        let url = self.rpc_http.parse().map_err(|e| {
+            LitVmError::Rpc(format!(
+                "invalid RPC URL: {}",
+                crate::network::redact_userinfo(&format!("{e}"))
+            ))
+        })?;
         Ok(ProviderBuilder::new().connect_http(url))
     }
 
@@ -408,10 +427,8 @@ impl LitVmClient {
             .estimate_eip1559_fees()
             .await
             .map_err(|e| LitVmError::Rpc(e.to_string()))?;
-        let max_priority = cap_priority_gwei(bump_eip1559(
-            old_tip,
-            market.max_priority_fee_per_gas,
-        ))?;
+        let max_priority =
+            cap_priority_gwei(bump_eip1559(old_tip, market.max_priority_fee_per_gas))?;
         let max_fee = cap_max_fee_gwei(bump_eip1559(old_max, market.max_fee_per_gas))?;
         if max_fee < max_priority {
             return Err(LitVmError::FeeCap(
@@ -520,4 +537,73 @@ struct BuiltTx {
 
 fn parse_tx_hash(txid: &str) -> Result<TxHash, LitVmError> {
     TxHash::from_str(txid.trim()).map_err(|e| LitVmError::Rpc(format!("invalid txid: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "wallet-litvm-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn open_redacts_debug_and_fails_cleanly_on_invalid_settings() {
+        let dir = TestDir::new("hygiene");
+        std::fs::write(
+            dir.path().join("litvm.json"),
+            r#"{"network_id":"liteforge","rpc_http_override":"https://rpcuser:rpcs3cr3t@litvm.example:8545"}"#,
+        )
+        .unwrap();
+
+        let key_bytes = [0x42u8; 32];
+        let client = LitVmClient::open(dir.path(), Zeroizing::new(key_bytes)).expect("open");
+        let dbg = format!("{client:?}");
+        assert!(
+            !dbg.contains("42424242") && !dbg.contains("rpcs3cr3t") && dbg.contains("<redacted>"),
+            "LitVmClient Debug leaked secret or RPC password: {dbg}"
+        );
+
+        let settings = client.settings();
+        assert!(!format!("{settings:?}").contains("rpcs3cr3t"));
+
+        let update_req = UpdateLitVmSettingsRequest {
+            rpc_http_override: Some("https://rpcuser:rpcs3cr3t@litvm.example:8545".into()),
+        };
+        assert!(!format!("{update_req:?}").contains("rpcs3cr3t"));
+
+        // Corrupt network_id triggers early `?` error in `LitVmClient::open` after taking `Zeroizing`.
+        std::fs::write(
+            dir.path().join("litvm.json"),
+            r#"{"network_id":"unknown-litvm-chain"}"#,
+        )
+        .unwrap();
+        let err = LitVmClient::open(dir.path(), Zeroizing::new(key_bytes))
+            .expect_err("unknown network must fail")
+            .to_string();
+        assert!(
+            !err.contains("42424242"),
+            "open error must not echo secret bytes: {err}"
+        );
+    }
 }

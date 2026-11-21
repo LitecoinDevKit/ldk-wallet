@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LitVmSummary {
     pub address: String,
     pub balance_zkltc: String,
@@ -15,13 +15,46 @@ pub struct LitVmSummary {
     pub seed_note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for LitVmSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitVmSummary")
+            .field("address", &self.address)
+            .field("balance_zkltc", &self.balance_zkltc)
+            .field("network_id", &self.network_id)
+            .field("network_name", &self.network_name)
+            .field("chain_id", &self.chain_id)
+            .field("symbol", &self.symbol)
+            .field("faucet_url", &self.faucet_url)
+            .field("explorer", &self.explorer)
+            .field("rpc_http", &crate::network::redact_userinfo(&self.rpc_http))
+            .field("signing_enabled", &self.signing_enabled)
+            .field("seed_note", &self.seed_note)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LitVmProbe {
     pub expected_chain_id: u64,
     pub rpc_chain_id: Option<u64>,
     pub rpc_http: String,
     pub matches: bool,
     pub error: Option<String>,
+}
+
+impl std::fmt::Debug for LitVmProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitVmProbe")
+            .field("expected_chain_id", &self.expected_chain_id)
+            .field("rpc_chain_id", &self.rpc_chain_id)
+            .field("rpc_http", &crate::network::redact_userinfo(&self.rpc_http))
+            .field("matches", &self.matches)
+            .field(
+                "error",
+                &self.error.as_deref().map(crate::network::redact_userinfo),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +119,21 @@ pub struct LitVmHistoryPage {
     pub warning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UpdateLitVmSettingsRequest {
     pub rpc_http_override: Option<String>,
+}
+
+impl std::fmt::Debug for UpdateLitVmSettingsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateLitVmSettingsRequest")
+            .field(
+                "rpc_http_override",
+                &self
+                    .rpc_http_override
+                    .as_deref()
+                    .map(crate::network::redact_userinfo),
+            )
+            .finish()
+    }
 }

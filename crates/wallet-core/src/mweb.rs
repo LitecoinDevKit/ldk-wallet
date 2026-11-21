@@ -27,11 +27,10 @@ use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::secp256k1::All;
 use bdk_wallet::bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use bdk_wallet::chain::Merge;
-use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{extract_prepared_mweb_pegin, select_mweb_coins, MwebStore, PersistedWallet};
 
-use crate::descriptors::sign_and_finalize;
+use crate::descriptors::{sign_and_finalize, ZeroizingSigner};
 use crate::dto::{
     ChurnPhase, CoinActions, CoinBlock, CoinStatus, CombinedSummary, MwebBroadcastResult,
     MwebSendRequest, MwebUtxoRecord, PeginRequest, PeginResult, PegoutRequest, SplitResult, TxKind,
@@ -202,8 +201,31 @@ pub struct MwebRuntime {
     agg: ChangeSet,
     /// Key for encrypting MWEB files at rest; `None` falls back to the legacy
     /// plaintext formats (tests / plaintext-era wallets awaiting migration).
-    sealing_key: Option<[u8; 32]>,
+    sealing_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     secp: Secp256k1<bdk_wallet::bitcoin::secp256k1::All>,
+}
+
+impl MwebRuntime {
+    /// Overwrite in-memory key material (`sealing_key` and MWEB master keys).
+    pub fn wipe(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(ref mut k) = self.sealing_key {
+            k.zeroize();
+        }
+        self.sealing_key = None;
+        self.keys.wipe();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_sealing_key_for_test(&self) -> bool {
+        self.sealing_key.is_some()
+    }
+}
+
+impl Drop for MwebRuntime {
+    fn drop(&mut self) {
+        self.wipe();
+    }
 }
 
 /// What to tell the user about a failed sync pass, and whether the failure
@@ -310,14 +332,20 @@ pub fn master_keys_for_account(
 ) -> Result<MasterKeys, WalletError> {
     let (scan_path, spend_path) = mweb_scan_spend_paths(scheme, account)?;
     let fingerprint = master.fingerprint(secp);
-    let scan = master
+    let mut scan_xprv = master
         .derive_priv(secp, &scan_path)
-        .map_err(|e| WalletError::Mweb(e.to_string()))?
-        .private_key;
-    let spend = master
-        .derive_priv(secp, &spend_path)
-        .map_err(|e| WalletError::Mweb(e.to_string()))?
-        .private_key;
+        .map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let mut scan = scan_xprv.private_key;
+    crate::seed::wipe_xpriv(&mut scan_xprv);
+    let mut spend_xprv = match master.derive_priv(secp, &spend_path) {
+        Ok(x) => x,
+        Err(e) => {
+            scan.non_secure_erase();
+            return Err(WalletError::Mweb(e.to_string()));
+        }
+    };
+    let spend = spend_xprv.private_key;
+    crate::seed::wipe_xpriv(&mut spend_xprv);
     Ok(MasterKeys {
         scan,
         spend,
@@ -335,19 +363,21 @@ impl MwebRuntime {
         network: WalletNetwork,
         scheme: MasterKeyScheme,
         account: u32,
-        sealing_key: Option<[u8; 32]>,
+        sealing_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     ) -> Result<Self, WalletError> {
         let secp = Secp256k1::new();
         let bdk_net = network.to_bitcoin_network();
-        let master = secret.master_xprv(bdk_net)?;
+        let master = secret.master_xprv_guarded(bdk_net)?;
         let keys = master_keys_for_account(&master, scheme, account, &secp)?;
+        drop(master);
         let book = AddressBook::from_keys(&keys, MWEB_GAP_LIMIT, &secp)
             .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
-        let (store, agg) = load_store(data_dir, sealing_key.as_ref())?;
-        let sync_state = load_sync_state(data_dir, sealing_key.as_ref())?;
-        let receive_index = load_receive_index(data_dir, sealing_key.as_ref())?;
-        let history = load_history(data_dir, sealing_key.as_ref())?;
+        let key_ref = sealing_key.as_deref();
+        let (store, agg) = load_store(data_dir, key_ref)?;
+        let sync_state = load_sync_state(data_dir, key_ref)?;
+        let receive_index = load_receive_index(data_dir, key_ref)?;
+        let history = load_history(data_dir, key_ref)?;
 
         Ok(Self {
             store,
@@ -368,36 +398,35 @@ impl MwebRuntime {
     }
 
     pub fn persist(&mut self, data_dir: &Path) -> Result<(), WalletError> {
-        if let Some(key) = self.sealing_key {
+        if let Some(ref key) = self.sealing_key {
             self.agg.merge(self.store.take_staged());
             // One counter for all four blobs, so a later read can tell whether
             // they came from the same persist.
             let counter = load_seal_counter(data_dir).saturating_add(1);
 
             let coins =
-                bdk_mweb::seal_changeset_with_context(&key, &self.agg, SealContext::Coins, counter)
+                bdk_mweb::seal_changeset_with_context(key, &self.agg, SealContext::Coins, counter)
                     .map_err(|e| WalletError::Mweb(e.to_string()))?;
             write_sealed(&meta::mweb_coins_enc_path(data_dir), coins)?;
-            let sync_json = serde_json::to_vec(&self.sync_state)
-                .map_err(|e| WalletError::Mweb(e.to_string()))?;
+            let sync_json = zeroize::Zeroizing::new(
+                serde_json::to_vec(&self.sync_state)
+                    .map_err(|e| WalletError::Mweb(e.to_string()))?,
+            );
             write_sealed(
                 &meta::mweb_sync_enc_path(data_dir),
-                seal_bytes(&key, &sync_json, SealContext::SyncState, counter)?,
+                seal_bytes(key, &sync_json, SealContext::SyncState, counter)?,
             )?;
+            let index_str = zeroize::Zeroizing::new(self.receive_index.to_string());
             write_sealed(
                 &meta::mweb_index_enc_path(data_dir),
-                seal_bytes(
-                    &key,
-                    self.receive_index.to_string().as_bytes(),
-                    SealContext::Index,
-                    counter,
-                )?,
+                seal_bytes(key, index_str.as_bytes(), SealContext::Index, counter)?,
             )?;
-            let history_json =
-                serde_json::to_vec(&self.history).map_err(|e| WalletError::Mweb(e.to_string()))?;
+            let history_json = zeroize::Zeroizing::new(
+                serde_json::to_vec(&self.history).map_err(|e| WalletError::Mweb(e.to_string()))?,
+            );
             write_sealed(
                 &meta::mweb_history_enc_path(data_dir),
-                seal_bytes(&key, &history_json, SealContext::History, counter)?,
+                seal_bytes(key, &history_json, SealContext::History, counter)?,
             )?;
             // Written last: a crash between the blobs and the counter leaves the
             // counter behind, which reads as "not yet advanced" rather than as a
@@ -2109,7 +2138,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         )
         .unwrap();
         assert_eq!(sealed.store.db().unspent_count(), 1);
@@ -2121,18 +2150,21 @@ mod tests {
         assert!(!meta::mweb_history_path(dir.path()).is_file());
 
         // Sealed reload sees the same state; the sealed blob is not plaintext.
-        let reloaded = MwebRuntime::open(
+        let mut reloaded = MwebRuntime::open(
             dir.path(),
             &secret,
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         )
         .unwrap();
+        assert!(reloaded.has_sealing_key_for_test());
         assert_eq!(reloaded.store.db().unspent_count(), 1);
         assert_eq!(reloaded.receive_index, 7);
         assert_eq!(reloaded.history.entries.len(), 1);
+        reloaded.wipe();
+        assert!(!reloaded.has_sealing_key_for_test());
         let blob = std::fs::read(meta::mweb_history_enc_path(dir.path())).unwrap();
         assert!(!blob.windows(2).any(|w| w == b"tx"));
 
@@ -2143,7 +2175,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some([0u8; 32]),
+            Some(zeroize::Zeroizing::new([0u8; 32])),
         );
         assert!(wrong.is_err());
     }
@@ -2200,7 +2232,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         )
         .unwrap();
         rt.store.db_mut().insert(coin(1, Some(100), Some(4)));
@@ -2228,7 +2260,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         );
         assert!(
             swapped.is_err(),
@@ -2291,7 +2323,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         )
         .unwrap();
         rt.persist(dir.path()).unwrap();
@@ -2356,7 +2388,7 @@ mod tests {
             WalletNetwork::Testnet,
             scheme,
             0,
-            Some(key),
+            Some(zeroize::Zeroizing::new(key)),
         )
         .unwrap();
         assert_eq!(rt.store.db().unspent_count(), 1);
@@ -2428,9 +2460,10 @@ fn read_sealed(
     path: &Path,
     key: &[u8; 32],
     context: SealContext,
-) -> Result<Option<Vec<u8>>, WalletError> {
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, WalletError> {
     match fs::read(path) {
         Ok(blob) => open_sealed_blob(&blob, key, context)
+            .map(zeroize::Zeroizing::new)
             .map(Some)
             .map_err(|e| WalletError::Mweb(format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2656,7 +2689,7 @@ fn resolve_reachable_peers(peers: &[String]) -> Result<Vec<std::net::SocketAddr>
 
 pub fn pegin(
     wallet: &mut PersistedWallet<Connection>,
-    signer: &KeyMapWrapper,
+    signer: &ZeroizingSigner,
     runtime: &mut MwebRuntime,
     route: &BroadcastRoute,
     req: PeginRequest,
@@ -2860,7 +2893,7 @@ pub(crate) fn broadcast_mweb_tx(
 }
 
 /// Where a transaction that carries MWEB data may be broadcast.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BroadcastRoute {
     pub data_dir: std::path::PathBuf,
     pub rpc_url: Option<String>,
@@ -2869,6 +2902,18 @@ pub struct BroadcastRoute {
     /// The user opted in to sending through their own litecoind before any
     /// peer, which makes their node the visible origin of the transaction.
     pub via_own_node: bool,
+}
+
+impl std::fmt::Debug for BroadcastRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BroadcastRoute")
+            .field("data_dir", &self.data_dir)
+            .field("rpc_url", &crate::redact::redact_opt_url(&self.rpc_url))
+            .field("peers", &self.peers)
+            .field("network", &self.network)
+            .field("via_own_node", &self.via_own_node)
+            .finish()
+    }
 }
 
 impl BroadcastRoute {
@@ -4003,6 +4048,21 @@ pub struct PreparedHop {
     pub created: bdk_mweb::MwebCoin,
 }
 
+impl std::fmt::Debug for PreparedHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedHop")
+            .field("raw_hex", &"<redacted>")
+            .field("txid", &self.txid)
+            .field("wtxid", &self.wtxid)
+            .field("spent_output_id", &self.spent_output_id)
+            .field("created_output_id", &self.created_output_id)
+            .field("receive_index", &self.receive_index)
+            .field("fee_sats", &self.fee_sats)
+            .field("created", &self.created)
+            .finish()
+    }
+}
+
 /// Sign `hops` dependent self-spends. The receive index advances and is persisted
 /// before the function returns, including when a later hop fails to build.
 pub fn sign_self_spend_hops(
@@ -4499,13 +4559,12 @@ mod pegin_balance_tests {
     use bdk_wallet::bitcoin::Network;
     use bdk_wallet::descriptor::IntoWalletDescriptor;
     use bdk_wallet::extract_prepared_mweb_pegin;
-    use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
     use bdk_wallet::test_utils::{get_funded_wallet_wpkh, get_test_wpkh_and_change_desc};
 
     const SEED_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     /// Caller-owned signer for the `get_funded_wallet_wpkh` test descriptors.
-    fn test_signer(wallet: &bdk_wallet::Wallet) -> KeyMapWrapper {
+    fn test_signer(wallet: &bdk_wallet::Wallet) -> ZeroizingSigner {
         let (desc, change_desc) = get_test_wpkh_and_change_desc();
         let (_, mut keymap) = desc
             .into_wallet_descriptor(wallet.secp_ctx(), wallet.network().into())
@@ -4514,7 +4573,7 @@ mod pegin_balance_tests {
             .into_wallet_descriptor(wallet.secp_ctx(), wallet.network().into())
             .expect("change descriptor");
         keymap.extend(change_keymap);
-        KeyMapWrapper::from(keymap)
+        ZeroizingSigner::new(keymap)
     }
 
     #[test]

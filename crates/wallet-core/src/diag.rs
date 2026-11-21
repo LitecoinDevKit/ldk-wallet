@@ -26,10 +26,15 @@ fn now_secs() -> u64 {
 }
 
 /// Append a line to the ring buffer and mirror to stderr.
+///
+/// Every message passes through [`crate::redact::scrub_log_line`] before
+/// hitting stderr or the ring buffer so mnemonics, private keys, URL
+/// credentials, and raw transaction hex never leak into logs or exported
+/// diagnostics bundles.
 pub fn log(message: impl AsRef<str>) {
-    let message = message.as_ref();
-    eprintln!("{message}");
-    let line = format!("{} {message}", now_secs());
+    let scrubbed = crate::redact::scrub_log_line(message.as_ref());
+    eprintln!("{scrubbed}");
+    let line = format!("{} {scrubbed}", now_secs());
     if let Ok(mut ring) = LOG.lock() {
         if ring.lines.len() >= CAPACITY {
             ring.lines.pop_front();
@@ -99,5 +104,29 @@ mod tests {
             .map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
             .collect();
         assert_eq!(numbers, (0..CAPACITY + 50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn log_scrubs_secrets_and_keeps_txid_identifiers() {
+        let (cursor, _) = since(u64::MAX);
+        let txid = "aa".repeat(32);
+        let raw_mweb = "02000000".to_string() + &"ef".repeat(80);
+        log(format!(
+            "diag-redact-check txid={txid} rpc=http://bob:pw123@127.0.0.1:9332 raw={raw_mweb} phrase=\"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\""
+        ));
+        let (_, lines) = since(cursor);
+        let mine: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("diag-redact-check"))
+            .collect();
+        assert_eq!(mine.len(), 1);
+        let entry = mine[0];
+        assert!(entry.contains(&txid), "64-char txid must remain: {entry}");
+        assert!(
+            !entry.contains("pw123") && !entry.contains("bob:"),
+            "{entry}"
+        );
+        assert!(!entry.contains(&raw_mweb), "{entry}");
+        assert!(!entry.contains("abandon"), "{entry}");
     }
 }

@@ -1177,7 +1177,7 @@ pub fn armed_expired(armed_at: u64, armed_height: u32, now: u64, tip: Option<u32
 }
 
 /// One signed self-spend. Raw transaction bytes live only in this file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArmedHop {
     pub raw_hex: String,
     pub txid: String,
@@ -1193,6 +1193,33 @@ pub struct ArmedHop {
     /// Spend secrets for the created output, inserted into the coin db at broadcast.
     #[serde(default)]
     pub created_coin: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for ArmedHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArmedHop")
+            .field(
+                "raw_hex",
+                &if self.raw_hex.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("txid", &self.txid)
+            .field("wtxid", &self.wtxid)
+            .field("spent_output_id", &self.spent_output_id)
+            .field("created_output_id", &self.created_output_id)
+            .field("receive_index", &self.receive_index)
+            .field("fee_sats", &self.fee_sats)
+            .field("local_applied", &self.local_applied)
+            .field("broadcast", &self.broadcast)
+            .field(
+                "created_coin",
+                &self.created_coin.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The chain prepared while the wallet was unlocked.
@@ -1235,12 +1262,16 @@ impl ArmedRecord {
 
 /// Drop the raw transaction and the created-coin secrets from this hop onward.
 pub fn wipe_raw_tail(record: &mut ArmedRecord) {
+    use zeroize::Zeroize;
     let start = record.armed_index as usize;
     for hop in record.hops.iter_mut().skip(start) {
         if hop.broadcast {
             continue;
         }
-        hop.raw_hex.clear();
+        hop.raw_hex.zeroize();
+        if let Some(ref mut coin_val) = hop.created_coin {
+            crate::redact::zeroize_json_value(coin_val);
+        }
         hop.created_coin = None;
     }
     record.expired = true;
@@ -2473,6 +2504,48 @@ mod tests {
         assert!(!ids.contains(&skeleton));
         assert!(ids.contains(&kernel_id));
         assert!(ids.contains("hop-wtxid"));
+    }
+
+    #[test]
+    fn armed_hop_debug_and_wipe_protect_raw_hex_and_coin_secrets() {
+        let mut record = ArmedRecord {
+            version: 1,
+            hops: vec![ArmedHop {
+                raw_hex: "02000000deadbeefcafebabe".repeat(8),
+                txid: "txid".into(),
+                wtxid: "wtxid".into(),
+                spent_output_id: "11".repeat(32),
+                created_output_id: "22".repeat(32),
+                receive_index: 3,
+                fee_sats: 50_000,
+                local_applied: true,
+                broadcast: false,
+                created_coin: Some(serde_json::json!({
+                    "output_id": "22".repeat(32),
+                    "blind": "aa".repeat(32),
+                    "shared_secret": "bb".repeat(32),
+                    "spend_key": "cc".repeat(32),
+                })),
+            }],
+            armed_index: 0,
+            armed_at_unix: 1,
+            armed_height: 2,
+            cover_min: 2,
+            send_after: Some(10),
+            own_ids: BTreeSet::new(),
+            expired: false,
+        };
+        let dbg = format!("{record:?}");
+        assert!(
+            !dbg.contains("deadbeefcafebabe")
+                && !dbg.contains(&"aa".repeat(32))
+                && !dbg.contains(&"bb".repeat(32))
+                && !dbg.contains(&"cc".repeat(32)),
+            "ArmedHop Debug leaked raw_hex or created_coin spend secrets: {dbg}"
+        );
+        wipe_raw_tail(&mut record);
+        assert!(record.hops[0].raw_hex.is_empty());
+        assert!(record.hops[0].created_coin.is_none());
     }
 
     fn hop(spent_output_id: &str, local_applied: bool, broadcast: bool) -> ArmedHop {

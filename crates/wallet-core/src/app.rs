@@ -11,15 +11,17 @@ use bdk_mweb::mweb_sync::SyncProgress;
 use bdk_wallet::bitcoin::consensus::encode::deserialize;
 use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::ChainPosition;
-use bdk_wallet::miniscript::descriptor::KeyMapWrapper;
 use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, PersistedWallet};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::accounts;
 use crate::churn;
 use crate::contacts;
-use crate::descriptors::{self, create_params, load_params, sign_and_finalize, signer};
+use crate::descriptors::{
+    self, create_params, load_params, sign_and_finalize, signer, ZeroizingSigner,
+};
 use crate::diag;
 use crate::dto::{
     AddressReuseHint, ChurnPhase, ChurnPreview, ChurnRequest, ChurnStatus, CombinedSummary,
@@ -54,7 +56,7 @@ struct WalletState {
     wallet: PersistedWallet<Connection>,
     /// Caller-owned transparent signing keys (see [`descriptors::signer`]); the wallet itself
     /// holds no secrets. Lives and dies with this state, i.e. cleared on `lock()`.
-    signer: KeyMapWrapper,
+    signer: ZeroizingSigner,
     db: Connection,
     /// BIP84 / MWEB / LitVM account index for [`Self::data_dir`].
     account_index: u32,
@@ -558,10 +560,10 @@ impl WalletApp {
         };
 
         bundle.network = Some(format!("{:?}", state.network).to_lowercase());
-        bundle.electrum_url = Some(state.electrum_url.clone());
+        bundle.electrum_url = Some(crate::redact::redact_userinfo(&state.electrum_url));
         bundle.electrum_validate_domain = Some(state.electrum_validate_domain);
         bundle.electrum_use_public_fallback = Some(state.electrum_use_public_fallback);
-        bundle.active_electrum_url = state.active_electrum_url.clone();
+        bundle.active_electrum_url = crate::redact::redact_opt_url(&state.active_electrum_url);
         bundle.mweb_scheme = Some(match state.mweb_scheme {
             MwebScheme::LitecoinCore => "litecoin-core".into(),
             MwebScheme::Lip0004 => "lip0004".into(),
@@ -610,8 +612,8 @@ impl WalletApp {
 
     /// 32-byte secp256k1 secret for LitVM (`m/44'/60'/{account}'/0/0`).
     /// Uses the loaded wallet's account index (0 if none loaded). Requires unlock.
-    /// Caller must zeroize after use. Never log this value.
-    pub fn litvm_account_secret(&self) -> Result<[u8; 32], WalletError> {
+    /// Zeroizes on drop. Never log this value.
+    pub fn litvm_account_secret(&self) -> Result<Zeroizing<[u8; 32]>, WalletError> {
         self.ensure_unlocked()?;
         let account = self
             .state
@@ -882,10 +884,11 @@ impl WalletApp {
         &self,
         req: RevealMnemonicRequest,
     ) -> Result<RevealMnemonicResponse, WalletError> {
+        self.ensure_unlocked()?;
         if self.secrets.needs_migration() {
             // Plaintext store — nothing to verify against.
         } else {
-            self.secrets.unlock(&req.passphrase)?;
+            self.secrets.verify_passphrase(&req.passphrase)?;
         }
         let stored = self
             .secrets
@@ -895,8 +898,8 @@ impl WalletApp {
         let (phrase, aezeed_passphrase) = secret.backup_material();
         Ok(RevealMnemonicResponse {
             kind: secret.kind().to_string(),
-            phrase,
-            aezeed_passphrase,
+            phrase: phrase.to_string(),
+            aezeed_passphrase: aezeed_passphrase.map(|p| p.to_string()),
         })
     }
 
@@ -951,6 +954,7 @@ impl WalletApp {
         *self.lock_state_raw()? = None;
         self.clear_park();
         self.clear_insights();
+        self.forget_electrum();
         self.secrets.delete_mnemonic()?;
         accounts::remove_all_accounts(data_dir)?;
         Ok(())
@@ -972,7 +976,10 @@ impl WalletApp {
             passphrase,
             MwebScheme::default(),
         )?;
-        Ok(CreateWalletResponse { mnemonic, summary })
+        Ok(CreateWalletResponse {
+            mnemonic: mnemonic.to_string(),
+            summary,
+        })
     }
 
     pub fn restore(
@@ -986,7 +993,7 @@ impl WalletApp {
             data_dir,
             &secret,
             req.network,
-            req.electrum_url,
+            req.electrum_url.clone(),
             passphrase,
             req.mweb_scheme,
         )
@@ -2033,7 +2040,9 @@ impl WalletApp {
 
     /// Lab-only: 32-byte scan/spend hex plus the current MWEB receive address.
     /// Callers must write this to a chmod 600 file and never log the hex.
-    pub fn export_mweb_coinswapd_secrets(&self) -> Result<(String, String, String), WalletError> {
+    pub fn export_mweb_coinswapd_secrets(
+        &self,
+    ) -> Result<(Zeroizing<String>, Zeroizing<String>, String), WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
@@ -2041,8 +2050,12 @@ impl WalletApp {
             .mweb
             .as_mut()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-        let scan = hex::encode(mweb.keys.scan.secret_bytes());
-        let spend = hex::encode(mweb.keys.spend.secret_bytes());
+        let mut scan_bytes = mweb.keys.scan.secret_bytes();
+        let scan = Zeroizing::new(hex::encode(scan_bytes));
+        scan_bytes.zeroize();
+        let mut spend_bytes = mweb.keys.spend.secret_bytes();
+        let spend = Zeroizing::new(hex::encode(spend_bytes));
+        spend_bytes.zeroize();
         let dest = mweb.receive_address(state.network)?;
         mweb.persist(&state.data_dir)?;
         Ok((scan, spend, dest))
@@ -2421,11 +2434,21 @@ impl WalletApp {
         self.secrets
             .set_with_passphrase(passphrase, &secret.to_stored())?;
 
-        std::fs::create_dir_all(data_dir)?;
+        let rollback = |app: &Self| {
+            let _ = accounts::remove_all_accounts(data_dir);
+            let _ = app.secrets.delete_mnemonic();
+            app.clear_insights();
+            app.clear_park();
+        };
+
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            rollback(self);
+            return Err(e.into());
+        }
         let account_dir = match accounts::init_registry_account0(data_dir) {
             Ok(d) => d,
             Err(e) => {
-                let _ = self.secrets.delete_mnemonic();
+                rollback(self);
                 return Err(e);
             }
         };
@@ -2437,8 +2460,15 @@ impl WalletApp {
         let (wallet, db, meta) = match open_created_account(&account_dir, secret, &meta) {
             Ok(v) => v,
             Err(e) => {
-                let _ = accounts::remove_all_accounts(data_dir);
-                let _ = self.secrets.delete_mnemonic();
+                rollback(self);
+                return Err(e);
+            }
+        };
+
+        let signer_val = match signer(secret, network, 0) {
+            Ok(s) => s,
+            Err(e) => {
+                rollback(self);
                 return Err(e);
             }
         };
@@ -2458,7 +2488,7 @@ impl WalletApp {
             tip_time: None,
             tip_time_height: 0,
             wallet,
-            signer: signer(secret, network, 0)?,
+            signer: signer_val,
             db,
             account_index: 0,
             network,
@@ -2480,10 +2510,25 @@ impl WalletApp {
             needs_mweb_scan: meta.needs_mweb_scan,
             mweb,
         };
-        let summary = build_summary(&mut state)?;
+        let summary = match build_summary(&mut state) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(state);
+                rollback(self);
+                return Err(e);
+            }
+        };
+        let mut guard = match self.lock_state() {
+            Ok(g) => g,
+            Err(e) => {
+                drop(state);
+                rollback(self);
+                return Err(e);
+            }
+        };
         self.publish_insights(&state);
         self.clear_park();
-        *self.lock_state()? = Some(state);
+        *guard = Some(state);
         Ok(summary)
     }
 
@@ -2654,7 +2699,7 @@ fn open_wallet_state(
     account_dir: &Path,
     meta: &WalletMeta,
     secret: &MasterSecret,
-    sealing: Option<[u8; 32]>,
+    sealing: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<WalletState, WalletError> {
     let account = meta.account_index;
     let mut db = Connection::open(meta::db_path(account_dir))
@@ -2853,7 +2898,10 @@ impl MemoryBackedApp {
             req.electrum_url,
             MwebScheme::default(),
         )?;
-        Ok(CreateWalletResponse { mnemonic, summary })
+        Ok(CreateWalletResponse {
+            mnemonic: mnemonic.to_string(),
+            summary,
+        })
     }
 
     pub fn restore(
@@ -2866,7 +2914,7 @@ impl MemoryBackedApp {
             data_dir,
             &secret,
             req.network,
-            req.electrum_url,
+            req.electrum_url.clone(),
             req.mweb_scheme,
         )
     }
@@ -3227,7 +3275,7 @@ impl MemoryBackedApp {
         let payload = secret.to_stored();
         self.secrets.set_mnemonic(&payload)?;
         let stored = self.secrets.get_mnemonic()?;
-        if stored.as_deref() != Some(payload.as_str()) {
+        if stored.as_ref().map(|s| s.as_str()) != Some(payload.as_str()) {
             let _ = self.secrets.delete_mnemonic();
             return Err(WalletError::SecretStore(
                 "secret store did not persist mnemonic".into(),
@@ -3589,7 +3637,7 @@ fn prepare_transfer(
     root: &Path,
     state: &WalletState,
     secret: &MasterSecret,
-    sealing_key: Option<[u8; 32]>,
+    sealing_key: Option<Zeroizing<[u8; 32]>>,
     req: &TransferCoinRequest,
     commit_dest: bool,
     park: &mut AccountPark,
@@ -3706,7 +3754,7 @@ fn reveal_parked_dest(
 fn reveal_dest_address(
     root: &Path,
     secret: &MasterSecret,
-    sealing_key: Option<[u8; 32]>,
+    sealing_key: Option<Zeroizing<[u8; 32]>>,
     to_account: u32,
     chain: SplitChain,
     network: WalletNetwork,
@@ -3836,7 +3884,7 @@ fn prepare_transfer_broadcast(
     root: &Path,
     state: &mut WalletState,
     secret: &MasterSecret,
-    sealing_key: Option<[u8; 32]>,
+    sealing_key: Option<Zeroizing<[u8; 32]>>,
     req: &TransferCoinRequest,
     park: &mut AccountPark,
     session: &str,
@@ -4456,13 +4504,14 @@ fn fetch_pegin_raw_tx(
         rpc_urls.push(local);
     }
     for url in &rpc_urls {
+        let safe_url = crate::redact::redact_userinfo(url);
         match crate::rpc::get_raw_transaction_hex(url, txid_hex) {
             Ok(hex) => match hex::decode(hex.trim()) {
                 Ok(raw) if !raw.is_empty() => return Ok(raw),
-                Ok(_) => errors.push(format!("RPC {url}: empty hex")),
-                Err(e) => errors.push(format!("RPC {url}: bad hex ({e})")),
+                Ok(_) => errors.push(format!("RPC {safe_url}: empty hex")),
+                Err(e) => errors.push(format!("RPC {safe_url}: bad hex ({e})")),
             },
-            Err(e) => errors.push(format!("RPC {url}: {e}")),
+            Err(e) => errors.push(format!("RPC {safe_url}: {e}")),
         }
     }
 
@@ -4472,13 +4521,14 @@ fn fetch_pegin_raw_tx(
         if state.active_electrum_url.as_deref() == Some(url.as_str()) {
             continue;
         }
+        let safe_url = crate::redact::redact_userinfo(&url);
         match electrum::connect_with_timeout(&url, state.electrum_validate_domain, 10) {
             Ok(alt) => match alt.inner.transaction_get_raw(&txid) {
                 Ok(raw) if !raw.is_empty() => return Ok(raw),
-                Ok(_) => errors.push(format!("{url}: empty tx")),
-                Err(e) => errors.push(format!("{url}: {e}")),
+                Ok(_) => errors.push(format!("{safe_url}: empty tx")),
+                Err(e) => errors.push(format!("{safe_url}: {e}")),
             },
-            Err(e) => errors.push(format!("{url}: {e}")),
+            Err(e) => errors.push(format!("{safe_url}: {e}")),
         }
     }
 
@@ -7531,5 +7581,45 @@ mod lock_lifecycle_tests {
 
         assert!(!app.exists(dir.path()));
         assert!(!state_loaded(&app));
+    }
+
+    #[test]
+    fn pegin_raw_tx_error_redacts_rpc_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let electrum_addr = listener.local_addr().unwrap();
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_rpc_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let client =
+            crate::electrum::connect_with_timeout(&format!("tcp://{electrum_addr}"), false, 2)
+                .unwrap();
+
+        let err = {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.electrum_use_public_fallback = false;
+            state.electrum_url = format!("tcp://{electrum_addr}");
+            state.active_electrum_url = Some(state.electrum_url.clone());
+            state.litecoin_rpc_url = Some(format!(
+                "http://rpcadmin:SuperSecretRpcPass42@127.0.0.1:{closed_rpc_port}"
+            ));
+            super::fetch_pegin_raw_tx(&"11".repeat(32), &client, state)
+                .expect_err("closed electrum + closed rpc must fail")
+        };
+        let _ = handle.join();
+
+        assert!(
+            !err.contains("SuperSecretRpcPass42") && !err.contains("rpcadmin:"),
+            "fetch_pegin_raw_tx leaked RPC credentials in error: {err}"
+        );
     }
 }

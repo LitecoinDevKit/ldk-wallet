@@ -14,7 +14,7 @@ use crate::error::WalletError;
 /// Stores the wallet mnemonic outside SQLite.
 pub trait SecretStore: Send + Sync {
     fn set_mnemonic(&self, mnemonic: &str) -> Result<(), WalletError>;
-    fn get_mnemonic(&self) -> Result<Option<String>, WalletError>;
+    fn get_mnemonic(&self) -> Result<Option<Zeroizing<String>>, WalletError>;
     fn delete_mnemonic(&self) -> Result<(), WalletError>;
 }
 
@@ -27,7 +27,7 @@ pub trait UnlockableSecretStore: SecretStore {
     /// Encrypt plaintext mnemonic in place; requires unlock afterward is already done.
     fn migrate_encrypt(&self, passphrase: &str) -> Result<(), WalletError>;
     /// Key material for sealing related stores (e.g. MWEB); `None` when locked/plaintext.
-    fn sealing_key(&self) -> Option<[u8; 32]>;
+    fn sealing_key(&self) -> Option<Zeroizing<[u8; 32]>>;
 }
 
 /// Legacy v1 format: Argon2id (19 MiB, t=2), plaintext = mnemonic only, and the
@@ -69,10 +69,12 @@ impl SecretStore for FileSecretStore {
         write_bytes(&self.path, mnemonic.trim().as_bytes())
     }
 
-    fn get_mnemonic(&self) -> Result<Option<String>, WalletError> {
+    fn get_mnemonic(&self) -> Result<Option<Zeroizing<String>>, WalletError> {
         match fs::read(&self.path) {
             Ok(bytes) => {
-                let trimmed = String::from_utf8_lossy(&bytes).trim().to_string();
+                let bytes = Zeroizing::new(bytes);
+                let decoded = Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned());
+                let trimmed = Zeroizing::new(decoded.trim().to_string());
                 if trimmed.is_empty() {
                     Ok(None)
                 } else {
@@ -129,13 +131,19 @@ impl EncryptedFileSecretStore {
         self.plaintext_path.is_file()
     }
 
-    fn derive_key_v1(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], WalletError> {
+    fn derive_key_v1(
+        passphrase: &str,
+        salt: &[u8],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, WalletError> {
         Self::derive_key(passphrase, salt, 19_456, 2)
     }
 
     /// v2 parameters: 64 MiB, t=3, p=1 — comfortably above the OWASP minimum
     /// while staying under a second on typical desktop hardware.
-    fn derive_key_v2(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], WalletError> {
+    fn derive_key_v2(
+        passphrase: &str,
+        salt: &[u8],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, WalletError> {
         Self::derive_key(passphrase, salt, 65_536, 3)
     }
 
@@ -144,13 +152,13 @@ impl EncryptedFileSecretStore {
         salt: &[u8],
         m_kib: u32,
         t_cost: u32,
-    ) -> Result<[u8; KEY_LEN], WalletError> {
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, WalletError> {
         let params = Params::new(m_kib, t_cost, 1, Some(KEY_LEN))
             .map_err(|e| WalletError::SecretStore(format!("argon2 params: {e}")))?;
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut key = [0u8; KEY_LEN];
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
         argon
-            .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+            .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
             .map_err(|e| WalletError::SecretStore(format!("argon2: {e}")))?;
         Ok(key)
     }
@@ -165,8 +173,8 @@ impl EncryptedFileSecretStore {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let mut key = Self::derive_key_v2(passphrase, &salt)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let key = Self::derive_key_v2(passphrase, &salt)?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         let mut plain = Zeroizing::new(Vec::with_capacity(KEY_LEN + mnemonic.trim().len()));
         plain.extend_from_slice(sealing_key);
@@ -174,7 +182,7 @@ impl EncryptedFileSecretStore {
         let ciphertext = cipher
             .encrypt(nonce, plain.as_slice())
             .map_err(|_| WalletError::SecretStore("encrypt failed".into()))?;
-        key.zeroize();
+        drop(key);
         let mut out = Vec::with_capacity(MAGIC_V2.len() + SALT_LEN + NONCE_LEN + ciphertext.len());
         out.extend_from_slice(MAGIC_V2);
         out.extend_from_slice(&salt);
@@ -203,12 +211,12 @@ impl EncryptedFileSecretStore {
         let salt = &blob[MAGIC_V2.len()..MAGIC_V2.len() + SALT_LEN];
         let nonce_bytes = &blob[MAGIC_V2.len() + SALT_LEN..MAGIC_V2.len() + SALT_LEN + NONCE_LEN];
         let ciphertext = &blob[MAGIC_V2.len() + SALT_LEN + NONCE_LEN..];
-        let mut key = if legacy {
+        let key = if legacy {
             Self::derive_key_v1(passphrase, salt)?
         } else {
             Self::derive_key_v2(passphrase, salt)?
         };
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
         let nonce = Nonce::from_slice(nonce_bytes);
         let plain = Zeroizing::new(
             cipher
@@ -217,27 +225,27 @@ impl EncryptedFileSecretStore {
         );
         if legacy {
             // v1 carried only the mnemonic; the derived key doubled as the sealing key.
-            let mnemonic = String::from_utf8(plain.to_vec())
+            let mnemonic_str = std::str::from_utf8(&plain)
                 .map_err(|_| WalletError::SecretStore("mnemonic is not valid UTF-8".into()))?;
             Ok(Opened {
-                mnemonic: Zeroizing::new(mnemonic),
-                sealing_key: Zeroizing::new(key),
+                mnemonic: Zeroizing::new(mnemonic_str.to_string()),
+                sealing_key: key,
                 legacy: true,
             })
         } else {
-            key.zeroize();
+            drop(key);
             if plain.len() < KEY_LEN {
                 return Err(WalletError::SecretStore(
                     "encrypted mnemonic payload is truncated".into(),
                 ));
             }
-            let mut sealing_key = [0u8; KEY_LEN];
+            let mut sealing_key = Zeroizing::new([0u8; KEY_LEN]);
             sealing_key.copy_from_slice(&plain[..KEY_LEN]);
-            let mnemonic = String::from_utf8(plain[KEY_LEN..].to_vec())
+            let mnemonic_str = std::str::from_utf8(&plain[KEY_LEN..])
                 .map_err(|_| WalletError::SecretStore("mnemonic is not valid UTF-8".into()))?;
             Ok(Opened {
-                mnemonic: Zeroizing::new(mnemonic),
-                sealing_key: Zeroizing::new(sealing_key),
+                mnemonic: Zeroizing::new(mnemonic_str.to_string()),
+                sealing_key,
                 legacy: false,
             })
         }
@@ -245,30 +253,25 @@ impl EncryptedFileSecretStore {
 }
 
 impl SecretStore for EncryptedFileSecretStore {
-    fn set_mnemonic(&self, mnemonic: &str) -> Result<(), WalletError> {
-        let mut inner = self.lock_inner()?;
-        let key = inner.sealing_key.as_ref().ok_or(WalletError::Locked)?;
-        // Re-seal with a fresh salt using the current passphrase-derived key is not possible
-        // without the passphrase; instead keep unlocked mnemonic and require passphrase on migrate.
-        // For create/restore after unlock/with passphrase path, caller uses migrate_encrypt or
-        // set_with_passphrase via UnlockableSecretStore.
-        let _ = key;
-        inner.unlocked_mnemonic = Some(Zeroizing::new(mnemonic.trim().to_string()));
+    fn set_mnemonic(&self, _mnemonic: &str) -> Result<(), WalletError> {
+        let inner = self.lock_inner()?;
+        let _key = inner.sealing_key.as_ref().ok_or(WalletError::Locked)?;
         Err(WalletError::SecretStore(
             "encrypted store requires set_with_passphrase / migrate_encrypt".into(),
         ))
     }
 
-    fn get_mnemonic(&self) -> Result<Option<String>, WalletError> {
+    fn get_mnemonic(&self) -> Result<Option<Zeroizing<String>>, WalletError> {
         let inner = self.lock_inner()?;
         if self.encrypted_exists() {
-            return Ok(inner.unlocked_mnemonic.as_ref().map(|m| m.to_string()));
+            return Ok(inner.unlocked_mnemonic.clone());
         }
         // Plaintext fallback while awaiting migration.
         drop(inner);
         match fs::read_to_string(&self.plaintext_path) {
             Ok(contents) => {
-                let trimmed = contents.trim().to_string();
+                let contents = Zeroizing::new(contents);
+                let trimmed = Zeroizing::new(contents.trim().to_string());
                 if trimmed.is_empty() {
                     Ok(None)
                 } else {
@@ -306,8 +309,8 @@ impl EncryptedFileSecretStore {
                 "passphrase must not be empty".into(),
             ));
         }
-        let mut sealing_key = [0u8; KEY_LEN];
-        rand::thread_rng().fill_bytes(&mut sealing_key);
+        let mut sealing_key = Zeroizing::new([0u8; KEY_LEN]);
+        rand::thread_rng().fill_bytes(&mut *sealing_key);
         let blob = Self::seal(passphrase, mnemonic, &sealing_key)?;
         write_bytes(&self.path, &blob)?;
         // Verify round-trip before deleting any plaintext.
@@ -318,11 +321,25 @@ impl EncryptedFileSecretStore {
                 "encrypted store did not persist mnemonic".into(),
             ));
         }
-        sealing_key.zeroize();
+        drop(sealing_key);
         let mut inner = self.lock_inner()?;
         inner.unlocked_mnemonic = Some(opened.mnemonic);
         inner.sealing_key = Some(opened.sealing_key);
         let _ = remove_if_exists(&self.plaintext_path);
+        Ok(())
+    }
+
+    /// Verify `passphrase` against the encrypted store without unlocking or
+    /// mutating in-memory state on failure.
+    pub fn verify_passphrase(&self, passphrase: &str) -> Result<(), WalletError> {
+        if !self.encrypted_exists() {
+            return Err(WalletError::SecretStore(
+                "no encrypted mnemonic to verify".into(),
+            ));
+        }
+        let blob = fs::read(&self.path).map_err(|e| WalletError::SecretStore(e.to_string()))?;
+        let opened = Self::open(passphrase, &blob)?;
+        drop(opened);
         Ok(())
     }
 }
@@ -353,8 +370,8 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             // Transparent v1 → v2 upgrade: fresh random sealing key, stronger KDF.
             // Only adopt the new key once the rewritten file verifies; on any
             // failure keep the legacy key so the on-disk v1 file stays usable.
-            let mut new_key = [0u8; KEY_LEN];
-            rand::thread_rng().fill_bytes(&mut new_key);
+            let mut new_key = Zeroizing::new([0u8; KEY_LEN]);
+            rand::thread_rng().fill_bytes(&mut *new_key);
             let upgraded = Self::seal(passphrase, &opened.mnemonic, &new_key).and_then(|blob2| {
                 let check = Self::open(passphrase, &blob2)?;
                 if check.mnemonic.trim() != opened.mnemonic.trim() {
@@ -364,11 +381,11 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             });
             match upgraded {
                 Ok(()) => {
-                    opened.sealing_key = Zeroizing::new(new_key);
+                    opened.sealing_key = new_key;
                     eprintln!("secret store: upgraded mnemonic file to v2 format");
                 }
                 Err(e) => {
-                    new_key.zeroize();
+                    drop(new_key);
                     eprintln!("secret store: v2 upgrade failed, staying on v1 ({e})");
                 }
             }
@@ -399,13 +416,15 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             let _ = remove_if_exists(&self.plaintext_path);
             return Ok(());
         }
-        let plain = match fs::read_to_string(&self.plaintext_path) {
-            Ok(s) => s.trim().to_string(),
+        let raw = match fs::read_to_string(&self.plaintext_path) {
+            Ok(s) => Zeroizing::new(s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(WalletError::MissingMnemonic);
             }
             Err(e) => return Err(WalletError::SecretStore(e.to_string())),
         };
+        let plain = Zeroizing::new(raw.trim().to_string());
+        drop(raw);
         if plain.is_empty() {
             return Err(WalletError::MissingMnemonic);
         }
@@ -413,17 +432,15 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
         Ok(())
     }
 
-    fn sealing_key(&self) -> Option<[u8; 32]> {
-        self.lock_inner()
-            .ok()
-            .and_then(|g| g.sealing_key.as_ref().map(|k| **k))
+    fn sealing_key(&self) -> Option<Zeroizing<[u8; 32]>> {
+        self.lock_inner().ok().and_then(|g| g.sealing_key.clone())
     }
 }
 
 /// In-memory store for tests (never use in production).
 #[derive(Default)]
 pub struct MemoryStore {
-    mnemonic: Mutex<Option<String>>,
+    mnemonic: Mutex<Option<Zeroizing<String>>>,
 }
 
 impl MemoryStore {
@@ -434,15 +451,18 @@ impl MemoryStore {
 
 impl SecretStore for MemoryStore {
     fn set_mnemonic(&self, mnemonic: &str) -> Result<(), WalletError> {
-        *self
+        let mut guard = self
             .mnemonic
             .lock()
-            .map_err(|_| WalletError::SecretStore("memory store lock poisoned".into()))? =
-            Some(mnemonic.to_string());
+            .map_err(|_| WalletError::SecretStore("memory store lock poisoned".into()))?;
+        if let Some(ref mut existing) = *guard {
+            existing.zeroize();
+        }
+        *guard = Some(Zeroizing::new(mnemonic.to_string()));
         Ok(())
     }
 
-    fn get_mnemonic(&self) -> Result<Option<String>, WalletError> {
+    fn get_mnemonic(&self) -> Result<Option<Zeroizing<String>>, WalletError> {
         Ok(self
             .mnemonic
             .lock()
@@ -451,10 +471,14 @@ impl SecretStore for MemoryStore {
     }
 
     fn delete_mnemonic(&self) -> Result<(), WalletError> {
-        *self
+        let mut guard = self
             .mnemonic
             .lock()
-            .map_err(|_| WalletError::SecretStore("memory store lock poisoned".into()))? = None;
+            .map_err(|_| WalletError::SecretStore("memory store lock poisoned".into()))?;
+        if let Some(ref mut existing) = *guard {
+            existing.zeroize();
+        }
+        *guard = None;
         Ok(())
     }
 }
@@ -512,18 +536,53 @@ mod tests {
             dir.path().join("wallet.mnemonic"),
         );
         store
-            .set_with_passphrase("correct horse", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+            .set_with_passphrase(
+                "correct horse",
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            )
             .unwrap();
         assert!(!store.is_locked());
         store.lock();
         assert!(store.is_locked());
+        assert!(store.sealing_key().is_none());
+        assert!(store.get_mnemonic().unwrap().is_none());
         assert!(matches!(
             store.unlock("wrong"),
             Err(WalletError::IncorrectPassphrase)
         ));
+        assert!(store.is_locked());
+        assert!(store.sealing_key().is_none());
+        assert!(store.get_mnemonic().unwrap().is_none());
         store.unlock("correct horse").unwrap();
         let got = store.get_mnemonic().unwrap().unwrap();
         assert!(got.starts_with("abandon"));
+    }
+
+    #[test]
+    fn set_mnemonic_error_does_not_overwrite_unlocked_secret() {
+        let dir = tempdir().unwrap();
+        let store = EncryptedFileSecretStore::new(
+            dir.path().join("wallet.mnemonic.enc"),
+            dir.path().join("wallet.mnemonic"),
+        );
+        store.set_with_passphrase("pw", "abandon ability").unwrap();
+        assert!(store.set_mnemonic("mutated phrase").is_err());
+        assert_eq!(
+            store.get_mnemonic().unwrap().unwrap().as_str(),
+            "abandon ability"
+        );
+    }
+
+    #[test]
+    fn corrupt_and_failed_writes_leave_store_cleared() {
+        let dir = tempdir().unwrap();
+        let enc = dir.path().join("wallet.mnemonic.enc");
+        fs::write(&enc, b"short").unwrap();
+        let store = EncryptedFileSecretStore::new(&enc, dir.path().join("wallet.mnemonic"));
+        assert!(store.unlock("pw").is_err());
+        assert!(store.is_locked());
+        assert!(store.sealing_key().is_none());
+        assert!(store.get_mnemonic().unwrap().is_none());
     }
 
     /// Build a legacy v1 blob (Argon2id 19 MiB/t=2, mnemonic-only payload).
@@ -533,7 +592,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut salt);
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let key = EncryptedFileSecretStore::derive_key_v1(passphrase, &salt).unwrap();
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), mnemonic.trim().as_bytes())
             .unwrap();
@@ -553,7 +612,7 @@ mod tests {
         fs::write(&enc, seal_v1("pass", mnemonic)).unwrap();
         let store = EncryptedFileSecretStore::new(&enc, dir.path().join("wallet.mnemonic"));
         store.unlock("pass").unwrap();
-        assert_eq!(store.get_mnemonic().unwrap().unwrap(), mnemonic);
+        assert_eq!(store.get_mnemonic().unwrap().unwrap().as_str(), mnemonic);
         let key_after_upgrade = store.sealing_key().unwrap();
         // File must now be v2 and unlock again with the same passphrase and
         // the same (persisted) sealing key.
@@ -589,7 +648,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let plain = dir.path().join("wallet.mnemonic");
         let enc = dir.path().join("wallet.mnemonic.enc");
-        fs::write(&plain, "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        fs::write(
+            &plain,
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
         let store = EncryptedFileSecretStore::new(&enc, &plain);
         assert!(store.needs_migration());
         store.migrate_encrypt("secret").unwrap();

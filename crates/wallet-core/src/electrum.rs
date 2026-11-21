@@ -35,8 +35,11 @@ pub fn connect_with_timeout(
         .validate_domain(validate_domain)
         .timeout(Some(timeout_secs))
         .build();
+    let safe_url = crate::redact::redact_userinfo(url);
     let client = Client::from_config(url, config).map_err(|e| {
-        let mut msg = format!("failed to connect to {url} (timed out or unreachable): {e}");
+        let safe_err = crate::redact::redact_userinfo(&e.to_string());
+        let mut msg =
+            format!("failed to connect to {safe_url} (timed out or unreachable): {safe_err}");
         if validate_domain && url.starts_with("ssl://") {
             msg.push_str(
                 "; if this server uses a self-signed certificate, disable TLS certificate \
@@ -59,12 +62,18 @@ pub fn connect_first(
 ) -> Result<(BdkElectrumClient<Client>, String), WalletError> {
     let mut errors: Vec<String> = Vec::new();
     for url in urls {
+        let safe_url = crate::redact::redact_userinfo(url);
         match connect(url, validate_domain) {
             Ok(client) => match handshake(&client) {
                 Ok(()) => return Ok((client, url.clone())),
-                Err(e) => errors.push(format!("{url}: connected but unresponsive ({e})")),
+                Err(e) => {
+                    let safe_err = crate::redact::redact_userinfo(&e.to_string());
+                    errors.push(format!(
+                        "{safe_url}: connected but unresponsive ({safe_err})"
+                    ));
+                }
             },
-            Err(e) => errors.push(format!("{url}: {e}")),
+            Err(e) => errors.push(format!("{safe_url}: {e}")),
         }
     }
     Err(WalletError::Electrum(format!(
@@ -99,10 +108,11 @@ pub fn cross_check_tip(
         .inner
         .block_headers_subscribe()
         .map_err(|e| WalletError::Electrum(e.to_string()))?;
+    let safe_url = crate::redact::redact_userinfo(url);
     let their_tip = sub.height as u32;
     if their_tip > local_tip_height.saturating_add(TIP_LAG_TOLERANCE) {
         return Ok(Some(format!(
-            "cross-check: independent server {url} is at height {their_tip}, {} blocks ahead of \
+            "cross-check: independent server {safe_url} is at height {their_tip}, {} blocks ahead of \
              the server used for this sync — that server may be lagging or withholding blocks",
             their_tip - local_tip_height
         )));
@@ -117,7 +127,7 @@ pub fn cross_check_tip(
         .map_err(|e| WalletError::Electrum(e.to_string()))?;
     if their_header.block_hash() != local_hash {
         return Ok(Some(format!(
-            "WARNING: Electrum servers disagree at height {common}: {url} reports a different \
+            "WARNING: Electrum servers disagree at height {common}: {safe_url} reports a different \
              block than the server used for this sync. One of them may be dishonest — verify \
              your balance against a block explorer or your own node before transacting"
         )));

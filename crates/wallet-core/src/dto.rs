@@ -1,6 +1,10 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::network::WalletNetwork;
+use crate::redact::{redact_opt_url, redact_userinfo};
 
 /// One entry in the multi-wallet switcher (same seed, BIP84 account index).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,7 +41,7 @@ pub struct DeleteWalletRequest {
 }
 
 /// Request to create a new wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CreateWalletRequest {
     pub network: WalletNetwork,
     /// Optional Electrum URL; defaults from the selected network when omitted.
@@ -45,29 +49,66 @@ pub struct CreateWalletRequest {
     pub electrum_url: Option<String>,
 }
 
+impl fmt::Debug for CreateWalletRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateWalletRequest")
+            .field("network", &self.network)
+            .field("electrum_url", &redact_opt_url(&self.electrum_url))
+            .finish()
+    }
+}
+
 /// Response from wallet creation. The mnemonic is returned once for backup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct CreateWalletResponse {
     pub mnemonic: String,
+    #[zeroize(skip)]
     pub summary: WalletSummary,
+}
+
+impl fmt::Debug for CreateWalletResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateWalletResponse")
+            .field("mnemonic", &"<redacted>")
+            .field("summary", &self.summary)
+            .finish()
+    }
 }
 
 /// Request to restore a wallet from an existing seed: a BIP39 mnemonic, an
 /// aezeed mnemonic (Nexus), or a root extended private key (xprv/zprv/Ltpv).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RestoreWalletRequest {
     /// Seed input; the kind is auto-detected. Named `mnemonic` for backward
     /// compatibility with existing callers.
     pub mnemonic: String,
+    #[zeroize(skip)]
     pub network: WalletNetwork,
     #[serde(default)]
+    #[zeroize(skip)]
     pub electrum_url: Option<String>,
     /// MWEB key-derivation scheme to restore under.
     #[serde(default)]
+    #[zeroize(skip)]
     pub mweb_scheme: MwebScheme,
     /// aezeed cipher-seed passphrase, when the seed is aezeed and one was set.
     #[serde(default)]
     pub aezeed_passphrase: Option<String>,
+}
+
+impl fmt::Debug for RestoreWalletRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoreWalletRequest")
+            .field("mnemonic", &"<redacted>")
+            .field("network", &self.network)
+            .field("electrum_url", &redact_opt_url(&self.electrum_url))
+            .field("mweb_scheme", &self.mweb_scheme)
+            .field(
+                "aezeed_passphrase",
+                &self.aezeed_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Which BIP32 layout derives the MWEB scan/spend keys.
@@ -271,24 +312,41 @@ pub struct TxRecord {
 }
 
 /// Request to unlock an encrypted wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct UnlockRequest {
     pub passphrase: String,
 }
 
+impl fmt::Debug for UnlockRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnlockRequest")
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Request to re-reveal the stored recovery secret after passphrase confirmation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RevealMnemonicRequest {
     pub passphrase: String,
+}
+
+impl fmt::Debug for RevealMnemonicRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RevealMnemonicRequest")
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Recovery material for display after a successful [`RevealMnemonicRequest`].
 ///
 /// Storage tags (`aezeed:`, `xprv:`, …) are stripped. An aezeed cipher-seed
 /// passphrase is returned separately when one was stored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RevealMnemonicResponse {
     /// Human-readable kind (`BIP39 mnemonic`, `aezeed seed`, `extended private key`).
+    #[zeroize(skip)]
     pub kind: String,
     /// Words or extended private key string suitable for backup / restore.
     pub phrase: String,
@@ -297,10 +355,31 @@ pub struct RevealMnemonicResponse {
     pub aezeed_passphrase: Option<String>,
 }
 
+impl fmt::Debug for RevealMnemonicResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RevealMnemonicResponse")
+            .field("kind", &self.kind)
+            .field("phrase", &"<redacted>")
+            .field(
+                "aezeed_passphrase",
+                &self.aezeed_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Request to migrate a plaintext mnemonic to an encrypted store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct MigrateEncryptRequest {
     pub passphrase: String,
+}
+
+impl fmt::Debug for MigrateEncryptRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MigrateEncryptRequest")
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -316,7 +395,7 @@ fn default_explorer_base_url() -> String {
 }
 
 /// Electrum / peer / explorer settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WalletSettings {
     pub electrum_url: String,
     /// Verify TLS certificates on ssl:// Electrum servers (default true).
@@ -356,8 +435,37 @@ pub struct WalletSettings {
     pub insights_enabled: bool,
 }
 
+impl fmt::Debug for WalletSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletSettings")
+            .field("electrum_url", &redact_userinfo(&self.electrum_url))
+            .field("electrum_validate_domain", &self.electrum_validate_domain)
+            .field(
+                "electrum_use_public_fallback",
+                &self.electrum_use_public_fallback,
+            )
+            .field("auto_lock_minutes", &self.auto_lock_minutes)
+            .field(
+                "electrum_active_url",
+                &redact_opt_url(&self.electrum_active_url),
+            )
+            .field("litecoin_rpc_url", &redact_opt_url(&self.litecoin_rpc_url))
+            .field("broadcast_via_own_node", &self.broadcast_via_own_node)
+            .field("mweb_peers", &self.mweb_peers)
+            .field("mweb_scheme", &self.mweb_scheme)
+            .field(
+                "explorer_base_url",
+                &redact_userinfo(&self.explorer_base_url),
+            )
+            .field("show_fiat", &self.show_fiat)
+            .field("use_explorer_fee_hints", &self.use_explorer_fee_hints)
+            .field("insights_enabled", &self.insights_enabled)
+            .finish()
+    }
+}
+
 /// Request to update wallet settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UpdateSettingsRequest {
     pub electrum_url: String,
     /// Verify TLS certificates on ssl:// Electrum servers (default true).
@@ -385,6 +493,30 @@ pub struct UpdateSettingsRequest {
     pub use_explorer_fee_hints: bool,
     #[serde(default = "default_true")]
     pub insights_enabled: bool,
+}
+
+impl fmt::Debug for UpdateSettingsRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpdateSettingsRequest")
+            .field("electrum_url", &redact_userinfo(&self.electrum_url))
+            .field("electrum_validate_domain", &self.electrum_validate_domain)
+            .field(
+                "electrum_use_public_fallback",
+                &self.electrum_use_public_fallback,
+            )
+            .field("auto_lock_minutes", &self.auto_lock_minutes)
+            .field("litecoin_rpc_url", &redact_opt_url(&self.litecoin_rpc_url))
+            .field("broadcast_via_own_node", &self.broadcast_via_own_node)
+            .field("mweb_peers", &self.mweb_peers)
+            .field(
+                "explorer_base_url",
+                &redact_userinfo(&self.explorer_base_url),
+            )
+            .field("show_fiat", &self.show_fiat)
+            .field("use_explorer_fee_hints", &self.use_explorer_fee_hints)
+            .field("insights_enabled", &self.insights_enabled)
+            .finish()
+    }
 }
 
 /// Aggregate litview network snapshot for Balance pulse / Insights header.

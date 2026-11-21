@@ -135,7 +135,7 @@ fn receive_address_advances_and_summary_keeps_it() {
         )
         .expect("create");
 
-    let first = created.summary.receive_address;
+    let first = created.summary.receive_address.clone();
     let second = app.receive_address().expect("new address");
     let third = app.receive_address().expect("another address");
 
@@ -246,7 +246,7 @@ fn address_reuse_hint_unused_used_and_mweb() {
             },
         )
         .expect("create");
-    let addr = created.summary.receive_address;
+    let addr = created.summary.receive_address.clone();
 
     assert!(
         !app.address_reuse_hint(&addr).expect("hint").reused,
@@ -778,7 +778,7 @@ fn switch_back_uses_the_resident_account_when_its_db_file_is_replaced() {
             },
         )
         .expect("create");
-    let addr0 = created.summary.receive_address;
+    let addr0 = created.summary.receive_address.clone();
     app.create_wallet_account(
         dir.path(),
         CreateAccountRequest {
@@ -917,9 +917,12 @@ fn file_secret_store_roundtrip() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     store.set_mnemonic(phrase).expect("set");
     let got = store.get_mnemonic().expect("get");
-    assert_eq!(got.as_deref(), Some(phrase));
+    assert_eq!(got.as_ref().map(|s| s.as_str()), Some(phrase));
     let store2 = FileSecretStore::new(&path);
-    assert_eq!(store2.get_mnemonic().unwrap().as_deref(), Some(phrase));
+    assert_eq!(
+        store2.get_mnemonic().unwrap().as_ref().map(|s| s.as_str()),
+        Some(phrase)
+    );
     store2.delete_mnemonic().expect("delete");
     assert_eq!(store2.get_mnemonic().unwrap(), None);
 }

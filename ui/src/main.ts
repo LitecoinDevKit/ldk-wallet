@@ -4803,12 +4803,11 @@ async function wipeAndOnboard() {
     hideLoading();
   }
   lastTxid = null;
-  clearPendingMnemonic();
+  clearSecretInputs();
   clearBackupLocalFlags();
   renderLastTxid();
   renderHistory([]);
   setPhase("onboarding");
-  syncPassMeters();
   setStatus("Wallet data reset — create or restore a wallet.");
 }
 
@@ -4970,8 +4969,24 @@ async function runSync(opts: { quiet: boolean }): Promise<boolean> {
   }
 }
 
+function clearSecretInputs() {
+  clearPendingMnemonic();
+  el.restoreMnemonic.value = "";
+  el.restoreAezeedPass.value = "";
+  el.restorePassphrase.value = "";
+  el.restorePassphrase2.value = "";
+  el.onboardPassphrase.value = "";
+  el.onboardPassphrase2.value = "";
+  el.migratePassphrase.value = "";
+  el.migratePassphrase2.value = "";
+  el.unlockPassphrase.value = "";
+  el.settingsRpc.value = "";
+  syncPassMeters();
+}
+
 async function lockWallet(statusMessage = "Wallet locked.") {
   closeModal(null);
+  clearSecretInputs();
   stopAutoSync();
   stopMwebProgressPolling();
   syncing = false;

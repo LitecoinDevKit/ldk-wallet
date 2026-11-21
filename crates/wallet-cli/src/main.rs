@@ -44,7 +44,7 @@ impl From<CliMwebScheme> for wallet_core::MwebScheme {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "wallet-cli",
     about = "Litecoin wallet-core smoke CLI (Electrum mainnet by default)"
@@ -62,7 +62,20 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cli")
+            .field("data_dir", &self.data_dir)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("command", &self.command)
+            .finish()
+    }
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Create a new BIP84 wallet; prints mnemonic once.
     Create {
@@ -173,16 +186,113 @@ enum Command {
     },
 }
 
-fn read_passphrase(explicit: &Option<String>) -> Result<String> {
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create { network, .. } => f
+                .debug_struct("Create")
+                .field("network", network)
+                .field("electrum", &"<redacted>")
+                .finish(),
+            Self::Restore {
+                network,
+                mweb_scheme,
+                aezeed_passphrase,
+                ..
+            } => f
+                .debug_struct("Restore")
+                .field("mnemonic", &"<redacted>")
+                .field("network", network)
+                .field("electrum", &"<redacted>")
+                .field("mweb_scheme", mweb_scheme)
+                .field(
+                    "aezeed_passphrase",
+                    &aezeed_passphrase.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            Self::Summary => f.write_str("Summary"),
+            Self::CombinedSummary => f.write_str("CombinedSummary"),
+            Self::MwebUnspent => f.write_str("MwebUnspent"),
+            Self::MwebCoinswapdEnv { out } => f
+                .debug_struct("MwebCoinswapdEnv")
+                .field("out", out)
+                .finish(),
+            Self::Address => f.write_str("Address"),
+            Self::Sync => f.write_str("Sync"),
+            Self::Send {
+                address,
+                amount_sats,
+                fee_rate,
+                drain,
+            } => f
+                .debug_struct("Send")
+                .field("address", address)
+                .field("amount_sats", amount_sats)
+                .field("fee_rate", fee_rate)
+                .field("drain", drain)
+                .finish(),
+            Self::History => f.write_str("History"),
+            Self::Derive {
+                network,
+                count,
+                account,
+                aezeed_passphrase,
+                ..
+            } => f
+                .debug_struct("Derive")
+                .field("input", &"<redacted>")
+                .field("network", network)
+                .field("count", count)
+                .field("account", account)
+                .field(
+                    "aezeed_passphrase",
+                    &aezeed_passphrase.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            #[cfg(feature = "litvm")]
+            Self::LitvmAddress => f.write_str("LitvmAddress"),
+            #[cfg(feature = "litvm")]
+            Self::LitvmBalance => f.write_str("LitvmBalance"),
+            #[cfg(feature = "litvm")]
+            Self::LitvmSend { address, amount } => f
+                .debug_struct("LitvmSend")
+                .field("address", address)
+                .field("amount", amount)
+                .finish(),
+            #[cfg(feature = "grail")]
+            Self::GrailVerify { offer } => {
+                f.debug_struct("GrailVerify").field("offer", offer).finish()
+            }
+            #[cfg(feature = "grail")]
+            Self::GrailDeposit {
+                offer,
+                amount_sats,
+                fee_rate,
+                outpoint,
+            } => f
+                .debug_struct("GrailDeposit")
+                .field("offer", offer)
+                .field("amount_sats", amount_sats)
+                .field("fee_rate", fee_rate)
+                .field("outpoint", outpoint)
+                .finish(),
+        }
+    }
+}
+
+fn read_passphrase(explicit: &Option<String>) -> Result<wallet_core::Zeroizing<String>> {
     if let Some(p) = explicit {
-        return Ok(p.clone());
+        return Ok(wallet_core::Zeroizing::new(p.clone()));
     }
     if let Ok(p) = std::env::var("WALLET_PASSPHRASE") {
+        let p = wallet_core::Zeroizing::new(p);
         if !p.is_empty() {
             return Ok(p);
         }
     }
-    let p = rpassword::prompt_password("Passphrase: ").context("read passphrase")?;
+    let p = wallet_core::Zeroizing::new(
+        rpassword::prompt_password("Passphrase: ").context("read passphrase")?,
+    );
     if p.is_empty() {
         bail!("passphrase must not be empty");
     }
@@ -305,11 +415,12 @@ fn main() -> Result<()> {
             account,
             aezeed_passphrase,
         } => {
+            let aezeed_passphrase = aezeed_passphrase.map(wallet_core::Zeroizing::new);
             let input = match input {
-                Some(i) => i,
+                Some(i) => wallet_core::Zeroizing::new(i),
                 None => {
                     eprintln!("Enter seed (words or extended key), then press Enter:");
-                    let mut line = String::new();
+                    let mut line = wallet_core::Zeroizing::new(String::new());
                     std::io::stdin()
                         .read_line(&mut line)
                         .context("read seed from stdin")?;
@@ -318,12 +429,14 @@ fn main() -> Result<()> {
             };
             let preview = wallet_core::derive_preview(
                 &input,
-                aezeed_passphrase.as_deref(),
+                aezeed_passphrase.as_ref().map(|s| s.as_str()),
                 network.into(),
                 count,
                 account,
             )
             .context("derive preview")?;
+            drop(input);
+            drop(aezeed_passphrase);
             println!("{}", serde_json::to_string_pretty(&preview)?);
         }
         #[cfg(feature = "litvm")]
@@ -481,10 +594,11 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
                 .with_context(|| format!("create {}", parent.display()))?;
         }
     }
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<wallet_core::Zeroizing<String>> = Vec::new();
     if path.exists() {
-        let existing =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let existing = wallet_core::Zeroizing::new(
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        );
         for line in existing.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("MWEB_SCAN_SECRET=")
@@ -493,16 +607,20 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
             {
                 continue;
             }
-            lines.push(line.to_string());
+            lines.push(wallet_core::Zeroizing::new(line.to_string()));
         }
         if !lines.is_empty() && !lines.last().map(|s| s.is_empty()).unwrap_or(true) {
-            lines.push(String::new());
+            lines.push(wallet_core::Zeroizing::new(String::new()));
         }
     }
-    lines.push(format!("MWEB_SCAN_SECRET={scan}"));
-    lines.push(format!("MWEB_SPEND_SECRET={spend}"));
-    lines.push(format!("E2E_MWEB_DEST={dest}"));
-    lines.push(String::new());
+    lines.push(wallet_core::Zeroizing::new(format!(
+        "MWEB_SCAN_SECRET={scan}"
+    )));
+    lines.push(wallet_core::Zeroizing::new(format!(
+        "MWEB_SPEND_SECRET={spend}"
+    )));
+    lines.push(wallet_core::Zeroizing::new(format!("E2E_MWEB_DEST={dest}")));
+    lines.push(wallet_core::Zeroizing::new(String::new()));
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     // Scan/spend hex. Unix creates the file 0600; Windows leaves the
@@ -515,7 +633,14 @@ fn write_coinswapd_env(path: &Path, scan: &str, spend: &str, dest: &str) -> Resu
     let mut f = opts
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    write!(f, "{}", lines.join("\n")).context("write coinswapd env")?;
+    let joined = wallet_core::Zeroizing::new(
+        lines
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    write!(f, "{}", joined.as_str()).context("write coinswapd env")?;
     f.sync_all().context("sync coinswapd env")?;
     Ok(())
 }
@@ -526,11 +651,16 @@ fn ensure_loaded(app: &WalletApp, data_dir: &Path, passphrase_opt: &Option<Strin
     }
     if app.needs_migration() {
         let passphrase = read_passphrase(passphrase_opt)?;
-        app.migrate_encrypt(wallet_core::MigrateEncryptRequest { passphrase })
-            .context("migrate encrypt")?;
+        app.migrate_encrypt(wallet_core::MigrateEncryptRequest {
+            passphrase: passphrase.to_string(),
+        })
+        .context("migrate encrypt")?;
     } else if app.is_locked() {
         let passphrase = read_passphrase(passphrase_opt)?;
-        app.unlock(UnlockRequest { passphrase }).context("unlock")?;
+        app.unlock(UnlockRequest {
+            passphrase: passphrase.to_string(),
+        })
+        .context("unlock")?;
     }
     app.load(data_dir).context("load wallet")?;
     Ok(())

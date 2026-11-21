@@ -4,16 +4,16 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Land the `SyncPass` guard ([#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25)).
-2. Property tests on every transition table (item 3).
-3. Coin-status and public-coin-status tests (item 4).
+1. Property tests on every transition table (item 3).
+2. Coin-status and public-coin-status tests (item 4).
+3. Error-path integration tests (item 5).
 
 ## Status
 
 | # | Task | Priority | Status | PR | Notes |
 |---|------|----------|--------|----|-------|
 | 1 | Tighten `AGENTS.md` | Planned | Done | [#24](https://github.com/LitecoinDevKit/ldk-wallet/pull/24) | Also adds this file. |
-| 2 | `SyncPass` guard for `sync_phase` | Planned | In review | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | Stacked on #24. |
+| 2 | `SyncPass` guard for `sync_phase` | Planned | Done | [#25](https://github.com/LitecoinDevKit/ldk-wallet/pull/25) | |
 | 3 | Property tests on transition tables | High | Not started | | |
 | 4 | Coin-status tests | High | Not started | | |
 | 5 | Error-path integration tests | High | Not started | | #25 adds the first one. |
@@ -26,7 +26,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 12 | `docs/MWEB_E2E.md` as a pre-release gate | Process | Not started | | |
 | 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
-| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | Needs #25 for a trustworthy phase. |
+| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). |
 
 ## Already planned
 

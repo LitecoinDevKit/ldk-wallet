@@ -37,12 +37,28 @@ struct Cached {
 
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 
+#[cfg(test)]
+thread_local! {
+    static OFFLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make discovery on this thread find no peers, so a test can run a sync pass
+/// without touching the network.
+#[cfg(test)]
+pub(crate) fn go_offline_for_test() {
+    OFFLINE.with(|offline| offline.set(true));
+}
+
 /// Peers that completed a handshake advertising MWEB light-client support.
 ///
 /// Cached for [`CACHE_TTL`]. Returns an empty vec when the seeds are
 /// unreachable or nothing answers, which callers treat as "MWEB unavailable"
 /// rather than an error.
 pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
+    #[cfg(test)]
+    if OFFLINE.with(std::cell::Cell::get) {
+        return Vec::new();
+    }
     if let Ok(guard) = CACHE.lock() {
         if let Some(cached) = guard.as_ref() {
             if cached.network == network

@@ -1,5 +1,5 @@
 import { invoke } from "./ipc";
-import { PHASE_FROM, PHASE_LABELS, type Phase } from "./phases";
+import { canEnter, PHASE_LABELS, type Phase } from "./phases";
 import QRCode from "qrcode";
 
 type WalletNetwork = "mainnet" | "testnet";
@@ -1718,7 +1718,7 @@ function setDisplayUnit(unit: DisplayUnit, opts: { clearAmbiguous?: boolean; kee
 }
 
 function setPhase(next: Phase) {
-  if (!PHASE_FROM[next].includes(currentPhase)) {
+  if (!canEnter(currentPhase, next)) {
     console.error(`Ignored phase change ${currentPhase} -> ${next}`);
     return;
   }

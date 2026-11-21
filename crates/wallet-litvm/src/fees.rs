@@ -7,9 +7,7 @@ pub const RBF_DEN: u128 = 1000;
 
 /// `ceil(old * 12.5%)`, at least 1 wei above `old`, then `max` with current market.
 pub fn bump_eip1559(old: u128, current: u128) -> u128 {
-    let bumped = old
-        .saturating_mul(RBF_NUM)
-        .div_ceil(RBF_DEN);
+    let bumped = old.saturating_mul(RBF_NUM).div_ceil(RBF_DEN);
     let floor = if bumped <= old {
         old.saturating_add(1)
     } else {
@@ -70,5 +68,8 @@ mod tests {
         assert!(check_total_fee(2_000_000, 20 * 1_000_000_000).is_ok());
         // 2M gas * 30 gwei = 0.06 zkLTC — over
         assert!(check_total_fee(2_000_000, 30 * 1_000_000_000).is_err());
+        // Extreme u64::MAX * u128::MAX saturates and is rejected by MAX_TOTAL_FEE_WEI.
+        assert!(check_total_fee(u64::MAX, u128::MAX).is_err());
+        assert_eq!(bump_eip1559(u128::MAX, 0), u128::MAX);
     }
 }

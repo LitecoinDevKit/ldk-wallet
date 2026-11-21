@@ -136,11 +136,7 @@ struct FeeLadderRaw {
 }
 
 fn ceil_sat_vb(v: f64) -> u64 {
-    if !v.is_finite() || v <= 0.0 {
-        1
-    } else {
-        v.ceil() as u64
-    }
+    crate::tx_invariants::clamp_estimated_fee_rate(v)
 }
 
 /// `GET {base}/api/v1/fees/recommended`

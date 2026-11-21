@@ -4,10 +4,10 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Transaction construction and value invariants (item 18).
-2. Diagram and table checks on every PR (item 7).
-3. Logging for phase changes, holds and rejections (item 15).
-4. Untrusted input bounds (item 19).
+1. Diagram and table checks on every PR (item 7).
+2. Logging for phase changes, holds and rejections (item 15).
+3. Untrusted input bounds (item 19).
+4. Backup and restore round-trips (item 20).
 
 ## Status
 
@@ -30,7 +30,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). Redaction is in `redact.rs` (item 16). |
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
 | 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. |
-| 18 | Transaction construction and value invariants | High | Not started | | Amounts, fees, dust, change, and peg-in/peg-out shape. Beside the coin-status tests. |
+| 18 | Transaction construction and value invariants | High | Done | [#34](https://github.com/LitecoinDevKit/ldk-wallet/pull/34) | `tx_invariants.rs` (`MAX_MONEY` checked math, `LitecoinDustCoinSelection` at 30 sat/vB, public/MWEB recipient script guards, coin-ID deduplication, post-build shape/conservation verifiers); direct peg-in PSBT construction without temporary `lock_outpoint`; post-sign index persistence; LitVM replacement target verifier; `ui/src/amounts.ts` + `scripts/amounts.test.mjs`; MWEB commitment/stealth/bulletproof/rewind verifier and seeded property tests. |
 | 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Refines item 10. |
 | 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. |
 | 21 | Static analysis expansion | Medium | Not started | | Unsafe surface, and optionally mutation testing of the tables. |
@@ -139,6 +139,12 @@ Those tests fixed three cleanup bugs. `cancel_churn` now checks `ChurnEvent::Can
 - `reconcile_churn_on_load` (plus idempotent `churn::inherit_depth`, `churn::revert_depth`, and `churn::commit_score`), `reconcile_mweb_chain_with_wallet`, `resync_mweb` pre-wipe `needs_mweb_scan` persistence, and cross-account stale-hold cleanup recover cleanly from process aborts and `SIGKILL` across `crash_recovery_tests.rs` and `crates/wallet-core/tests/crash_recovery.rs`.
 
 **18. Transaction construction and value invariants.** Checked arithmetic on amounts and fees, dust limits, and change selection. Constructed transactions, especially peg-in and peg-out, meet the expected shape and do not leave a stuck or attacker-spendable output when the path returns an error. MWEB commitment and kernel balance sit here, beside the coin-status tests.
+- `tx_invariants` (`crates/wallet-core/src/tx_invariants.rs`) enforces `MAX_MONEY` (`84,000,000` LTC) checked addition/summation, fee-rate bounds (`1..=100,000` sat/vB), deduplicating coin-control normalizers, `validate_public_recipient` (rejecting MWEB stealth addresses whose `script_pubkey()` is empty and witness v8/v9 bridge scripts on both normal and `drain` sends), `validate_mweb_recipient`, and post-construction shape/conservation verifiers (`verify_transparent_psbt`, `verify_pegin_tx`, `verify_mweb_spend_tx`).
+- `LitecoinDustCoinSelection` enforces Litecoin Core's 30 sat/vB dust floor (`2,940` litoshis on P2WPKH, `3,300` on witness-v9 peg-ins) on change and drain outputs instead of `rust-litecoin`'s inherited 3 sat/vB (`294` litoshis) constant, pulling in an optional UTXO when doing so rescues sub-dust change for less input fee than forfeiting the leftover.
+- `mweb::prepare_pegin` builds peg-in PSBTs with `LitecoinDustCoinSelection` and `unspendable(held)` directly instead of temporarily calling `wallet.lock_outpoint` on `public_reserved` coins; `resolve_pegin_request` filters out user-frozen UTXOs, enforces `PEGIN_V9_DUST_SATS` (`3,300`) and MWEB weight minimum fees, and sizes multi-input miner fees.
+- `split::plan_split` enforces `bdk_mweb::policy::min_mweb_fee` across 2–50 private outputs and replaces saturating addition with checked arithmetic; `build_public_split_psbt`, `sign_pegout`, `prepare_transfer_broadcast`, `sign_mweb_split`, and `sign_self_spend_hops` defer external/MWEB receive-index persistence until building, signing, and invariant checks succeed.
+- `wallet-litvm` (`verify_replacement_target` in `crates/wallet-litvm/src/client.rs`) verifies sender, recipient, value, nonce, and empty calldata on RPC-fetched pending transactions before signing an EIP-1559 replacement; `ui/src/amounts.ts` + `scripts/amounts.test.mjs` bound UI LTC/litoshi parsing to `MAX_MONEY_SATS` and reject malformed comma placements.
+- `assert_mweb_tx_consensus_and_balance` and `mweb_constructed_spends_balance_commitments_stealth_and_rangeproofs` (beside the coin-status tests in `crates/wallet-core/src/mweb.rs`), plus seeded property tests across `split.rs`, `mweb.rs`, `tx_invariants_tests.rs`, `wallet-litvm`, and `scripts/amounts.test.mjs`, pin Pedersen commitment balance, stealth excess balance, Bulletproof rangeproofs, and value conservation.
 
 ## Untrusted input, restore, and static analysis
 

@@ -349,6 +349,11 @@ impl LitVmClient {
             let rebuilt = self
                 .runtime
                 .block_on(self.build_tx(to, adjusted, Some(probe.nonce)))?;
+            if adjusted.saturating_add(rebuilt.max_fee) > balance {
+                return Err(LitVmError::InvalidAmount(
+                    "balance too low to cover the LitVM fee".into(),
+                ));
+            }
             return Ok((adjusted, rebuilt));
         }
         Ok((value, built))
@@ -409,15 +414,21 @@ impl LitVmClient {
                 )
             })?;
 
-        let nonce = original.nonce();
-        let to = original
-            .to()
-            .ok_or_else(|| LitVmError::Rpc("cannot replace a contract-creation tx".into()))?;
-        let value = original.value();
+        let (to, value, nonce) = verify_replacement_target(
+            self.address,
+            req,
+            &OriginalTxFields {
+                from: alloy::network::TransactionResponse::from(&original),
+                to: original.to(),
+                value: original.value(),
+                nonce: original.nonce(),
+                input_len: original.input().len(),
+            },
+        )?;
         let gas_limit = if original.gas_limit() == 0 {
             21_000
         } else {
-            original.gas_limit()
+            original.gas_limit().min(MAX_GAS_LIMIT)
         };
 
         let old_max = original.max_fee_per_gas();
@@ -535,6 +546,63 @@ struct BuiltTx {
     max_fee: U256,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginalTxFields {
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub nonce: u64,
+    pub input_len: usize,
+}
+
+/// Verify an RPC-returned pending transaction matches the user-confirmed [`LitVmReplaceRequest`]
+/// before signing a replacement (defense against a lying RPC substituting recipient, value,
+/// nonce, sender, or calldata).
+pub(crate) fn verify_replacement_target(
+    expected_from: Address,
+    req: &LitVmReplaceRequest,
+    orig: &OriginalTxFields,
+) -> Result<(Address, U256, u64), LitVmError> {
+    let expected_to = parse_evm_address(&req.address)?;
+    let expected_value = parse_zkltc(&req.amount_zkltc)?;
+    if expected_value.is_zero() {
+        return Err(LitVmError::InvalidAmount(
+            "amount must be greater than 0".into(),
+        ));
+    }
+    if orig.from != expected_from {
+        return Err(LitVmError::Rpc(
+            "refusing to replace a transaction from a different sender".into(),
+        ));
+    }
+    let Some(to) = orig.to else {
+        return Err(LitVmError::Rpc(
+            "cannot replace a contract-creation tx".into(),
+        ));
+    };
+    if to != expected_to {
+        return Err(LitVmError::Rpc(
+            "RPC pending transaction destination does not match replacement request".into(),
+        ));
+    }
+    if orig.value != expected_value {
+        return Err(LitVmError::Rpc(
+            "RPC pending transaction amount does not match replacement request".into(),
+        ));
+    }
+    if orig.nonce != req.nonce {
+        return Err(LitVmError::Rpc(
+            "RPC pending transaction nonce does not match replacement request".into(),
+        ));
+    }
+    if orig.input_len > 0 {
+        return Err(LitVmError::Rpc(
+            "refusing to replace a transaction carrying non-empty calldata".into(),
+        ));
+    }
+    Ok((to, orig.value, orig.nonce))
+}
+
 fn parse_tx_hash(txid: &str) -> Result<TxHash, LitVmError> {
     TxHash::from_str(txid.trim()).map_err(|e| LitVmError::Rpc(format!("invalid txid: {e}")))
 }
@@ -605,5 +673,96 @@ mod tests {
             !err.contains("42424242"),
             "open error must not echo secret bytes: {err}"
         );
+    }
+
+    #[test]
+    fn f8_verify_replacement_target_rejects_mismatched_rpc_fields() {
+        let sender = parse_evm_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+        let recip = parse_evm_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap();
+        let attacker = parse_evm_address("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC").unwrap();
+        let val = parse_zkltc("1.25").unwrap();
+        let req = LitVmReplaceRequest {
+            txid: format!("0x{}", "11".repeat(32)),
+            nonce: 7,
+            address: format_address(recip),
+            amount_zkltc: "1.25".into(),
+        };
+        let good = OriginalTxFields {
+            from: sender,
+            to: Some(recip),
+            value: val,
+            nonce: 7,
+            input_len: 0,
+        };
+        assert_eq!(
+            verify_replacement_target(sender, &req, &good).unwrap(),
+            (recip, val, 7)
+        );
+
+        // Wrong sender
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                from: attacker,
+                ..good.clone()
+            }
+        )
+        .is_err());
+
+        // Contract creation (to == None)
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                to: None,
+                ..good.clone()
+            }
+        )
+        .is_err());
+
+        // Attacker-substituted destination
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                to: Some(attacker),
+                ..good.clone()
+            }
+        )
+        .is_err());
+
+        // Attacker-inflated value
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                value: parse_zkltc("99.0").unwrap(),
+                ..good.clone()
+            }
+        )
+        .is_err());
+
+        // Mismatched nonce
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                nonce: 8,
+                ..good.clone()
+            }
+        )
+        .is_err());
+
+        // Unexpected calldata
+        assert!(verify_replacement_target(
+            sender,
+            &req,
+            &OriginalTxFields {
+                input_len: 4,
+                ..good
+            }
+        )
+        .is_err());
     }
 }

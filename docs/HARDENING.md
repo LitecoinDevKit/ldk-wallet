@@ -4,9 +4,9 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Untrusted input bounds (item 19).
-2. Backup and restore round-trips (item 20).
-3. Static analysis expansion (item 21).
+1. SPV acceptance of Electrum data (item 25).
+2. Peg-out maturity on public coins (item 26).
+3. Untrusted input bounds (item 19).
 
 ## Status
 
@@ -30,16 +30,18 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
 | 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. |
 | 18 | Transaction construction and value invariants | High | Done | [#34](https://github.com/LitecoinDevKit/ldk-wallet/pull/34) | `tx_invariants.rs` (`MAX_MONEY` checked math, `LitecoinDustCoinSelection` at 30 sat/vB, public/MWEB recipient script guards, coin-ID deduplication, post-build shape/conservation verifiers); direct peg-in PSBT construction without temporary `lock_outpoint`; post-sign index persistence; LitVM replacement target verifier; `ui/src/amounts.ts` + `scripts/amounts.test.mjs`; MWEB commitment/stealth/bulletproof/rewind verifier and seeded property tests. |
-| 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Refines item 10. |
-| 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. |
+| 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Includes Electrum notification spam, server-sent requests, and truncated local JSON. Refines item 10. Merkle and header validity are item 25. |
+| 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. Also open a frozen file from each on-disk generation. |
 | 21 | Static analysis expansion | Medium | Not started | | Unsafe surface, and optionally mutation testing of the tables. |
 | 22 | Error-message sanitization | Lower | Not started | | UI and logs omit stack traces and extra address or amount detail. |
 | 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
+| 25 | SPV acceptance of Electrum data | High | Not started | | Forged merkle proofs and headers that fail Litecoin proof-of-work must not confirm a coin. `cross_check_tip` stays a warning. |
+| 26 | Peg-out maturity on public coins | High | Not started | | A HogEx peg-out with fewer than 6 confirmations is maturing, not Ready. Ordinary unconfirmed public coins stay selectable. |
 
 ## Model and effort
 
-How to staff items 6–24. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
+How to staff items 6–26. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
 
 - **Carbon:** Gemini 4 Carbon, or an equivalent high-reasoning model.
 - **Argon:** Gemini 4 Argon, or another strong coding model.
@@ -62,14 +64,16 @@ Effort is Low, Medium, or High, relative to the size of the change and the reaso
 | 16 | Secret hygiene and zeroization | Carbon · Medium | Argon · Medium–High | Enumerate every lock, wipe, error path, and buffer. Implementation is tests plus careful `zeroize` use. |
 | 17 | Persistence atomicity and crash recovery | Carbon · Medium–High | Argon · High | Plan the kill points and the residual risk, then test kill, restart, and consistency. |
 | 18 | Transaction construction and value invariants | Carbon · Medium | Argon · Medium–High | Checked arithmetic, dust, change, and peg-in/peg-out shape. Carbon finds the edge cases; Argon writes the property tests. |
-| 19 | Untrusted input bounds | Carbon · Medium | Argon · Medium | Size, timeout, and structure limits, plus structure-aware fuzz. |
-| 20 | Backup and restore round-trips | Argon · Medium | Argon · Medium–High | Seed and metadata restore under interrupted operations and holds. |
+| 19 | Untrusted input bounds | Carbon · Medium | Argon · Medium | Size, timeout, and structure limits, plus structure-aware fuzz. Notification spam and truncated JSON are named cases. Merkle proofs are item 25. |
+| 20 | Backup and restore round-trips | Argon · Medium | Argon · Medium–High | Seed and metadata restore, plus one frozen file per on-disk generation. |
 | 21 | Static analysis expansion | Light–Argon · Low | Light · Low–Medium | `cargo-geiger` and optional mutants. CI and documentation. |
 | 22 | Error-message sanitization | Light · Low | Light · Low–Medium | Redaction rules and a few tests. |
 | 23 | Lookalike addresses and confirmations | Argon · Low–Medium | Argon · Medium | UI warnings and extra confirmation flows. |
 | 24 | Release SBOM | Light · Low | Light · Low | On top of the supply-chain CI already in place. |
+| 25 | SPV acceptance of Electrum data | Carbon · Medium | Argon · Medium–High | Plan the proof and header cases. Implementation is failing tests, then a verifier that rejects them before a coin is confirmed. |
+| 26 | Peg-out maturity on public coins | Argon · Low–Medium | Argon · Medium | Failing test first. Status flags gain maturing. The 6-block boundary is the off-by-one to get right. |
 
-Plan items 16, 17, and 18 with Carbon. Items 11 and 19 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
+Plan items 16, 17, 18, and 25 with Carbon. Items 11 and 19 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
 
 ## Already planned
 
@@ -156,9 +160,9 @@ These are the only three generated diagrams (`churn-transitions`, `lock-transiti
 
 ## Untrusted input, restore, and static analysis
 
-**19. Untrusted input bounds.** Size, timeout, and structure limits on Electrum responses, MWEB peer messages, address and seed parsers, and local job and settings files. Structure-aware fuzz or property tests on those parsers. This is defense in depth on the kind of validation mismatch seen in the 2026 MWEB incident, and it refines item 10.
+**19. Untrusted input bounds.** Size, timeout, and structure limits on Electrum responses, MWEB peer messages, address and seed parsers, and local job and settings files. Structure-aware fuzz or property tests on those parsers. This is defense in depth on the kind of validation mismatch seen in the 2026 MWEB incident, and it refines item 10. Named Electrum cases, from `ltc-electrum/electrum-ltc` `tests/test_interface.py` and `tests/test_jsondb.py`: disconnect on notification spam, disconnect on a server-initiated request, and a truncated or garbage local JSON file must not panic or load a partial wallet. Whether a merkle proof or a header is allowed to confirm a coin is item 25.
 
-**20. Backup and restore round-trips.** A seed plus metadata restore recovers the same spendable transparent and MWEB coins, including after an interrupted operation, a reserved hold, and more than one account under one seed.
+**20. Backup and restore round-trips.** A seed plus metadata restore recovers the same spendable transparent and MWEB coins, including after an interrupted operation, a reserved hold, and more than one account under one seed. Also open a frozen file from each on-disk generation this wallet has shipped (plaintext MWEB files, v1 Argon2 secrets, v1 seal envelopes) and still spend. Seed restore does not pin those readers. The pattern is Electrum-LTC `tests/test_storage_upgrade.py`: one fixture per format, opened by current code.
 
 **21. Static analysis.** `cargo-geiger`, or the same kind of check, on the unsafe surface, and optionally `cargo-mutants` on the transition tables and status functions. Record that constant-time behavior comes from the crypto crates, or add a light test where this repo owns the comparison.
 
@@ -169,3 +173,18 @@ These are the only three generated diagrams (`churn-transitions`, `lock-transiti
 **23. Lookalike addresses and confirmations.** Warn on address lookalikes, and confirm high-value or irreversible actions beyond the existing wipe phrase.
 
 **24. Release SBOM.** Attach an SBOM, or an explicit check of the pinned dependencies, to releases. The supply-chain CI already in place stays as it is.
+
+## Electrum trust and peg-out maturity
+
+Taken from Electrum-LTC (`ltc-electrum/electrum-ltc`, branch `mweb`). That suite is upstream Electrum with Litecoin addresses swapped in. It has no MWEB tests. These two items are the gaps it still exposed. Coin selection, dust, change, and derivation vectors are already items 18 and the frozen vectors in `crates/wallet-core/tests/recovery.rs`. Their regtest workflow is Lightning, so it is not a suite to copy. Item 12 stays the MWEB gate.
+
+**25. SPV acceptance of Electrum data.** A server must not be able to mark a coin confirmed with a forged proof or a header that does not meet Litecoin proof-of-work. `bdk_electrum` confirms via `electrum_client::utils::validate_merkle_proof` (pin `6ffa5afa` in `LitecoinDevKit/rust-electrum-client`). That function only recomputes the merkle root and checks it against the header that same server returned. Electrum rejects two proofs this accepts, in `tests/test_verifier.py`:
+
+- CVE-2017-12842: a 64-byte transaction used as an inner merkle node (`InnerNodeOfSpvProofIsValidTx`).
+- CVE-2012-2459: a duplicated left sibling forging extra leaf positions (`LeftSiblingDuplicate`). A legitimate duplicate is only a right sibling.
+
+`tests/test_blockchain.py` (`TestVerifyHeader`, `TestHeaderChainResolution`) rejects a prev-hash mismatch, a target mismatch, insufficient proof-of-work, a lagging server, and a fork. This wallet's `apply_electrum_chain_update` applies the server's update as given. `cross_check_tip` compares header hashes with a second server and warns. It does not check scrypt proof-of-work, and it does not fail the sync. That warning stays. It does not replace a local check. Audit note O11 (a server hiding mempool transactions) is a different residual.
+
+A transaction the server claims is mined is not confirmed until the proof passes. An invalid transaction is rejected. Switching servers drops unconfirmed state that was cached only because of the previous server (`tests/test_address_synchronizer.py`). Item 5 covers a dead peer, not a lying one.
+
+**26. Peg-out maturity on public coins.** Litecoin consensus will not spend a HogEx peg-out until 6 confirmations (`PEGOUT_MATURITY` in Electrum-LTC `electrum/bitcoin.py`, and `CanonicalTxOut::is_mature` in `bdk`). `collect_unspent` never asks `is_mature`. `public_coin_status` marks any public coin with one or more confirmations Ready and selectable, so a peg-out at 1–5 confirmations offers spend. Those coins are maturing: spend buttons off, through the same flag path private maturing coins already use. Update `AGENTS.md` in that PR so the public status list includes maturing. An ordinary unconfirmed public coin stays selectable, as item 4 pinned. Coinbase outputs follow the same `is_mature` check (100 confirmations) so the rule is not a peg-out special case. The boundary is `tip - confirmation_height + 1 >= maturity`.

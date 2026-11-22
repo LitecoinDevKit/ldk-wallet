@@ -1005,11 +1005,19 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
+        // Accept and never answer. Reading the request and then dropping the
+        // socket makes the client fail at once, so the repair timeout never runs.
         for stream in listener.incoming().flatten() {
-            let mut stream = stream;
-            let mut buf = [0u8; 2048];
-            let _ = std::io::Read::read(&mut stream, &mut buf);
-            let _ = std::io::Read::read(&mut stream, &mut buf);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
         }
     });
 

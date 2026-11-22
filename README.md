@@ -8,7 +8,7 @@ Canonical MWEB shape in `wallet-core`: Electrum/RPC tip → `MwebStore` + LIP sy
 
 ## Status
 
-**v0.4.16** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. MWEB path aligned with Litecoin Core 0.21.5.8. A Logs button on every screen, including sign-in, opens a live view of the diagnostic log. The window drags again from the title bar, brand and nav. The block height follows Electrum when the explorer lags. Locking now always drops wallet state, even while a sync holds it. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
+**v0.4.17** (prototype) — Public BIP84 + MWEB peg-in / private send / peg-out via LIP-0006 P2P + optional litecoind RPC. MWEB path aligned with Litecoin Core 0.21.5.8. Electrum sync checks headers, merkle proofs, and transactions before applying them. A peg-out or coinbase coin stays maturing until it can be spent. A warm sync skips anchors it already proved, and a dead peg-in fallback no longer stalls the pass. Wallet files are saved atomically and recovered after a crash, and secrets are wiped on lock. LitVM LiteForge testnet sidecar (zkLTC, same seed). Encrypted mnemonic, coin control, receive QR, history. Not independently audited.
 
 Ships **macOS Apple Silicon** (unsigned — Gatekeeper may say the app is damaged; `xattr -cr "/Applications/LDK Wallet.app"`), **Linux x86_64** (`.deb` / `.AppImage`), and **Windows x64** (unsigned per-user installer — SmartScreen may warn; More info → Run anyway). No Intel Mac or ARM Linux build.
 

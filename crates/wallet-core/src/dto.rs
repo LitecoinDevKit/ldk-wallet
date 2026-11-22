@@ -548,7 +548,7 @@ pub struct MetricSeries {
     pub values: Vec<f64>,
     pub latest: Option<f64>,
     pub change_pct: Option<f64>,
-    /// Path under the explorer base URL (e.g. `/explore`).
+    /// Path under the explorer base URL (e.g. `/studio/presets/price/in-dollars`).
     pub litview_path: String,
 }
 

@@ -12,36 +12,31 @@ use crate::explorer::{self, normalize_base_url};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Allowlisted charts shown in Insights (name, day-index series, UI title, unit hint).
+/// Allowlisted charts shown in Insights (name, `day1` index, UI title, unit hint).
 /// Order matches the Insights UI slate (price featured first).
 pub const CHART_ALLOWLIST: &[(&str, &str, &str, &str)] = &[
-    ("price", "day", "Price", "USD"),
-    ("mvrv", "day", "MVRV", "ratio"),
-    ("price_drawdown", "day", "ATH drawdown", "%"),
-    ("fee_median", "day", "Median fee", "sats"),
-    ("tx_count_sum_24h", "day", "Tx count (24h)", "count"),
-    ("hash_rate", "day", "Hash rate", "H/s"),
-    ("mweb_balance", "day", "MWEB balance", "LTC"),
-    (
-        "mweb_pegin_count_sum_1m",
-        "day",
-        "MWEB peg-ins (1m)",
-        "count",
-    ),
+    ("price", "day1", "Price", "USD"),
+    ("mvrv", "day1", "MVRV", "ratio"),
+    ("price_drawdown", "day1", "ATH drawdown", "%"),
+    ("tx_fee_median", "day1", "Median fee", "sats"),
+    ("tx_count_sum_24h", "day1", "Tx count (24h)", "count"),
+    ("hashrate", "day1", "Hash rate", "H/s"),
+    ("mweb_supply", "day1", "MWEB balance", "LTC"),
+    ("mweb_peg_in_sum_1m", "day1", "MWEB peg-ins (1m)", "LTC"),
 ];
 
-/// Litview SPA path for a series id (see LRK `website/scripts/options/*` tree).
+/// Litview path for a series id: a Studio preset, or the series browser.
 fn litview_chart_path(id: &str) -> String {
     match id {
-        "price" => "/charts/market/price".into(),
-        "mvrv" => "/charts/distribution/overview/capitalization/mvrv".into(),
-        "price_drawdown" => "/charts/market/all-time-high/drawdown".into(),
-        "fee_median" => "/charts/network/transactions/fee/block".into(),
-        "tx_count_sum_24h" => "/charts/network/transactions/count/24h".into(),
-        "hash_rate" => "/charts/mining/hashrate/current".into(),
-        "mweb_balance" => "/charts/network/mweb/balance/combined".into(),
-        "mweb_pegin_count_sum_1m" => "/charts/network/mweb/peg-in-count/1m".into(),
-        _ => "/charts".into(),
+        "price" => "/studio/presets/price/in-dollars".into(),
+        "mvrv" => "/studio/presets/valuation/mvrv".into(),
+        "price_drawdown" => "/studio/presets/price/all-time-high/drawdown".into(),
+        "tx_fee_median" => "/series/?series=tx_fee_median&index=day1".into(),
+        "tx_count_sum_24h" => "/studio/presets/network/transactions/count".into(),
+        "hashrate" => "/studio/presets/mining/hashing/hash-rate".into(),
+        "mweb_supply" => "/studio/presets/mweb/supply".into(),
+        "mweb_peg_in_sum_1m" => "/studio/presets/mweb/peg-ins".into(),
+        _ => "/studio/presets/".into(),
     }
 }
 
@@ -90,9 +85,6 @@ struct MempoolStats {
 
 #[derive(Debug, Deserialize)]
 struct SeriesResponse {
-    #[serde(default)]
-    #[serde(rename = "type")]
-    value_type: Option<String>,
     #[serde(default)]
     data: Vec<Option<f64>>,
 }
@@ -144,7 +136,7 @@ pub fn fetch_network_pulse(base: &str) -> Result<NetworkPulse, WalletError> {
         let price = s.spawn(|| explorer::fetch_spot_price(b));
         let fees = s.spawn(|| explorer::fetch_fee_ladder(b));
         let mempool = s.spawn(|| mempool_stats(b));
-        let change = s.spawn(|| fetch_series_raw(b, "price", "day", -2));
+        let change = s.spawn(|| fetch_series_raw(b, "price", "day1", -2));
 
         let tip_height = tip
             .join()
@@ -192,14 +184,10 @@ fn series_to_metric(
     let values = values_from_series(&raw);
     let latest = values.last().copied();
     let change_pct = pct_change(&values);
-    let unit = raw
-        .value_type
-        .filter(|s| !s.is_empty() && s != "None")
-        .unwrap_or_else(|| unit.to_string());
     MetricSeries {
         id: id.to_string(),
         title: title.to_string(),
-        unit,
+        unit: unit.to_string(),
         index: index.to_string(),
         values,
         latest,

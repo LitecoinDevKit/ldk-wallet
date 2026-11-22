@@ -11,8 +11,9 @@ indexer or copy the `website_next` SPA.
 ui  --invoke-->  src-tauri commands  -->  wallet-core
                                             |-- Electrum / MWEB (BDK)
                                             '-- ureq HTTPS --> litview or self-host
-ui  --open_explorer_url-->  system browser  -->  {explorer}/tx/{txid}
-                                         or  -->  {explorer}/explore
+ui  --open_explorer_url-->  system browser  -->  {explorer}/explorer/tx/{txid}
+                                         or  -->  {explorer}/explorer/block/{hash}
+                                         or  -->  {explorer}/studio/presets/
 ```
 
 - All litview HTTP goes through Rust (`ureq`). WebView CSP stays IPC-only
@@ -26,7 +27,7 @@ ui  --open_explorer_url-->  system browser  -->  {explorer}/tx/{txid}
 | --- | --- | --- | --- |
 | “View on litview” | User click | IP + txid (browser) | Button visible |
 | Tx enrichment `GET /api/tx/{txid}` | User opens tx detail | IP + that txid | On when detail opens; in-session cache |
-| Spot price `GET /api/mempool/price` | Auto while unlocked (~60s) | IP only | On; Settings toggle |
+| Spot price `GET /api/oracle/price` | Auto while unlocked (~60s) | IP only | On; Settings toggle |
 | Fee ladder `GET /api/v1/fees/recommended` | Send form / preview | IP only | On; chips are suggestions |
 | Insights pulse (tip, price, fees, mempool) | Auto while unlocked (~90s) when Insights on | IP only | On; Settings `insights_enabled` |
 | Insights charts `GET /api/series/…` | Insights view open / refresh | IP only | On with Insights |
@@ -50,10 +51,10 @@ Helpers / commands:
 - `explorer_tx_url(txid)` / `explorer_block_url(hash)` — no network
 - `open_explorer_url(url)` — OS browser
 - `fetch_tx_detail(txid)` → `TxEnrichment` from `/api/tx/{txid}`
-- `fetch_spot_price()` → `/api/mempool/price`
+- `fetch_spot_price()` → `/api/oracle/price`
 - `fetch_fee_ladder()` → `/api/v1/fees/recommended`
 - `fetch_network_pulse()` → tip + price + fees + mempool
-- `fetch_insight_charts()` → allowlisted `/api/series/{name}/day` windows
+- `fetch_insight_charts()` → allowlisted `/api/series/{name}/day1` windows
 
 Hand-rolled GETs against the mempool.space-compatible JSON and LRK series API;
 no `brk_client` dep.

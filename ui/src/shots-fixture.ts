@@ -377,7 +377,7 @@ function series(
     values,
     latest: values[values.length - 1] ?? null,
     change_pct: change,
-    litview_path: "/charts",
+    litview_path: "/studio/presets/",
   };
 }
 
@@ -388,8 +388,8 @@ function wave(start: number, step: number, count = 30): number[] {
 function charts() {
   return [
     series("price", "Price", "usd", wave(80, 3), 1.4),
-    series("fee_median", "Median fee", "sats", wave(120, 40), -2.1),
-    series("hash_rate", "Hash rate", "h", wave(1.2e15, 0.05e15), 0.6),
+    series("tx_fee_median", "Median fee", "sats", wave(120, 40), -2.1),
+    series("hashrate", "Hash rate", "H/s", wave(1.2e15, 0.05e15), 0.6),
   ];
 }
 

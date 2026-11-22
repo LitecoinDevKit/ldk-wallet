@@ -1023,11 +1023,11 @@ const INSIGHTS_CHART_ORDER = [
   "price",
   "mvrv",
   "price_drawdown",
-  "fee_median",
+  "tx_fee_median",
   "tx_count_sum_24h",
-  "hash_rate",
-  "mweb_balance",
-  "mweb_pegin_count_sum_1m",
+  "hashrate",
+  "mweb_supply",
+  "mweb_peg_in_sum_1m",
 ] as const;
 
 function formatMetricValue(id: string, value: number | null | undefined): string {
@@ -1038,17 +1038,17 @@ function formatMetricValue(id: string, value: number | null | undefined): string
     const sign = value > 0 ? "+" : "";
     return `${sign}${value.toFixed(1)}%`;
   }
-  if (id === "fee_median") return `${Math.round(value).toLocaleString("en-US")} sats`;
-  if (id === "tx_count_sum_24h" || id === "mweb_pegin_count_sum_1m") {
+  if (id === "tx_fee_median") return `${Math.round(value).toLocaleString("en-US")} sats`;
+  if (id === "tx_count_sum_24h") {
     return formatCompact(value);
   }
-  if (id === "hash_rate") {
+  if (id === "hashrate") {
     if (value >= 1e15) return `${(value / 1e15).toFixed(2)} PH/s`;
     if (value >= 1e12) return `${(value / 1e12).toFixed(2)} TH/s`;
     if (value >= 1e9) return `${(value / 1e9).toFixed(2)} GH/s`;
     return formatCompact(value);
   }
-  if (id === "mweb_balance") {
+  if (id === "mweb_supply" || id === "mweb_peg_in_sum_1m") {
     return `${value.toLocaleString("en-US", { maximumFractionDigits: 0 })} LTC`;
   }
   return formatCompact(value);
@@ -1288,7 +1288,7 @@ function renderInsightCharts(series: MetricSeries[]) {
     foot.append(windowLabel, openLabel);
 
     card.append(top, plot, range, foot);
-    card.addEventListener("click", () => openLitviewPath(s.litview_path || "/charts"));
+    card.addEventListener("click", () => openLitviewPath(s.litview_path || "/studio/presets/"));
     el.insightsCharts.appendChild(card);
   }
 }
@@ -1748,7 +1748,7 @@ el.networkPulse.addEventListener("click", () => setView("insights"));
 el.btnRefreshInsights.addEventListener("click", () => void refreshInsightsView());
 
 el.btnOpenLitview.addEventListener("click", () => {
-  openLitviewPath("/charts");
+  openLitviewPath("/studio/presets/");
 });
 
 el.historySearch.addEventListener("input", () => {
@@ -2401,7 +2401,7 @@ function stopStatusStripClock() {
 
 el.statusBlock.addEventListener("click", () => {
   if (el.statusBlock.disabled || statusStripModel.tip == null || statusStripModel.error) return;
-  openLitviewPath(`/block/${statusStripModel.tip}`);
+  openLitviewPath(`/explorer/block/${statusStripModel.tip}`);
 });
 
 async function showBroadcastFailure(raw: unknown): Promise<void> {

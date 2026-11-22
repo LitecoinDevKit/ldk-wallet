@@ -4,10 +4,12 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Untrusted input bounds (item 19).
-2. Backup and restore round-trips (item 20). Item 20 stays ahead of items 27 and 28 so the frozen depth fixture captures today's `churn_depth.json` before item 28's per-hop ledger. Item 20 needs a second fixture after that ledger lands.
-3. Auto-lock wake race (item 31). It sits after item 20 and before items 27 and 28. It does not jump ahead of item 19.
-4. After item 31: adversarial MWEB peers (item 27) and cross-layer reorg unwind (item 28). Dropped unconfirmed transparent spends (item 29) follows those. macOS full-disk flush (item 30) stays lower.
+1. Single-instance directory lock (item 32). A second process runs `clear_stale` and drops the first process's live holds. This is ahead of item 19 for that reason.
+2. `churn_armed.json` at rest (item 35). The file is plaintext JSON, mode `0600`, and the locked pump reads `spend_key`, `blind`, `shared_secret`, and `raw_hex` from it. This is ahead of item 19 for that reason.
+3. Untrusted input bounds (item 19).
+4. Backup and restore round-trips (item 20). Item 20 stays ahead of items 27 and 28 so the frozen depth fixture captures today's `churn_depth.json` before item 28's per-hop ledger. Item 20 needs a second fixture after that ledger lands. Its stale-hold fixture is an old session, not a second live process (item 32).
+5. Auto-lock wake race (item 31). It sits after item 20 and before the High fund-safety tail. It does not jump ahead of items 32, 35, or 19.
+6. After item 31: SPV checkpoints (item 33), LitVM send invariants (item 34), adversarial MWEB peers (item 27), and cross-layer reorg unwind (item 28). Dropped unconfirmed transparent spends (item 29) follows those. macOS full-disk flush (item 30) stays lower. Core dumps and backup exclusion (item 36) wait for release.
 
 ## Status
 
@@ -26,7 +28,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 11 | Chaos tests for lock and failure mid-pass | Fuzzing | Not started | | |
 | 12 | `docs/MWEB_E2E.md` as a pre-release gate | Process | Not started | | |
 | 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
-| 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Through PR #38. This edit records the auto-lock wake race (item 31, O15). Never claim the wallet is audited. |
+| 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Through PR #38. Records the auto-lock wake race (item 31, O15), below-window SPV anchors (item 33, O13), and plaintext `churn_armed.json` (item 35, O16). Never claim the wallet is audited. |
 | 15 | Logging for phase changes, holds and rejections | Observability | Done | [#36](https://github.com/LitecoinDevKit/ldk-wallet/pull/36) | `churn::transition`, `SyncPass`, `WalletApp` lock lifecycle, `mweb_frozen` holds, and freeze/churn command rejections log job/coin IDs, `from`/`to`, and `reason` via `diag::log` (`redact::scrub_log_line`). |
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
 | 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. Windows CI already runs these tests; macOS `F_FULLFSYNC` is item 30. |
@@ -35,7 +37,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 20 | Backup and restore round-trips | Medium | Not started | | Seed-only restores gap and scan keys and resets freezes, labels, and depth. Seed plus metadata restores the spendable set. v1 seal opens without a v2 counter and fails closed with one. A restored stale hold sweeps on load and keeps user freezes (ids). Frozen `churn_depth.json` before item 28, and again after. |
 | 21 | Static analysis expansion | Medium | Not started | | Unsafe surface, and optionally mutation testing of the tables. CI pins the Tauri CSP, `capabilities/default.json`, and rejection of locked or out-of-phase commands. |
 | 22 | Error-message sanitization | Lower | Not started | | UI and logs omit stack traces and extra address or amount detail. |
-| 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
+| 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. Also confirm or refuse when `estimatefee`, already clamped to `1..=100,000` sat/vB, makes the total fee or the fee-to-amount ratio cross a stated threshold. |
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
 | 25 | SPV acceptance of Electrum data | High | Done | [#37](https://github.com/LitecoinDevKit/ldk-wallet/pull/37) | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
 | 26 | Peg-out maturity on public coins | High | Done | [#38](https://github.com/LitecoinDevKit/ldk-wallet/pull/38) | `public_coin_status` and `collect_unspent` enforce `CanonicalTxOut::is_mature` (6 confirmations on HogEx peg-outs, 100 on coinbase), marking immature coins `Maturing` with `maturity_blocks_left` and blocking spend/split/transfer/peg-in/freeze while keeping ordinary unconfirmed public coins selectable. |
@@ -44,10 +46,15 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 29 | Dropped unconfirmed transparent spends | Medium | Not started | | Release on own-node absence, or an SPV-verified conflict, or 48h and ~1,152 blocks since `broadcast_height` with the Electrum server omitting it. Peg-ins and ordinary public spends store that height. Own-node absence is not required for the timeout. RBF is out of scope. |
 | 30 | macOS full-disk flush | Lower | Not started | | The same `F_FULLFSYNC` helper on `write_atomic` and `write_atomic_0600`, file and parent. A failed parent flush fails the write. `#[cfg(unix)]` / `#[cfg(target_os = "macos")]`. Same parent flush in LitVM settings and the CLI env writer. No new CI job. |
 | 31 | Auto-lock wake race | High | Not started | | Activity and focus handlers test the idle deadline before refreshing `lastActivityTs`. `WalletApp` enforces the same deadline. Background polls do not refresh it. Sits after item 20. Item 16 stays zeroization. |
+| 32 | Single-instance directory lock | High | Not started | | `flock` or a lockfile so the app and `wallet-cli` cannot open one directory together. A second process must not run `clear_stale` against a live hold. |
+| 33 | SPV checkpoints and work floor | High | Not started | | O13. A fresh or far-behind wallet does not accept an invented chain on PoW and `powLimit` alone. Anchors below the 2016 window need more than an isolated header. |
+| 34 | LitVM send and RPC invariants | High | Not started | | Re-check `eth_chainId` inside send, not only in `probe`. A normal send refuses non-empty calldata. Existing gas, max-fee, and 0.05 zkLTC total-fee caps stay. |
+| 35 | `churn_armed.json` at rest | High | Not started | | Plaintext `0600` JSON holds `raw_hex` and the created coin's `spend_key`, `blind`, and `shared_secret` so the locked pump can broadcast. Mode `0600` is not encryption. O1 does not cover this file. |
+| 36 | Core dumps, backup exclusion, updater | Lower | Not started | | No updater exists. Do this with the release work in item 24, not ahead of items 32–35. |
 
 ## Model and effort
 
-How to staff items 6–31. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
+How to staff items 6–36. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
 
 - **Carbon:** Gemini 4 Carbon, or an equivalent high-reasoning model.
 - **Argon:** Gemini 4 Argon, or another strong coding model.
@@ -74,7 +81,7 @@ Effort is Low, Medium, or High, relative to the size of the change and the reaso
 | 20 | Backup and restore round-trips | Argon · Medium | Argon · Medium–High | Seed-only versus seed plus metadata, one frozen file per generation, both v1 seal cases, and a stale-hold sweep that keeps user freezes (ids). |
 | 21 | Static analysis expansion | Light–Argon · Low | Light · Low–Medium | `cargo-geiger` and optional mutants. CI pins the Tauri CSP, capabilities, and locked or out-of-phase command rejection. |
 | 22 | Error-message sanitization | Light · Low | Light · Low–Medium | Redaction rules and a few tests. |
-| 23 | Lookalike addresses and confirmations | Argon · Low–Medium | Argon · Medium | UI warnings and extra confirmation flows. |
+| 23 | Lookalike addresses and confirmations | Argon · Low–Medium | Argon · Medium | UI warnings, extra confirmation flows, and a threshold on total fee and fee-to-amount ratio above the `100,000` sat/vB clamp. |
 | 24 | Release SBOM | Light · Low | Light · Low | On top of the supply-chain CI already in place. |
 | 25 | SPV acceptance of Electrum data | Carbon · Medium | Argon · Medium–High | Plan the proof and header cases. Implementation is failing tests, then a verifier that rejects them before a coin is confirmed. |
 | 26 | Peg-out maturity on public coins | Argon · Low–Medium | Argon · Medium | Failing test first. Status flags gain maturing. The 6-block boundary is the off-by-one to get right. |
@@ -83,8 +90,13 @@ Effort is Low, Medium, or High, relative to the size of the change and the reaso
 | 29 | Dropped unconfirmed transparent spends | Carbon · Medium | Argon · Medium–High | Three release triggers: own-node absence, an SPV-verified conflict, or 48h and ~1,152 blocks with the Electrum server omitting it. RBF is out of scope. |
 | 30 | macOS full-disk flush | Light · Low | Argon · Low–Medium | One `F_FULLFSYNC` helper for `write_atomic` and `write_atomic_0600`, file and parent. Parent flush failure fails the write. Keep the unix and macOS cfgs. No new CI job. |
 | 31 | Auto-lock wake race | Argon · Low–Medium | Argon · Medium | Check the deadline before refreshing activity. `WalletApp` enforces the same deadline, and background polls do not refresh it. |
+| 32 | Single-instance directory lock | Carbon · Medium | Argon · Medium | Fail closed before `clear_stale` when another live process holds the directory. A crash must still sweep a dead session. |
+| 33 | SPV checkpoints and work floor | Carbon · Medium | Argon · Medium–High | O13. Checkpoints or a work floor for the first header in the window, and for anchors below it. |
+| 34 | LitVM send and RPC invariants | Argon · Medium | Argon · Medium | Re-check chain id before signing. Empty calldata on a normal send. Keep the existing fee and gas caps. |
+| 35 | `churn_armed.json` at rest | Carbon · Medium | Argon · Medium–High | Spend secrets stay out of plaintext JSON. The locked pump can still broadcast. |
+| 36 | Core dumps, backup exclusion, updater | Light · Low | Light · Low | With item 24, when a release is near. No updater today. |
 
-Plan items 16, 17, 18, 25, 27, and 28 with Carbon. Items 11, 19, and 29 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
+Plan items 16, 17, 18, 25, 27, 28, 32, 33, and 35 with Carbon. Items 11, 19, and 29 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
 
 ## Already planned
 
@@ -187,7 +199,7 @@ The idle timer that decides when auto-lock fires is item 31. This item is the wi
 
 The v1 seal-envelope fixture pairs with item 17. A v1 envelope opens and upgrades when no v2 seal counter exists, and it fails closed when `mweb_seal_counter.txt` is present.
 
-`clear_stale` in `crates/wallet-core/src/mweb_frozen.rs` drops `reserved` and `public_reserved` whose `session` is not this process, and it leaves `ids` alone. Public user freezes live in the BDK wallet DB, not in that file. The fixture restores an `mweb_frozen.json` that contains an old session's in-flight hold, and load sweeps that hold and keeps `ids`.
+`clear_stale` in `crates/wallet-core/src/mweb_frozen.rs` drops `reserved` and `public_reserved` whose `session` is not this process, and it leaves `ids` alone. Public user freezes live in the BDK wallet DB, not in that file. The fixture restores an `mweb_frozen.json` that contains an old session's in-flight hold, and load sweeps that hold and keeps `ids`. A second live process is not that old session: opening one sweeps the first process's holds, which is item 32.
 
 Capture today's `churn_depth.json` in this item, before item 28's per-hop ledger changes that file. After item 28 lands, add a second frozen fixture for the ledger format.
 
@@ -199,7 +211,7 @@ The same item pins the Tauri surface in CI, beside the diagram checks in items 7
 
 **22. Error-message sanitization.** UI text and logs omit stack traces and extra address or amount detail.
 
-**23. Lookalike addresses and confirmations.** Warn on address lookalikes, and confirm high-value or irreversible actions beyond the existing wipe phrase.
+**23. Lookalike addresses and confirmations.** Warn on address lookalikes, and confirm high-value or irreversible actions beyond the existing wipe phrase. `estimate_fee_rate_sat_vb` clamps Electrum `blockchain.estimatefee` to `1..=100,000` sat/vB (`MAX_FEE_RATE_SAT_VB`). At that cap a 250 vB transaction pays 0.25 LTC. Confirm, or refuse, when the total fee or the fee-to-amount ratio crosses a stated threshold. The rate clamp stays.
 
 **24. Release SBOM.** Attach an SBOM, or an explicit check of the pinned dependencies, to releases. The supply-chain CI already in place stays as it is.
 
@@ -225,7 +237,7 @@ Done. `crates/wallet-core/src/spv.rs` replaces `bdk_electrum`'s `full_scan` and 
 - Server switch: `electrum_spv.json` records which unconfirmed transactions only the last server reported. `update_settings` evicts them on a server change, keeping peg-ins and transactions that spend our own coins. A server that fails verification is forgotten, not tried first again.
 - `probe_tip` (Settings, Test connection) checks genesis and the tip header's proof of work. Churn scoring's `block_hash_at` uses only local, stored-verified, or proof-of-work-checked headers.
 
-Tests use a thread-local regtest proof-of-work override (`spv::easy_pow_for_test`) so mock chains mine in a hash or two. Residuals are in `docs/AUDIT_NOTES.md`.
+Tests use a thread-local regtest proof-of-work override (`spv::easy_pow_for_test`) so mock chains mine in a hash or two. Residuals are in `docs/AUDIT_NOTES.md`. The below-window anchor residual (O13) is item 33.
 
 **26. Peg-out maturity on public coins.** Done. Litecoin consensus will not spend a HogEx peg-out until 6 confirmations (`PEGOUT_MATURITY` in Electrum-LTC `electrum/bitcoin.py`, and `CanonicalTxOut::is_mature` in `bdk`). `public_coin_status` and `collect_unspent` read `is_mature`. A peg-out at 1–5 confirmations is `Maturing`, with spend buttons off through the same flag path private maturing coins already use. `AGENTS.md` lists maturing on the public status list. An ordinary unconfirmed public coin stays selectable, as item 4 pinned. Coinbase outputs follow the same `is_mature` check (100 confirmations). The boundary is `tip - confirmation_height + 1 >= maturity`.
 - `public_utxo_maturity` and `collect_unspent` in `crates/wallet-core/src/app.rs` read `CanonicalTxOut::is_mature(tip)` and compute `maturity_blocks_left` (`PEGOUT_MATURITY` = 6 on HogEx peg-outs, `COINBASE_MATURITY` = 100 on coinbase outputs, `0` on ordinary outputs).
@@ -272,4 +284,24 @@ Own-node absence is not required on the timeout path. Peg-ins and ordinary trans
 
 ## Auto-lock
 
-**31. Auto-lock wake race.** The idle check in `ui/src/main.ts` stores `lastActivityTs = Date.now()` and compares it on a 30-second `setInterval`. The `pointerdown`, `keydown`, `wheel`, and `mousemove` listeners refresh `lastActivityTs` immediately, so input on wake resets the idle clock before the interval observes the sleep. Those handlers, plus `visibilitychange` and `focus`, test `Date.now() - lastActivityTs` against the timeout before they refresh the timestamp. `WalletApp` enforces the same deadline, so a throttled webview or a forged UI call locks at the same boundary as `NotLoaded` and the `DELETE WALLET` phrase. Background polls (`pump_churn`, and status or sync polls) do not refresh that idle timestamp, so an open window polling every few seconds cannot keep the deadline alive. Item 16 stays the zeroization work. This sits after item 20 and before items 27 and 28. Audit note O15.
+**31. Auto-lock wake race.** The idle check in `ui/src/main.ts` stores `lastActivityTs = Date.now()` and compares it on a 30-second `setInterval`. The `pointerdown`, `keydown`, `wheel`, and `mousemove` listeners refresh `lastActivityTs` immediately, so input on wake resets the idle clock before the interval observes the sleep. Those handlers, plus `visibilitychange` and `focus`, test `Date.now() - lastActivityTs` against the timeout before they refresh the timestamp. `WalletApp` enforces the same deadline, so a throttled webview or a forged UI call locks at the same boundary as `NotLoaded` and the `DELETE WALLET` phrase. Background polls (`pump_churn`, and status or sync polls) do not refresh that idle timestamp, so an open window polling every few seconds cannot keep the deadline alive. Item 16 stays the zeroization work. This sits after item 20 and before items 33, 34, 27, and 28. Audit note O15.
+
+## One directory, one process
+
+**32. Single-instance directory lock.** Item 17 makes each file write atomic. Item 30 makes a rename onto an open handle fail closed. Neither stops `ldk-wallet` and `wallet-cli`, or two app launches, from opening the same directory. `clear_stale` drops every `reserved` and `public_reserved` hold whose `session` is not this process, so the second open does not only race `mweb_seal_counter.txt`. It releases the first process's live in-flight holds. Take an exclusive lock (`flock` or a lockfile) before open, in the app and in `wallet-cli`. A second process fails closed and does not call `clear_stale`. A crash still leaves a dead session, and the next open of a directory with no live holder still sweeps that session. Item 20's fixture is that dead session, not a second live process.
+
+## SPV anchors below the window
+
+**33. SPV checkpoints and work floor.** Item 25 verifies the last 2016 headers. Audit note O13 is the residual: a fresh wallet, or one far behind, accepts the window's first header with only a proof-of-work and `powLimit` check, and an anchor below the window is checked against an isolated header. Ship signed header checkpoints, or verify forward from the last checkpoint, and give anchors below the window more than an isolated proof-of-work check. A server that can mine 2016 headers at minimum difficulty must not present that chain as the wallet's.
+
+## LitVM sends
+
+**34. LitVM send and RPC invariants.** Item 18 verifies an EIP-1559 replacement (`verify_replacement_target`: sender, recipient, value, nonce, empty calldata). Item 19 caps the HTTP body, the call deadline, and redirects. A normal send already goes through `probe`, which sets `signing_enabled` only when `eth_chainId` matches the preset, and through `build_tx`, which caps the priority fee, the max fee (`MAX_FEE_GWEI`), the gas limit (`MAX_GAS_LIMIT` = 2,000,000), and the total fee (`MAX_TOTAL_FEE_WEI`, 0.05 zkLTC). `send` then trusts `signing_enabled` and does not read the chain id again. The built transfer never sets calldata and never asserts the signed transaction's input is empty. Re-check `eth_chainId` against the preset inside send, before signing. Refuse a normal send whose calldata is non-empty, the same way replacement already does. Keep the existing caps, and test that a hostile fee or gas estimate cannot pass them.
+
+## Armed hops on disk
+
+**35. `churn_armed.json` at rest.** `write_armed` in `crates/wallet-core/src/churn.rs` writes `ArmedRecord` with `write_atomic_0600`. The JSON includes `raw_hex` and `created_coin`, and `created_coin` is `serde_json` of `PreparedHop.created` (`bdk_mweb::MwebCoin`), whose fields include `spend_key`, `blind`, and `shared_secret`. The test `armed_hop_debug_and_wipe_protect_raw_hex_and_coin_secrets` redacts those fields in `Debug`. It does not seal the file. `docs/LOCK_LIFECYCLE.md` says the broadcast pump reads `churn_armed.json` while locked, without unlocking, so sealing the file under the key that lock wipes would stop the pump. Mode `0600` is not encryption. Keep that pump, and keep those spend secrets out of plaintext JSON. Audit note O1 is the plaintext `wallet.sqlite` (addresses and history, not keys) and does not cover this file. Tor and DNS-seed privacy stay O7. Other JSON sidecars that do not hold spend secrets stay out of this item.
+
+## Release surface
+
+**36. Core dumps, backup exclusion, updater.** Not ahead of items 32–35. No in-app updater exists; add one only with an explicit check that it cannot replace the wallet from an unpinned source. Exclude the wallet directory from cloud backup, and keep secrets out of core dumps. Do this with the release work in item 24.

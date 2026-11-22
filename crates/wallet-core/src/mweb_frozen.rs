@@ -146,18 +146,23 @@ pub fn reserve(data_dir: &Path, output_ids: &[String], session: &str) -> Result<
     edit(data_dir, |file| {
         for id in &ids {
             if file.reserved.contains_key(id) {
+                crate::diag::log(format!(
+                    "coin-hold: rejected reserve kind=private coin={id} session={session} from=reserved to=reserved reason={RESERVED_MESSAGE}"
+                ));
                 return Err(WalletError::Mweb(RESERVED_MESSAGE.into()));
             }
             if file.ids.contains(id) {
-                return Err(WalletError::Mweb(
-                    "selected private coin is frozen — unfreeze it first".into(),
+                let msg = "selected private coin is frozen — unfreeze it first";
+                crate::diag::log(format!(
+                    "coin-hold: rejected reserve kind=private coin={id} session={session} from=frozen to=reserved reason={msg}"
                 ));
+                return Err(WalletError::Mweb(msg.into()));
             }
         }
         let since_unix = crate::mweb_history::now_ts();
-        for id in ids {
+        for id in &ids {
             file.reserved.insert(
-                id,
+                id.clone(),
                 Reservation {
                     session: session.to_string(),
                     since_unix,
@@ -165,19 +170,33 @@ pub fn reserve(data_dir: &Path, output_ids: &[String], session: &str) -> Result<
             );
         }
         Ok(true)
-    })
+    })?;
+    for id in &ids {
+        crate::diag::log(format!(
+            "coin-hold: take kind=private coin={id} session={session} from=unheld to=reserved reason=in-flight spend"
+        ));
+    }
+    Ok(())
 }
 
 pub fn release(data_dir: &Path, output_ids: &[String]) -> Result<(), WalletError> {
+    let mut released = Vec::new();
     edit(data_dir, |file| {
-        let before = file.reserved.len();
         for id in output_ids {
             if let Ok(id) = normalize_output_id(id) {
-                file.reserved.remove(&id);
+                if file.reserved.remove(&id).is_some() {
+                    released.push(id);
+                }
             }
         }
-        Ok(file.reserved.len() != before)
-    })
+        Ok(!released.is_empty())
+    })?;
+    for id in released {
+        crate::diag::log(format!(
+            "coin-hold: release kind=private coin={id} from=reserved to=unheld reason=spend settled"
+        ));
+    }
+    Ok(())
 }
 
 /// Hold public `outpoints` for a split or transfer in flight. Refuses, writing
@@ -189,11 +208,14 @@ pub fn reserve_public(
     session: &str,
 ) -> Result<(), WalletError> {
     edit(data_dir, |file| {
-        if outpoints
-            .iter()
-            .any(|op| file.public_reserved.contains_key(&op.to_string()))
-        {
-            return Err(WalletError::BuildTx(RESERVED_MESSAGE.into()));
+        for op in outpoints {
+            let key = op.to_string();
+            if file.public_reserved.contains_key(&key) {
+                crate::diag::log(format!(
+                    "coin-hold: rejected reserve kind=public coin={key} session={session} from=public_reserved to=public_reserved reason={RESERVED_MESSAGE}"
+                ));
+                return Err(WalletError::BuildTx(RESERVED_MESSAGE.into()));
+            }
         }
         let since_unix = crate::mweb_history::now_ts();
         for op in outpoints {
@@ -206,17 +228,32 @@ pub fn reserve_public(
             );
         }
         Ok(true)
-    })
+    })?;
+    for op in outpoints {
+        crate::diag::log(format!(
+            "coin-hold: take kind=public coin={op} session={session} from=unheld to=public_reserved reason=in-flight spend"
+        ));
+    }
+    Ok(())
 }
 
 pub fn release_public(data_dir: &Path, outpoints: &[OutPoint]) -> Result<(), WalletError> {
+    let mut released = Vec::new();
     edit(data_dir, |file| {
-        let before = file.public_reserved.len();
         for op in outpoints {
-            file.public_reserved.remove(&op.to_string());
+            let key = op.to_string();
+            if file.public_reserved.remove(&key).is_some() {
+                released.push(key);
+            }
         }
-        Ok(file.public_reserved.len() != before)
-    })
+        Ok(!released.is_empty())
+    })?;
+    for key in released {
+        crate::diag::log(format!(
+            "coin-hold: release kind=public coin={key} from=public_reserved to=unheld reason=spend settled"
+        ));
+    }
+    Ok(())
 }
 
 /// Public coins held by a split or transfer in flight.
@@ -230,12 +267,37 @@ pub fn public_reserved_outpoints(data_dir: &Path) -> Result<BTreeSet<OutPoint>, 
 
 /// Drop holds left by an earlier process, which can no longer be broadcasting.
 pub fn clear_stale(data_dir: &Path, session: &str) -> Result<(), WalletError> {
+    let mut stale_private: Vec<(String, String)> = Vec::new();
+    let mut stale_public: Vec<(String, String)> = Vec::new();
     edit(data_dir, |file| {
         let before = file.reserved.len() + file.public_reserved.len();
-        file.reserved.retain(|_, r| r.session == session);
-        file.public_reserved.retain(|_, r| r.session == session);
+        file.reserved.retain(|id, r| {
+            let keep = r.session == session;
+            if !keep {
+                stale_private.push((id.clone(), r.session.clone()));
+            }
+            keep
+        });
+        file.public_reserved.retain(|op, r| {
+            let keep = r.session == session;
+            if !keep {
+                stale_public.push((op.clone(), r.session.clone()));
+            }
+            keep
+        });
         Ok(file.reserved.len() + file.public_reserved.len() != before)
-    })
+    })?;
+    for (id, old) in stale_private {
+        crate::diag::log(format!(
+            "coin-hold: release kind=private coin={id} from=reserved(session={old}) to=unheld(session={session}) reason=stale session"
+        ));
+    }
+    for (op, old) in stale_public {
+        crate::diag::log(format!(
+            "coin-hold: release kind=public coin={op} from=public_reserved(session={old}) to=unheld(session={session}) reason=stale session"
+        ));
+    }
+    Ok(())
 }
 
 /// Coins no spend may select: the user's freezes and the holds of spends in flight.
@@ -405,5 +467,92 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = set_locked(dir.path(), "not-hex", true).unwrap_err();
         assert!(err.to_string().contains("32-byte hex"));
+    }
+
+    #[test]
+    fn hold_take_release_stale_and_rejections_are_logged() {
+        let dir = tempdir().unwrap();
+        let priv_live = "d1".repeat(32);
+        let priv_frozen = "d2".repeat(32);
+        let priv_stale = "d3".repeat(32);
+        let pub_live = OutPoint::from_str(&format!("{}:0", "e1".repeat(32))).unwrap();
+        let pub_stale = OutPoint::from_str(&format!("{}:1", "e2".repeat(32))).unwrap();
+
+        set_locked(dir.path(), &priv_frozen, true).unwrap();
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        // Take private and public holds, plus stale ones under a dead session.
+        reserve(dir.path(), std::slice::from_ref(&priv_live), "live-s").unwrap();
+        reserve(dir.path(), std::slice::from_ref(&priv_stale), "dead-s").unwrap();
+        reserve_public(dir.path(), &[pub_live], "live-s").unwrap();
+        reserve_public(dir.path(), &[pub_stale], "dead-s").unwrap();
+
+        // Reject double-reserve (private and public) and frozen reserve.
+        assert!(reserve(dir.path(), std::slice::from_ref(&priv_live), "live-s").is_err());
+        assert!(reserve(dir.path(), std::slice::from_ref(&priv_frozen), "live-s").is_err());
+        assert!(reserve_public(dir.path(), &[pub_live], "live-s").is_err());
+
+        // Sweep stale session holds and release live ones.
+        clear_stale(dir.path(), "live-s").unwrap();
+        release(dir.path(), std::slice::from_ref(&priv_live)).unwrap();
+        release_public(dir.path(), &[pub_live]).unwrap();
+
+        let (_, lines) = crate::diag::since(cursor);
+        let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+
+        assert!(
+            has(&format!(
+                "coin-hold: take kind=private coin={priv_live} session=live-s from=unheld to=reserved reason=in-flight spend"
+            )),
+            "missing private take log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: take kind=public coin={pub_live} session=live-s from=unheld to=public_reserved reason=in-flight spend"
+            )),
+            "missing public take log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: rejected reserve kind=private coin={priv_live} session=live-s from=reserved to=reserved reason={RESERVED_MESSAGE}"
+            )),
+            "missing private double-reserve rejection log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: rejected reserve kind=private coin={priv_frozen} session=live-s from=frozen to=reserved reason=selected private coin is frozen"
+            )),
+            "missing frozen private reserve rejection log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: rejected reserve kind=public coin={pub_live} session=live-s from=public_reserved to=public_reserved reason={RESERVED_MESSAGE}"
+            )),
+            "missing public double-reserve rejection log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: release kind=private coin={priv_stale} from=reserved(session=dead-s) to=unheld(session=live-s) reason=stale session"
+            )),
+            "missing stale private release log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: release kind=public coin={pub_stale} from=public_reserved(session=dead-s) to=unheld(session=live-s) reason=stale session"
+            )),
+            "missing stale public release log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: release kind=private coin={priv_live} from=reserved to=unheld reason=spend settled"
+            )),
+            "missing private release log in {lines:#?}"
+        );
+        assert!(
+            has(&format!(
+                "coin-hold: release kind=public coin={pub_live} from=public_reserved to=unheld reason=spend settled"
+            )),
+            "missing public release log in {lines:#?}"
+        );
     }
 }

@@ -653,11 +653,14 @@ fn check(job: &ChurnJob, kind: ChurnEventKind) -> Result<ChurnPhase, WalletError
 pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), WalletError> {
     let kind = event.kind(job);
     let from = job.phase;
-    let to = check(job, kind).inspect_err(|_| {
-        crate::diag::log(format!("self-spend: rejected {kind:?} in {from:?}"));
+    let to = check(job, kind).inspect_err(|err| {
+        crate::diag::log(format!(
+            "self-spend: rejected {kind:?} job={} coin={} from={from:?} reason={err}",
+            job.origin_output_id, job.current_output_id
+        ));
     })?;
-    match event {
-        ChurnEvent::Signed | ChurnEvent::ArmedNext => {
+    let reason: String = match event {
+        ChurnEvent::Signed => {
             job.pending_wtxid = None;
             job.broadcast_height = None;
             job.last_check = None;
@@ -665,6 +668,17 @@ pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), Walle
             job.cover_hold = None;
             job.needs_resign = false;
             job.header_cache.clear();
+            "hop signed".into()
+        }
+        ChurnEvent::ArmedNext => {
+            job.pending_wtxid = None;
+            job.broadcast_height = None;
+            job.last_check = None;
+            job.last_error = None;
+            job.cover_hold = None;
+            job.needs_resign = false;
+            job.header_cache.clear();
+            "next hop armed".into()
         }
         ChurnEvent::Broadcast {
             wtxid,
@@ -683,27 +697,34 @@ pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), Walle
             job.needs_resign = false;
             clear_cover_read(job);
             job.spreading = false;
+            format!("broadcast wtxid={wtxid} height={height}")
         }
         ChurnEvent::BroadcastFailed(error) => {
+            let reason = format!("broadcast failed: {error}");
             job.last_error = Some(error);
+            reason
         }
-        ChurnEvent::Scored(score) => match score {
-            HopScore::Unscored => {}
-            HopScore::Solo => {
-                job.last_other_kernels = None;
-                job.last_other_outputs = None;
+        ChurnEvent::Scored(score) => {
+            match score {
+                HopScore::Unscored => {}
+                HopScore::Solo => {
+                    job.last_other_kernels = None;
+                    job.last_other_outputs = None;
+                }
+                HopScore::Mixed {
+                    other_kernels,
+                    other_outputs,
+                } => {
+                    job.effective_depth = job.effective_depth.saturating_add(1);
+                    job.last_other_kernels = Some(other_kernels);
+                    job.last_other_outputs = Some(other_outputs);
+                }
             }
-            HopScore::Mixed {
-                other_kernels,
-                other_outputs,
-            } => {
-                job.effective_depth = job.effective_depth.saturating_add(1);
-                job.last_other_kernels = Some(other_kernels);
-                job.last_other_outputs = Some(other_outputs);
-            }
-        },
+            format!("scored {score:?}")
+        }
         ChurnEvent::NotIncluded { restored_output_id } => {
             let id = mweb_frozen::normalize_output_id(restored_output_id)?;
+            let reason = format!("not included restored={id}");
             job.current_output_id = id;
             job.pending_wtxid = None;
             job.created_output_id = None;
@@ -711,8 +732,10 @@ pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), Walle
             job.header_cache.clear();
             job.last_error = Some("This spend was not included in a block.".into());
             job.needs_resign = true;
+            reason
         }
-        ChurnEvent::StillUnscored | ChurnEvent::Cancel => {}
+        ChurnEvent::StillUnscored => "still unscored inside grace".into(),
+        ChurnEvent::Cancel => "user cancel".into(),
         ChurnEvent::Retry => {
             job.last_error = None;
             if from != ChurnPhase::PausedUnscored {
@@ -722,24 +745,32 @@ pub fn transition(job: &mut ChurnJob, event: ChurnEvent<'_>) -> Result<(), Walle
                 // The prepared chain is used up. The next hop is a new signature.
                 job.needs_resign = true;
             }
+            "user retry".into()
         }
         ChurnEvent::Expired => {
             job.needs_resign = true;
             job.last_error = Some(EXPIRED_SPEND.into());
             job.cover_hold = None;
+            "armed hop expired".into()
         }
         ChurnEvent::ForeignSpend => {
             job.needs_resign = false;
             job.input_spent_elsewhere = true;
             job.last_error = Some(FOREIGN_SPEND.into());
             job.cover_hold = None;
+            "input spent elsewhere".into()
         }
         ChurnEvent::Finished => {
             job.cover_hold = None;
             job.needs_resign = false;
+            "prepared chain finished".into()
         }
-    }
+    };
     job.phase = to;
+    crate::diag::log(format!(
+        "self-spend: phase {from:?} -> {to:?} job={} coin={} event={kind:?} reason={reason}",
+        job.origin_output_id, job.current_output_id
+    ));
     Ok(())
 }
 
@@ -1573,6 +1604,89 @@ mod tests {
         let before = job.clone();
         assert!(transition(&mut job, ChurnEvent::Expired).is_err());
         assert_eq!(job, before);
+    }
+
+    #[test]
+    fn transition_and_rejection_log_job_coin_from_to_and_reason() {
+        let origin = "a1".repeat(32);
+        let hop1 = "b2".repeat(32);
+        let wtxid = "c3".repeat(32);
+        let mut job = new_job(&origin, false, 1, 50_000, 2, false).unwrap();
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        transition(&mut job, ChurnEvent::Signed).unwrap();
+        transition(
+            &mut job,
+            ChurnEvent::Broadcast {
+                wtxid: &wtxid,
+                new_output_id: &hop1,
+                height: 77,
+            },
+        )
+        .unwrap();
+        // Cancel while WaitingConfirm is rejected.
+        assert!(transition(&mut job, ChurnEvent::Cancel).is_err());
+        transition(
+            &mut job,
+            ChurnEvent::Scored(HopScore::Mixed {
+                other_kernels: 2,
+                other_outputs: 3,
+            }),
+        )
+        .unwrap();
+        // Terminal Done rejects Expired.
+        assert!(transition(&mut job, ChurnEvent::Expired).is_err());
+
+        let (_, lines) = crate::diag::since(cursor);
+        let mine: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains(&format!("job={origin}")))
+            .collect();
+        assert!(
+            mine.iter().any(|l| {
+                l.contains("self-spend: phase WaitingToBroadcast -> WaitingForCover")
+                    && l.contains(&format!("coin={origin}"))
+                    && l.contains("event=Signed")
+                    && l.contains("reason=hop signed")
+            }),
+            "missing Signed phase log in {mine:#?}"
+        );
+        assert!(
+            mine.iter().any(|l| {
+                l.contains("self-spend: phase WaitingForCover -> WaitingConfirm")
+                    && l.contains(&format!("coin={hop1}"))
+                    && l.contains("event=Broadcast")
+                    && l.contains(&format!("reason=broadcast wtxid={wtxid} height=77"))
+            }),
+            "missing Broadcast phase log in {mine:#?}"
+        );
+        assert!(
+            mine.iter().any(|l| {
+                l.contains("self-spend: rejected Cancel")
+                    && l.contains(&format!("coin={hop1}"))
+                    && l.contains("from=WaitingConfirm")
+                    && l.contains("already on the network")
+            }),
+            "missing rejected Cancel log in {mine:#?}"
+        );
+        assert!(
+            mine.iter().any(|l| {
+                l.contains("self-spend: phase WaitingConfirm -> Done")
+                    && l.contains(&format!("coin={hop1}"))
+                    && l.contains("event=ScoredFinal")
+                    && l.contains("reason=scored Mixed")
+            }),
+            "missing ScoredFinal phase log in {mine:#?}"
+        );
+        assert!(
+            mine.iter().any(|l| {
+                l.contains("self-spend: rejected Expired")
+                    && l.contains(&format!("coin={hop1}"))
+                    && l.contains("from=Done")
+                    && l.contains("cannot change from its current state")
+            }),
+            "missing rejected Expired log in {mine:#?}"
+        );
     }
 
     #[test]

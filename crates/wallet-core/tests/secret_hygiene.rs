@@ -338,9 +338,10 @@ fn lock_wipe_and_error_paths_clear_secrets_and_redact_diagnostics() {
     ));
 
     // Wrong passphrase unlock fails closed and keeps secrets cleared.
+    let secret_pass = "wrong-super-secret-passphrase-token";
     assert!(matches!(
         app.unlock(UnlockRequest {
-            passphrase: "wrong".into(),
+            passphrase: secret_pass.into(),
         }),
         Err(WalletError::IncorrectPassphrase)
     ));
@@ -349,6 +350,25 @@ fn lock_wipe_and_error_paths_clear_secrets_and_redact_diagnostics() {
         app.litvm_account_secret(),
         Err(WalletError::Locked)
     ));
+
+    let bundle_locked = app.diagnostics("0.4.16");
+    let locked_json = serde_json::to_string(&bundle_locked).unwrap();
+    assert!(
+        !locked_json.contains(secret_pass) && !locked_json.contains(TEST_PASSPHRASE),
+        "diagnostics bundle leaked passphrase on lock/unlock rejection: {locked_json}"
+    );
+    assert!(
+        bundle_locked
+            .recent_log_lines
+            .iter()
+            .any(|l| l.contains("lock-state: Loaded -> Locked"))
+            && bundle_locked
+                .recent_log_lines
+                .iter()
+                .any(|l| l.contains("lock-state: rejected Unlock from=Locked")),
+        "diagnostics bundle must record lock transition and unlock rejection: {:?}",
+        bundle_locked.recent_log_lines
+    );
 
     // Wipe deletes mnemonic files and all accounts, leaving nothing recoverable in memory.
     app.wipe(dir.path()).expect("wipe");

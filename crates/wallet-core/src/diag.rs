@@ -9,7 +9,10 @@ const CAPACITY: usize = 200;
 /// Lines with their sequence number. Numbers start at 1 and never repeat, so a
 /// reader can ask for everything after the last number it saw.
 struct Ring {
+    #[cfg(not(test))]
     lines: VecDeque<(u64, String)>,
+    #[cfg(test)]
+    lines: VecDeque<(u64, std::thread::ThreadId, String)>,
     last_seq: u64,
 }
 
@@ -36,19 +39,44 @@ pub fn log(message: impl AsRef<str>) {
     eprintln!("{scrubbed}");
     let line = format!("{} {scrubbed}", now_secs());
     if let Ok(mut ring) = LOG.lock() {
-        if ring.lines.len() >= CAPACITY {
-            ring.lines.pop_front();
+        #[cfg(not(test))]
+        {
+            if ring.lines.len() >= CAPACITY {
+                ring.lines.pop_front();
+            }
+            ring.last_seq += 1;
+            let seq = ring.last_seq;
+            ring.lines.push_back((seq, line));
         }
-        ring.last_seq += 1;
-        let seq = ring.last_seq;
-        ring.lines.push_back((seq, line));
+        #[cfg(test)]
+        {
+            let tid = std::thread::current().id();
+            let thread_count = ring.lines.iter().filter(|(_, t, _)| *t == tid).count();
+            if thread_count >= CAPACITY {
+                if let Some(pos) = ring.lines.iter().position(|(_, t, _)| *t == tid) {
+                    ring.lines.remove(pos);
+                }
+            }
+            ring.last_seq += 1;
+            let seq = ring.last_seq;
+            ring.lines.push_back((seq, tid, line));
+        }
     }
 }
 
 /// Snapshot of recent diagnostic lines (oldest first).
 pub fn snapshot() -> Vec<String> {
     LOG.lock()
-        .map(|ring| ring.lines.iter().map(|(_, l)| l.clone()).collect())
+        .map(|ring| {
+            #[cfg(not(test))]
+            {
+                ring.lines.iter().map(|(_, l)| l.clone()).collect()
+            }
+            #[cfg(test)]
+            {
+                ring.lines.iter().map(|(_, _, l)| l.clone()).collect()
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -57,11 +85,19 @@ pub fn snapshot() -> Vec<String> {
 pub fn since(seq: u64) -> (u64, Vec<String>) {
     LOG.lock()
         .map(|ring| {
+            #[cfg(not(test))]
             let lines = ring
                 .lines
                 .iter()
                 .filter(|(s, _)| *s > seq)
                 .map(|(_, l)| l.clone())
+                .collect();
+            #[cfg(test)]
+            let lines = ring
+                .lines
+                .iter()
+                .filter(|(s, _, _)| *s > seq)
+                .map(|(_, _, l)| l.clone())
                 .collect();
             (ring.last_seq, lines)
         })

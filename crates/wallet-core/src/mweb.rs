@@ -1710,9 +1710,17 @@ mod tests {
         }
     }
 
-    fn public_facts(confirmations: u32, locked: bool, reserved: bool) -> PublicCoinFacts {
+    fn public_facts(
+        confirmations: u32,
+        mature: bool,
+        maturity_blocks_left: u32,
+        locked: bool,
+        reserved: bool,
+    ) -> PublicCoinFacts {
         PublicCoinFacts {
             confirmations,
+            mature,
+            maturity_blocks_left,
             locked,
             reserved,
         }
@@ -1723,7 +1731,7 @@ mod tests {
         // (facts, status, blocked, select/freeze, split/transfer, unfreeze)
         let cases = [
             (
-                public_facts(3, false, false),
+                public_facts(3, true, 0, false, false),
                 CoinStatus::Ready,
                 None,
                 true,
@@ -1731,7 +1739,7 @@ mod tests {
                 false,
             ),
             (
-                public_facts(0, false, false),
+                public_facts(0, true, 0, false, false),
                 CoinStatus::Pending,
                 Some(CoinBlock::Unconfirmed),
                 true,
@@ -1739,23 +1747,31 @@ mod tests {
                 false,
             ),
             (
-                public_facts(3, true, false),
-                CoinStatus::Frozen,
-                Some(CoinBlock::Frozen),
-                false,
-                false,
-                true,
-            ),
-            (
-                public_facts(0, true, false),
+                public_facts(0, false, 6, false, false),
                 CoinStatus::Pending,
+                Some(CoinBlock::Unconfirmed),
+                false,
+                false,
+                false,
+            ),
+            (
+                public_facts(2, false, 4, false, false),
+                CoinStatus::Maturing,
+                Some(CoinBlock::Maturing { blocks_left: 4 }),
+                false,
+                false,
+                false,
+            ),
+            (
+                public_facts(2, false, 4, true, false),
+                CoinStatus::Maturing,
                 Some(CoinBlock::Frozen),
                 false,
                 false,
                 true,
             ),
             (
-                public_facts(3, false, true),
+                public_facts(2, false, 4, false, true),
                 CoinStatus::Sending,
                 Some(CoinBlock::Sending),
                 false,
@@ -1763,7 +1779,31 @@ mod tests {
                 false,
             ),
             (
-                public_facts(3, true, true),
+                public_facts(3, true, 0, true, false),
+                CoinStatus::Frozen,
+                Some(CoinBlock::Frozen),
+                false,
+                false,
+                true,
+            ),
+            (
+                public_facts(0, true, 0, true, false),
+                CoinStatus::Pending,
+                Some(CoinBlock::Frozen),
+                false,
+                false,
+                true,
+            ),
+            (
+                public_facts(3, true, 0, false, true),
+                CoinStatus::Sending,
+                Some(CoinBlock::Sending),
+                false,
+                false,
+                false,
+            ),
+            (
+                public_facts(3, true, 0, true, true),
                 CoinStatus::Sending,
                 Some(CoinBlock::Sending),
                 false,
@@ -1773,15 +1813,15 @@ mod tests {
         ];
         for (facts, status, blocked, free, spend, unfreeze) in cases {
             let (s, a) = public_coin_status(&facts);
-            assert_eq!(s, status);
-            assert_eq!(a.blocked, blocked);
-            assert_eq!((a.select, a.freeze), (free, free));
-            assert_eq!((a.split, a.transfer), (spend, spend));
+            assert_eq!(s, status, "{facts:?}");
+            assert_eq!(a.blocked, blocked, "{facts:?}");
+            assert_eq!((a.select, a.freeze), (free, free), "{facts:?}");
+            assert_eq!((a.split, a.transfer), (spend, spend), "{facts:?}");
             assert_eq!(
                 a.unfreeze, unfreeze,
-                "the send owns the coin until it finishes"
+                "the send owns the coin until it finishes: {facts:?}"
             );
-            assert!(!a.spend_to_self);
+            assert!(!a.spend_to_self, "{facts:?}");
         }
     }
 
@@ -1914,6 +1954,7 @@ mod tests {
         let status = [
             (CoinStatus::Sending, f.reserved),
             (CoinStatus::Pending, f.confirmations == 0),
+            (CoinStatus::Maturing, !f.mature),
             (CoinStatus::Frozen, f.locked),
             (CoinStatus::Ready, true),
         ]
@@ -1925,6 +1966,12 @@ mod tests {
             (CoinBlock::Sending, f.reserved),
             (CoinBlock::Frozen, f.locked),
             (CoinBlock::Unconfirmed, f.confirmations == 0),
+            (
+                CoinBlock::Maturing {
+                    blocks_left: f.maturity_blocks_left,
+                },
+                !f.mature,
+            ),
         ]
         .into_iter()
         .find(|(_, applies)| *applies)
@@ -1934,17 +1981,31 @@ mod tests {
 
     #[test]
     fn public_coin_status_holds_for_every_fact_combination() {
+        let maturities = [
+            (0, true, 0),  // ordinary unconfirmed public coin (stays selectable)
+            (0, false, 6), // unconfirmed HogEx peg-out / coinbase
+            (1, false, 5), // 1-conf HogEx peg-out (5 blocks left)
+            (5, false, 1), // 5-conf HogEx peg-out (1 block left)
+            (6, true, 0),  // 6-conf mature HogEx peg-out
+            (1, true, 0),  // 1-conf ordinary public coin
+        ];
         let mut seen = 0usize;
-        for confirmations in [0, 1, 6] {
+        for (confirmations, mature, maturity_blocks_left) in maturities {
             for locked in [false, true] {
                 for reserved in [false, true] {
-                    let facts = public_facts(confirmations, locked, reserved);
+                    let facts = public_facts(
+                        confirmations,
+                        mature,
+                        maturity_blocks_left,
+                        locked,
+                        reserved,
+                    );
                     let (status, actions) = public_coin_status(&facts);
                     let (want_status, want_blocked) = spec_public(&facts);
                     assert_eq!(status, want_status, "{facts:?}");
                     assert_eq!(actions.blocked, want_blocked, "{facts:?}");
                     assert!(!actions.spend_to_self, "{facts:?}");
-                    let free = !facts.reserved && !facts.locked;
+                    let free = !facts.reserved && !facts.locked && facts.mature;
                     assert_eq!((actions.select, actions.freeze), (free, free), "{facts:?}");
                     let spend = actions.blocked.is_none();
                     assert_eq!(
@@ -1952,10 +2013,15 @@ mod tests {
                         (spend, spend),
                         "{facts:?}"
                     );
+                    assert_eq!(spend, status == CoinStatus::Ready, "{facts:?}");
                     assert_eq!(
                         actions.unfreeze,
                         facts.locked && !facts.reserved,
                         "{facts:?}"
+                    );
+                    assert!(
+                        !(actions.freeze && actions.unfreeze),
+                        "freeze and unfreeze are never both on: {facts:?}"
                     );
                     if facts.reserved {
                         assert!(
@@ -1968,11 +2034,14 @@ mod tests {
                             "a hold is not a freeze the user can undo: {facts:?}"
                         );
                     }
+                    if let Some(CoinBlock::Maturing { blocks_left }) = actions.blocked {
+                        assert_eq!(blocks_left, facts.maturity_blocks_left, "{facts:?}");
+                    }
                     seen += 1;
                 }
             }
         }
-        assert_eq!(seen, 12);
+        assert_eq!(seen, 6 * 2 * 2);
     }
 
     #[test]
@@ -3986,6 +4055,8 @@ pub(crate) fn coin_status(f: &CoinFacts) -> (CoinStatus, CoinActions) {
 #[derive(Debug)]
 pub(crate) struct PublicCoinFacts {
     pub confirmations: u32,
+    pub mature: bool,
+    pub maturity_blocks_left: u32,
     /// Frozen by the user (BDK wallet lock).
     pub locked: bool,
     /// A split or transfer in flight holds the coin (`mweb_frozen` `public_reserved`).
@@ -3994,14 +4065,17 @@ pub(crate) struct PublicCoinFacts {
 
 /// The only place a public coin's status and buttons are decided.
 ///
-/// Status is the first match of: sending, pending, frozen, ready. The blocked reason is the
-/// first match of: sending, frozen, unconfirmed. An unconfirmed coin may still be picked
-/// for a send; only split and transfer wait for a confirmation.
+/// Status is the first match of: sending, pending, maturing, frozen, ready. The blocked reason
+/// is the first match of: sending, frozen, unconfirmed, maturing. An ordinary unconfirmed coin
+/// may still be picked for a send; split and transfer wait for a confirmation, and a HogEx
+/// peg-out or coinbase coin waits for maturity.
 pub(crate) fn public_coin_status(f: &PublicCoinFacts) -> (CoinStatus, CoinActions) {
     let status = if f.reserved {
         CoinStatus::Sending
     } else if f.confirmations == 0 {
         CoinStatus::Pending
+    } else if !f.mature {
+        CoinStatus::Maturing
     } else if f.locked {
         CoinStatus::Frozen
     } else {
@@ -4013,10 +4087,14 @@ pub(crate) fn public_coin_status(f: &PublicCoinFacts) -> (CoinStatus, CoinAction
         Some(CoinBlock::Frozen)
     } else if f.confirmations == 0 {
         Some(CoinBlock::Unconfirmed)
+    } else if !f.mature {
+        Some(CoinBlock::Maturing {
+            blocks_left: f.maturity_blocks_left,
+        })
     } else {
         None
     };
-    let free = !f.reserved && !f.locked;
+    let free = !f.reserved && !f.locked && f.mature;
     let spendable = blocked.is_none();
     let actions = CoinActions {
         spend_to_self: false,

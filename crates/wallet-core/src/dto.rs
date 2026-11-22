@@ -204,6 +204,12 @@ pub struct UtxoRecord {
     /// `external` (receive) or `internal` (change).
     pub keychain: String,
     pub confirmations: u32,
+    /// True when the coin satisfies Litecoin consensus maturity (`is_mature`).
+    #[serde(default)]
+    pub mature: bool,
+    /// Blocks remaining before an immature HogEx peg-out or coinbase coin matures (`0` when mature).
+    #[serde(default)]
+    pub maturity_blocks_left: u32,
     /// Frozen coins are skipped by automatic coin selection.
     pub locked: bool,
     /// Optional local note (non-secret sidecar).
@@ -1021,7 +1027,7 @@ pub struct MwebUtxoRecord {
 
 /// Status of one coin. [`crate::mweb::coin_status`] (private) and
 /// [`crate::mweb::public_coin_status`] (public) pick the first that applies, in declaration
-/// order. Public coins only use Sending, Pending, Frozen and Ready.
+/// order. Public coins use Sending, Pending, Maturing, Frozen and Ready.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoinStatus {
@@ -1031,7 +1037,7 @@ pub enum CoinStatus {
     Sending,
     /// Not in a block yet.
     Pending,
-    /// A confirmed peg-in that has not reached maturity.
+    /// A confirmed peg-in, peg-out, or coinbase coin that has not reached maturity.
     Maturing,
     /// Frozen by the user.
     Frozen,

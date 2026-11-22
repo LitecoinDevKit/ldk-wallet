@@ -298,6 +298,22 @@ test("canonical backend coin_status and public_coin_status profiles map to the r
   assert.equal(maturingPriv.split.disabled, true);
   assert.equal(maturingPriv.split.title, "Matures in 4 blocks.");
 
+  const maturingPub = publicCoinActionState(
+    { status: "maturing", actions: maturingActions },
+    { hasOtherWallets: true },
+  );
+  assert.equal(maturingPub.jobHolds, false);
+  assert.equal(maturingPub.spendToSelf.visible, false);
+  assert.equal(maturingPub.select.disabled, true);
+  assert.equal(maturingPub.select.title, "Matures in 4 blocks.");
+  assert.equal(maturingPub.freeze.disabled, true);
+  assert.equal(maturingPub.freeze.targetLocked, null);
+  assert.equal(maturingPub.freeze.title, "Matures in 4 blocks.");
+  assert.equal(maturingPub.split.disabled, true);
+  assert.equal(maturingPub.split.title, "Matures in 4 blocks.");
+  assert.equal(maturingPub.transfer.disabled, true);
+  assert.equal(maturingPub.transfer.title, "Matures in 4 blocks.");
+
   const pendingPublicActions = {
     spend_to_self: false,
     split: false,

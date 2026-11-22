@@ -4,8 +4,8 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Peg-out maturity on public coins (item 26).
-2. Untrusted input bounds (item 19).
+1. Untrusted input bounds (item 19).
+2. Backup and restore round-trips (item 20).
 3. After item 20: adversarial MWEB peers (item 27) and cross-layer reorg unwind (item 28). Dropped unconfirmed transparent spends (item 29) follows those. macOS full-disk flush (item 30) stays lower.
 
 ## Status
@@ -37,7 +37,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
 | 25 | SPV acceptance of Electrum data | High | Done | [#37](https://github.com/LitecoinDevKit/ldk-wallet/pull/37) | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
-| 26 | Peg-out maturity on public coins | High | Not started | | A HogEx peg-out with fewer than 6 confirmations is maturing, not Ready. Ordinary unconfirmed public coins stay selectable. |
+| 26 | Peg-out maturity on public coins | High | Done | [#38](https://github.com/LitecoinDevKit/ldk-wallet/pull/38) | `public_coin_status` and `collect_unspent` enforce `CanonicalTxOut::is_mature` (6 confirmations on HogEx peg-outs, 100 on coinbase), marking immature coins `Maturing` with `maturity_blocks_left` and blocking spend/split/transfer/peg-in/freeze while keeping ordinary unconfirmed public coins selectable. |
 | 27 | Adversarial MWEB peer | High | Not started | | A disagreeing second peer warns and does not mark the balance complete. A failed HogEx anchor leaves coins and history unchanged and goes stale. Withheld leaves stay the O2 warning, including when the second peer is unreachable. LIP-0006 verification stays in `bdk_mweb`. |
 | 28 | Cross-layer reorg unwind | High | Not started | | A reorg that un-mines a peg-in, a peg-out, or a scored churn hop unwinds transparent coins, MWEB coins, history, holds, and churn depth together. Item 17 only unconfirms MWEB history above the wallet tip. |
 | 29 | Dropped unconfirmed transparent spends | Medium | Not started | | A peg-in or public spend that has left the mempool releases its inputs. Release needs own-node absence, a conflicting confirmed spend, or a 48h-style timeout. A server that merely omits a peg-in still cannot resurrect it. RBF is out of scope. |
@@ -207,6 +207,9 @@ Done. `crates/wallet-core/src/spv.rs` replaces `bdk_electrum`'s `full_scan` and 
 Tests use a thread-local regtest proof-of-work override (`spv::easy_pow_for_test`) so mock chains mine in a hash or two. Residuals are in `docs/AUDIT_NOTES.md`.
 
 **26. Peg-out maturity on public coins.** Litecoin consensus will not spend a HogEx peg-out until 6 confirmations (`PEGOUT_MATURITY` in Electrum-LTC `electrum/bitcoin.py`, and `CanonicalTxOut::is_mature` in `bdk`). `collect_unspent` never asks `is_mature`. `public_coin_status` marks any public coin with one or more confirmations Ready and selectable, so a peg-out at 1–5 confirmations offers spend. Those coins are maturing: spend buttons off, through the same flag path private maturing coins already use. Update `AGENTS.md` in that PR so the public status list includes maturing. An ordinary unconfirmed public coin stays selectable, as item 4 pinned. Coinbase outputs follow the same `is_mature` check (100 confirmations) so the rule is not a peg-out special case. The boundary is `tip - confirmation_height + 1 >= maturity`.
+- `public_utxo_maturity` and `collect_unspent` in `crates/wallet-core/src/app.rs` read `CanonicalTxOut::is_mature(tip)` and compute `maturity_blocks_left` (`PEGOUT_MATURITY` = 6 on HogEx peg-outs, `COINBASE_MATURITY` = 100 on coinbase outputs, `0` on ordinary outputs).
+- `mweb::public_coin_status` in `crates/wallet-core/src/mweb.rs` adds `Maturing` (`status` priority: `Sending -> Pending -> Maturing -> Frozen -> Ready`; `blocked` priority: `Sending -> Frozen -> Unconfirmed -> Maturing`), turning `select`, `freeze`, `split`, and `transfer` off while `!mature` and keeping ordinary unconfirmed public coins selectable (`Pending`, `select: true`, `freeze: true`).
+- `build_send_psbt`, `public_split_utxo`, `resolve_pegin_request`, and `selectable_public_utxo_amounts` reject or exclude immature HogEx and coinbase UTXOs, `ui/src/main.ts` renders the `Maturing` chip and remaining block count on public rows, and `hogex_pegout_and_coinbase_maturity_boundaries_in_public_coins` pins the 6-block and 100-block boundaries.
 
 ## MWEB peers, reorgs, and dropped spends
 

@@ -897,7 +897,13 @@ fn failed_electrum_sync_leaves_phase_idle_and_state_unchanged() {
     configure(&app, "tcp://127.0.0.1:9", None, &[], false);
     assert!(meta::read_meta(&data_dir).unwrap().needs_full_scan);
 
+    let (cursor, _) = diag::since(u64::MAX);
     assert!(app.sync().is_err());
+    let (_, lines) = diag::since(cursor);
+    assert!(
+        lines.iter().any(|l| l.contains("sync: failed:")),
+        "missing sync failure log in {lines:#?}"
+    );
 
     assert_eq!(app.mweb_sync_progress().phase, SyncPhase::Idle);
     assert!(meta::read_meta(&data_dir).unwrap().needs_full_scan);

@@ -5,7 +5,10 @@ use crate::error::WalletError;
 use crate::network::WalletNetwork;
 
 pub const STOP_GAP: usize = 50;
-pub const BATCH_SIZE: usize = 5;
+/// Scripts per `blockchain.scripthash.get_history` call. A warm sync re-asks
+/// for every revealed script, so a batch of 5 is one round-trip per five
+/// addresses. ElectrumX accepts 50.
+pub const BATCH_SIZE: usize = 50;
 /// Floor when Electrum has no fee estimate (or returns an unusable value).
 pub const MIN_FEE_RATE_SAT_VB: u64 = 1;
 /// Target confirmation blocks for `blockchain.estimatefee`.

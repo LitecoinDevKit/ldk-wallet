@@ -51,6 +51,8 @@ struct MockChainState {
     txs: HashMap<String, Vec<u8>>,
     proofs: HashMap<(String, usize), Result<MockMerkleProof, String>>,
     broadcast_txs: Vec<Transaction>,
+    /// Heights passed to `blockchain.block.header` (one entry per call).
+    header_calls: Vec<u32>,
 }
 
 struct MockElectrumServer {
@@ -150,6 +152,7 @@ fn handle_single_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
         }
         "blockchain.block.header" => {
             let h = params.first().and_then(Value::as_u64).unwrap_or(0) as u32;
+            st.header_calls.push(h);
             match st.headers.get(&h) {
                 Some(hdr) => json!({
                     "jsonrpc": "2.0",
@@ -921,5 +924,146 @@ fn cross_check_tip_remains_a_warning_and_does_not_fail_sync() {
     assert!(
         warning.contains("WARNING: Electrum servers disagree at height 1"),
         "unexpected warning: {warning}"
+    );
+}
+
+fn extend_chain(st: &mut MockChainState, target: u32) {
+    while st.tip_height < target {
+        let prev = *st.headers.get(&st.tip_height).expect("tip header");
+        let height = st.tip_height + 1;
+        let next = mine_testnet_header(Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: prev.block_hash(),
+            merkle_root: prev.merkle_root,
+            time: prev.time.saturating_add(600),
+            bits: easy_bits(),
+            nonce: 0,
+        });
+        st.headers.insert(height, next);
+        st.tip_height = height;
+    }
+}
+
+#[test]
+fn second_sync_does_not_refetch_a_header_for_an_anchored_tx_below_the_window() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let _window = crate::spv::narrow_header_window_for_test(4);
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x41);
+    let (mut state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+    extend_chain(&mut state, 5);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+    app.sync().expect("first sync anchors the coin");
+    assert_eq!(app.summary().unwrap().tip_height, 5);
+    assert_eq!(app.list_unspent().unwrap().len(), 1);
+
+    // The stored header would also avoid a fetch. Remove it so the skip has to
+    // come from the anchor already in the wallet.
+    let account_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+    let mut spv = crate::spv::load_spv_state(&account_dir);
+    assert!(
+        spv.verified_headers.remove(&1).is_some(),
+        "first sync should have stored the anchor header"
+    );
+    crate::spv::save_spv_state(&account_dir, &spv).unwrap();
+
+    server.update(|st| {
+        extend_chain(st, 20);
+        st.header_calls.clear();
+    });
+    app.sync().expect("second sync");
+    let calls = server.state.lock().unwrap().header_calls.clone();
+    assert!(
+        !calls.contains(&1),
+        "anchored tx below the window must not refetch its header, calls={calls:?}"
+    );
+    assert_eq!(app.list_unspent().unwrap().len(), 1);
+    assert_eq!(app.summary().unwrap().tip_height, 20);
+}
+
+#[test]
+fn pegin_repair_backs_off_after_a_dead_fallback() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x51);
+    let (state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        // Accept and never answer. Reading the request and then dropping the
+        // socket makes the client fail at once, so the repair timeout never runs.
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let missing_id = "ab".repeat(32);
+    {
+        let mut guard = app.lock_state().unwrap();
+        let st = guard.as_mut().unwrap();
+        st.litecoin_rpc_url = Some(rpc_url);
+        st.mweb.as_mut().unwrap().history.record(MwebHistoryEntry {
+            id: missing_id,
+            kind: TxKind::Pegin,
+            net_sats: -1_000_000,
+            fee_sats: Some(10_000),
+            timestamp: crate::mweb_history::now_ts(),
+            output_ids: Vec::new(),
+            input_ids: Vec::new(),
+            confirmed_height: None,
+        });
+        let data_dir = st.data_dir.clone();
+        st.mweb.as_mut().unwrap().persist(&data_dir).unwrap();
+    }
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+
+    let started = std::time::Instant::now();
+    let first = app.sync().expect("sync warns instead of failing repair");
+    let first_ms = started.elapsed().as_millis();
+    assert!(first
+        .warnings
+        .iter()
+        .any(|w| w.contains("Could not repair")));
+    assert!(
+        (1500..5000).contains(&first_ms),
+        "dead fallback should stop at the short timeout, got {first_ms} ms"
+    );
+
+    let started = std::time::Instant::now();
+    let second = app.sync().expect("second sync");
+    let second_ms = started.elapsed().as_millis();
+    assert!(second
+        .warnings
+        .iter()
+        .any(|w| w.contains("Could not repair")));
+    assert!(
+        second_ms < 1_500,
+        "a peg-in that just failed its fallbacks must not stall the next sync, got {second_ms} ms"
     );
 }

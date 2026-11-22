@@ -35,7 +35,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 22 | Error-message sanitization | Lower | Not started | | UI and logs omit stack traces and extra address or amount detail. |
 | 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
-| 25 | SPV acceptance of Electrum data | High | Done | | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
+| 25 | SPV acceptance of Electrum data | High | Done | [#37](https://github.com/LitecoinDevKit/ldk-wallet/pull/37) | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
 | 26 | Peg-out maturity on public coins | High | Not started | | A HogEx peg-out with fewer than 6 confirmations is maturing, not Ready. Ordinary unconfirmed public coins stay selectable. |
 
 ## Model and effort

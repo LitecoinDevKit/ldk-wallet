@@ -1310,3 +1310,234 @@ fn early_return_validations_leave_phases_holds_and_coins_untouched() {
     );
     assert_snap(&app, &before);
 }
+
+#[test]
+fn phase_changes_holds_and_rejections_appear_in_diagnostic_log_and_bundle() {
+    crate::discovery::go_offline_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pub_outs) = app_with_public_coins(dir.path(), &[2_000_000]);
+    let priv_id = "f1".repeat(32);
+    {
+        let mut guard = app.lock_state().unwrap();
+        let state = guard.as_mut().unwrap();
+        insert_private_coin(state, [0xf1; 32], 3_000_000, Some(0), false);
+    }
+    persist_private(&app);
+    clear_planted_job(&app);
+
+    let (cursor, _) = diag::since(u64::MAX);
+
+    // 1. SyncPass transitions: early drop resets to Idle; finish reaches Done.
+    {
+        let pass = app.sync_pass();
+        pass.electrum(true);
+        pass.mweb();
+        drop(pass);
+    }
+    {
+        let pass = app.sync_pass();
+        pass.electrum(false);
+        pass.finish();
+    }
+
+    // 2. Lock lifecycle: Loaded -> LockPending -> Locked (CheckLock and ReleaseGuard),
+    // rejected Unlock, UnlockedEmpty -> Loaded, and rejected command while Locked.
+    {
+        let mut guard = app.lock_state().unwrap();
+        app.lock();
+        assert!(guard.check_lock().is_err());
+    }
+    assert!(app.summary().is_err());
+    assert!(app
+        .unlock(UnlockRequest {
+            passphrase: "wrong passphrase".into(),
+        })
+        .is_err());
+    unlock_load(&app, dir.path());
+    {
+        let guard = app.lock_state().unwrap();
+        app.lock();
+        drop(guard);
+    }
+    unlock_load(&app, dir.path());
+
+    // 3. Holds and freeze/unfreeze commands + rejections (private and public).
+    let data_dir = account_dir(&app);
+    let priv_hold = CoinHold::take(&data_dir, vec![priv_id.clone()], &app.session).unwrap();
+    let pub_hold = CoinHold::take_public(&data_dir, vec![pub_outs[0]], &app.session).unwrap();
+
+    // Freeze while held must be rejected and logged.
+    assert!(app
+        .set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: priv_id.clone(),
+            locked: true,
+        })
+        .is_err());
+    assert!(app
+        .set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: pub_outs[0].to_string(),
+            locked: true,
+        })
+        .is_err());
+    drop(priv_hold);
+    drop(pub_hold);
+
+    // User freeze -> repeat freeze rejected -> unfreeze (private and public).
+    app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+        output_id: priv_id.clone(),
+        locked: true,
+    })
+    .unwrap();
+    assert!(app
+        .set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+            output_id: priv_id.clone(),
+            locked: true,
+        })
+        .is_err());
+    app.set_mweb_utxo_locked(SetMwebUtxoLockedRequest {
+        output_id: priv_id.clone(),
+        locked: false,
+    })
+    .unwrap();
+
+    app.set_utxo_locked(SetUtxoLockedRequest {
+        outpoint: pub_outs[0].to_string(),
+        locked: true,
+    })
+    .unwrap();
+    assert!(app
+        .set_utxo_locked(SetUtxoLockedRequest {
+            outpoint: pub_outs[0].to_string(),
+            locked: true,
+        })
+        .is_err());
+    app.set_utxo_locked(SetUtxoLockedRequest {
+        outpoint: pub_outs[0].to_string(),
+        locked: false,
+    })
+    .unwrap();
+
+    // 4. Churn command rejections (no job on disk, invalid target) + start & cancel transitions.
+    assert!(app.retry_churn().is_err());
+    assert!(app.cancel_churn().is_err());
+    assert!(app.start_churn(churn_req(&priv_id, 99, 1)).is_err());
+    app.start_churn(churn_req(&priv_id, 1, 1)).unwrap();
+    app.cancel_churn().unwrap();
+
+    let (_, lines) = diag::since(cursor);
+    let bundle = app.diagnostics("0.4.16");
+    let has = |needle: &str| {
+        lines.iter().any(|l| l.contains(needle))
+            && bundle.recent_log_lines.iter().any(|l| l.contains(needle))
+    };
+
+    // SyncPass assertions.
+    assert!(
+        has("sync-phase: Idle -> ElectrumFullScan reason=electrum full_scan"),
+        "missing ElectrumFullScan log in {lines:#?}"
+    );
+    assert!(
+        has("sync-phase: ElectrumFullScan -> MwebDownload reason=mweb download"),
+        "missing MwebDownload log in {lines:#?}"
+    );
+    assert!(
+        has("sync-phase: MwebDownload -> Idle reason=pass exited before finish"),
+        "missing SyncPass early-exit Idle log in {lines:#?}"
+    );
+    assert!(
+        has("sync-phase: Idle -> ElectrumSync reason=electrum sync")
+            && has("sync-phase: ElectrumSync -> Done reason=pass finished"),
+        "missing SyncPass finish log in {lines:#?}"
+    );
+
+    // Lock lifecycle assertions.
+    assert!(
+        has("lock-state: Loaded -> LockPending event=LockWhileHeld reason=state mutex held"),
+        "missing LockWhileHeld log in {lines:#?}"
+    );
+    assert!(
+        has("lock-state: LockPending -> Locked event=CheckLock reason=holder aborted on pending lock"),
+        "missing CheckLock log in {lines:#?}"
+    );
+    assert!(
+        has("lock-state: LockPending -> Locked event=ReleaseGuard reason=holder released state mutex"),
+        "missing ReleaseGuard log in {lines:#?}"
+    );
+    assert!(
+        has("lock-state: rejected command from=Locked reason=wallet is locked"),
+        "missing rejected command while Locked log in {lines:#?}"
+    );
+    assert!(
+        has("lock-state: rejected Unlock from=Locked reason=incorrect passphrase"),
+        "missing rejected Unlock log in {lines:#?}"
+    );
+    assert!(
+        has("lock-state: Locked -> UnlockedEmpty event=Unlock reason=passphrase verified")
+            && has(
+                "lock-state: UnlockedEmpty -> Loaded event=Load account=0 reason=account loaded"
+            ),
+        "missing Unlock/Load logs in {lines:#?}"
+    );
+
+    // CoinHold & freeze assertions.
+    assert!(
+        has(&format!(
+            "coin-hold: take kind=private coin={priv_id} session={} from=unheld to=reserved reason=in-flight spend",
+            app.session
+        )) && has(&format!(
+            "coin-hold: release kind=private coin={priv_id} from=reserved to=unheld reason=spend settled"
+        )),
+        "missing private CoinHold logs in {lines:#?}"
+    );
+    assert!(
+        has(&format!(
+            "coin-hold: take kind=public coin={} session={} from=unheld to=public_reserved reason=in-flight spend",
+            pub_outs[0], app.session
+        )) && has(&format!(
+            "coin-hold: release kind=public coin={} from=public_reserved to=unheld reason=spend settled",
+            pub_outs[0]
+        )),
+        "missing public CoinHold logs in {lines:#?}"
+    );
+    assert!(
+        has(&format!(
+            "coin-freeze: rejected kind=private coin={priv_id} from=unfrozen to=frozen"
+        )) && has(&format!(
+            "coin-freeze: phase unfrozen -> frozen kind=private coin={priv_id} reason=user freeze command"
+        )) && has(&format!(
+            "coin-freeze: phase frozen -> unfrozen kind=private coin={priv_id} reason=user freeze command"
+        )),
+        "missing private freeze logs in {lines:#?}"
+    );
+    assert!(
+        has(&format!(
+            "coin-freeze: rejected kind=public coin={} from=unfrozen to=frozen",
+            pub_outs[0]
+        )) && has(&format!(
+            "coin-freeze: phase unfrozen -> frozen kind=public coin={} reason=user freeze command",
+            pub_outs[0]
+        )) && has(&format!(
+            "coin-freeze: phase frozen -> unfrozen kind=public coin={} reason=user freeze command",
+            pub_outs[0]
+        )),
+        "missing public freeze logs in {lines:#?}"
+    );
+
+    // Self-spend command rejections & transitions.
+    assert!(
+        has("self-spend: rejected Retry job=none from=None reason=There is no self-spend to try again.")
+            && has("self-spend: rejected Cancel job=none from=None reason=There is no self-spend to cancel.")
+            && has(&format!(
+                "self-spend: rejected Start coin={priv_id} from=None"
+            )),
+        "missing self-spend command rejection logs in {lines:#?}"
+    );
+    assert!(
+        has(&format!(
+            "self-spend: phase WaitingToBroadcast -> WaitingForCover job={priv_id}"
+        )) && has(&format!(
+            "self-spend: phase WaitingForCover -> Cancelled job={priv_id}"
+        )),
+        "missing self-spend phase transition logs in {lines:#?}"
+    );
+}

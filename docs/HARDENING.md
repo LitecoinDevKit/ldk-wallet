@@ -4,9 +4,9 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. Logging for phase changes, holds and rejections (item 15).
-2. Untrusted input bounds (item 19).
-3. Backup and restore round-trips (item 20).
+1. Untrusted input bounds (item 19).
+2. Backup and restore round-trips (item 20).
+3. Static analysis expansion (item 21).
 
 ## Status
 
@@ -26,7 +26,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 12 | `docs/MWEB_E2E.md` as a pre-release gate | Process | Not started | | |
 | 13 | Review notes for holds vs freezes and the lock lifecycle | Process | Not started | | |
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
-| 15 | Logging for phase changes, holds and rejections | Observability | Not started | | The reported sync phase is now trustworthy (#25). Redaction is in `redact.rs` (item 16). |
+| 15 | Logging for phase changes, holds and rejections | Observability | Done | [#36](https://github.com/LitecoinDevKit/ldk-wallet/pull/36) | `churn::transition`, `SyncPass`, `WalletApp` lock lifecycle, `mweb_frozen` holds, and freeze/churn command rejections log job/coin IDs, `from`/`to`, and `reason` via `diag::log` (`redact::scrub_log_line`). |
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
 | 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. |
 | 18 | Transaction construction and value invariants | High | Done | [#34](https://github.com/LitecoinDevKit/ldk-wallet/pull/34) | `tx_invariants.rs` (`MAX_MONEY` checked math, `LitecoinDustCoinSelection` at 30 sat/vB, public/MWEB recipient script guards, coin-ID deduplication, post-build shape/conservation verifiers); direct peg-in PSBT construction without temporary `lock_outpoint`; post-sign index persistence; LitVM replacement target verifier; `ui/src/amounts.ts` + `scripts/amounts.test.mjs`; MWEB commitment/stealth/bulletproof/rewind verifier and seeded property tests. |
@@ -132,6 +132,9 @@ These are the only three generated diagrams (`churn-transitions`, `lock-transiti
 ## Observability
 
 **15.** Log phase changes, hold take and release, and transition rejections with the job or coin id, from and to, and the reason, so support bundles and post-mortems are useful. Those logs follow the redaction rules in item 16.
+- `churn::transition` (`crates/wallet-core/src/churn.rs`) logs every accepted self-spend phase change (`self-spend: phase <from> -> <to> job=<origin_id> coin=<current_id> event=<kind> reason=<reason>`) and every rejected transition (`self-spend: rejected <kind> job=<origin_id> coin=<current_id> from=<from> reason=<err>`), and `start_churn`, `retry_churn`, and `cancel_churn` log pre-transition command rejections.
+- `mweb_frozen` (`crates/wallet-core/src/mweb_frozen.rs`) logs private and public in-flight hold takes (`coin-hold: take`), releases (`coin-hold: release`), stale-session sweeps (`reason=stale session`), and double-reserve/frozen-coin rejections (`coin-hold: rejected reserve`) with the coin or outpoint ID, session, `from`/`to`, and reason.
+- `SyncPass`, `WalletApp` lock lifecycle (`unlock`, `load_locked`, `create_or_restore`, `activate_parked`, `lock`, `StateGuard::check_lock`, `StateGuard::drop`), and `set_private_freeze` / `set_public_freeze` (`crates/wallet-core/src/app.rs`) log sync-phase transitions (including early-drop resets to `Idle`), lock-state transitions and rejections, and user freeze/unfreeze changes and rejections, all routed through `diag::log` (`redact::scrub_log_line`) and pinned by tests in `churn.rs`, `mweb_frozen.rs`, `error_path_tests.rs`, and `tests/secret_hygiene.rs`.
 
 ## Secrets, persistence, and value
 

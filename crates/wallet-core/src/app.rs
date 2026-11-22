@@ -341,12 +341,21 @@ fn install_loaded(
     mut state: WalletState,
 ) -> Result<WalletSummary, WalletError> {
     let summary = build_summary(&mut state)?;
+    let from = if guard.is_some() {
+        "Loaded"
+    } else {
+        "UnlockedEmpty"
+    };
+    let account_index = state.account_index;
     if let Some(prev) = guard.take() {
         if prev.account_index != state.account_index {
             park.insert(prev);
         }
     }
     *guard = Some(state);
+    diag::log(format!(
+        "lock-state: {from} -> Loaded event=Load account={account_index} reason=account loaded"
+    ));
     Ok(summary)
 }
 
@@ -363,11 +372,19 @@ fn activate_parked(
     let Some(mut state) = park.take(index) else {
         return Ok(None);
     };
+    let from = if guard.is_some() {
+        "Loaded"
+    } else {
+        "UnlockedEmpty"
+    };
     if let Some(prev) = guard.take() {
         park.insert(prev);
     }
     let summary = build_summary(&mut state)?;
     *guard = Some(state);
+    diag::log(format!(
+        "lock-state: {from} -> Loaded event=Load account={index} reason=parked account activated"
+    ));
     Ok(Some(summary))
 }
 
@@ -381,32 +398,35 @@ struct SyncPass<'a> {
 
 impl SyncPass<'_> {
     fn electrum(&self, full_scan: bool) {
-        self.set(if full_scan {
-            SyncPhase::ElectrumFullScan
+        if full_scan {
+            self.set(SyncPhase::ElectrumFullScan, "electrum full_scan");
         } else {
-            SyncPhase::ElectrumSync
-        });
+            self.set(SyncPhase::ElectrumSync, "electrum sync");
+        }
     }
 
     fn mweb(&self) {
-        self.set(SyncPhase::MwebDownload);
+        self.set(SyncPhase::MwebDownload, "mweb download");
     }
 
     /// Done stays visible until the next pass starts.
     fn finish(mut self) {
-        self.set(SyncPhase::Done);
+        self.set(SyncPhase::Done, "pass finished");
         self.finished = true;
     }
 
-    fn set(&self, phase: SyncPhase) {
-        self.phase.store(phase.as_u8(), Ordering::Relaxed);
+    fn set(&self, phase: SyncPhase, reason: &str) {
+        let from = SyncPhase::from_u8(self.phase.swap(phase.as_u8(), Ordering::Relaxed));
+        if from != phase {
+            diag::log(format!("sync-phase: {from:?} -> {phase:?} reason={reason}"));
+        }
     }
 }
 
 impl Drop for SyncPass<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.set(SyncPhase::Idle);
+            self.set(SyncPhase::Idle, "pass exited before finish");
         }
     }
 }
@@ -881,7 +901,20 @@ impl WalletApp {
     }
 
     pub fn unlock(&self, req: UnlockRequest) -> Result<(), WalletError> {
-        self.secrets.unlock(&req.passphrase)
+        match self.secrets.unlock(&req.passphrase) {
+            Ok(()) => {
+                diag::log(
+                    "lock-state: Locked -> UnlockedEmpty event=Unlock reason=passphrase verified",
+                );
+                Ok(())
+            }
+            Err(err) => {
+                diag::log(format!(
+                    "lock-state: rejected Unlock from=Locked reason={err}"
+                ));
+                Err(err)
+            }
+        }
     }
 
     /// Re-verify the wallet passphrase and return the stored recovery secret for display.
@@ -917,6 +950,8 @@ impl WalletApp {
     ///
     /// Does **not** block on an in-flight sync.
     pub fn lock(&self) {
+        let was_unlocked = !self.secrets.is_locked();
+        let had_pending = self.pending_lock.load(Ordering::Acquire);
         self.secrets.lock();
         self.clear_insights();
         self.pending_lock.store(true, Ordering::Release);
@@ -925,16 +960,36 @@ impl WalletApp {
         self.clear_park();
         match self.state.try_lock() {
             Ok(mut guard) => {
-                *guard = None;
+                let had_loaded = guard.take().is_some();
                 self.pending_lock.store(false, Ordering::Release);
+                if had_loaded {
+                    let from = if had_pending { "LockPending" } else { "Loaded" };
+                    diag::log(format!(
+                        "lock-state: {from} -> Locked event=Lock reason=lock requested"
+                    ));
+                } else if was_unlocked {
+                    diag::log(
+                        "lock-state: UnlockedEmpty -> Locked event=Lock reason=lock requested",
+                    );
+                }
             }
             Err(TryLockError::WouldBlock) => {
                 // A holder has the state and drops it on release; secrets are already cleared.
+                diag::log(
+                    "lock-state: Loaded -> LockPending event=LockWhileHeld reason=state mutex held",
+                );
             }
             Err(TryLockError::Poisoned(poisoned)) => {
                 let mut guard = poisoned.into_inner();
-                *guard = None;
+                let had_loaded = guard.take().is_some();
                 self.pending_lock.store(false, Ordering::Release);
+                if had_loaded {
+                    diag::log("lock-state: Loaded -> Locked event=Lock reason=lock requested");
+                } else if was_unlocked {
+                    diag::log(
+                        "lock-state: UnlockedEmpty -> Locked event=Lock reason=lock requested",
+                    );
+                }
             }
         }
     }
@@ -2343,7 +2398,13 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let (info, frozen, job_active, from_pegin) = churn_start_facts(state, &req.output_id)?;
+        let coin = req.output_id.trim();
+        let (info, frozen, job_active, from_pegin) = churn_start_facts(state, &req.output_id)
+            .inspect_err(|err| {
+                diag::log(format!(
+                    "self-spend: rejected Start coin={coin} from=None reason={err}"
+                ));
+            })?;
         let target = churn::check_start(&churn::StartCheck {
             mature: info.mature,
             frozen,
@@ -2351,8 +2412,17 @@ impl WalletApp {
             fee_sats: DEFAULT_MWEB_FEE_SATS,
             job_active,
             target_depth: req.target_depth,
+        })
+        .inspect_err(|err| {
+            diag::log(format!(
+                "self-spend: rejected Start coin={coin} from=None reason={err}"
+            ));
         })?;
-        let cover_min = churn::normalize_cover_min(req.cover_min)?;
+        let cover_min = churn::normalize_cover_min(req.cover_min).inspect_err(|err| {
+            diag::log(format!(
+                "self-spend: rejected Start coin={coin} from=None reason={err}"
+            ));
+        })?;
         let mut job = churn::new_job(
             &req.output_id,
             from_pegin || info.is_pegin,
@@ -2397,8 +2467,13 @@ impl WalletApp {
         // The load path also does this. Retry can run on a state that was already
         // open when the armed hop expired, so it has to reconcile before it signs.
         undo_expired_local(state)?;
-        let mut job = churn::read_job(&state.data_dir)?
-            .ok_or_else(|| WalletError::BuildTx("There is no self-spend to try again.".into()))?;
+        let mut job = churn::read_job(&state.data_dir)?.ok_or_else(|| {
+            let msg = "There is no self-spend to try again.";
+            diag::log(format!(
+                "self-spend: rejected Retry job=none from=None reason={msg}"
+            ));
+            WalletError::BuildTx(msg.into())
+        })?;
         churn::request_retry(&mut job)?;
         if job.needs_resign {
             resign_one_hop(state, &mut job)?;
@@ -2415,8 +2490,13 @@ impl WalletApp {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        let mut job = churn::read_job(&state.data_dir)?
-            .ok_or_else(|| WalletError::BuildTx("There is no self-spend to cancel.".into()))?;
+        let mut job = churn::read_job(&state.data_dir)?.ok_or_else(|| {
+            let msg = "There is no self-spend to cancel.";
+            diag::log(format!(
+                "self-spend: rejected Cancel job=none from=None reason={msg}"
+            ));
+            WalletError::BuildTx(msg.into())
+        })?;
         let shown = job.current_output_id.clone();
         // Reject the transition before recalling the hop. Cancel only changes the
         // phase, so a refusal leaves the coin store and the freeze file alone.
@@ -2564,14 +2644,23 @@ impl WalletApp {
                 return Err(e);
             }
         };
+        let from = if guard.is_some() {
+            "Loaded"
+        } else {
+            "UnlockedEmpty"
+        };
         self.publish_insights(&state);
         self.clear_park();
         *guard = Some(state);
+        diag::log(format!(
+            "lock-state: {from} -> Loaded event=Load account=0 reason=wallet created or restored"
+        ));
         Ok(summary)
     }
 
     fn ensure_unlocked(&self) -> Result<(), WalletError> {
         if self.secrets.is_locked() {
+            diag::log("lock-state: rejected command from=Locked reason=wallet is locked");
             Err(WalletError::Locked)
         } else {
             Ok(())
@@ -2585,6 +2674,12 @@ impl WalletApp {
             inner: self.lock_state_raw()?,
             app: self,
         };
+        if guard.inner.is_none()
+            && !self.pending_lock.load(Ordering::Acquire)
+            && self.secrets.is_locked()
+        {
+            diag::log("lock-state: rejected acquire from=Locked reason=wallet is locked");
+        }
         guard.check_lock()?;
         Ok(guard)
     }
@@ -2704,8 +2799,14 @@ impl StateGuard<'_> {
         if !self.app.lock_requested() {
             return Ok(());
         }
+        let had_pending = self.inner.is_some() || self.app.pending_lock.load(Ordering::Acquire);
         *self.inner = None;
         self.app.finish_lock();
+        if had_pending {
+            diag::log(
+                "lock-state: LockPending -> Locked event=CheckLock reason=holder aborted on pending lock",
+            );
+        }
         Err(WalletError::Locked)
     }
 }
@@ -2727,8 +2828,14 @@ impl std::ops::DerefMut for StateGuard<'_> {
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
         if self.app.lock_requested() {
+            let had_pending = self.inner.is_some() || self.app.pending_lock.load(Ordering::Acquire);
             *self.inner = None;
             self.app.finish_lock();
+            if had_pending {
+                diag::log(
+                    "lock-state: LockPending -> Locked event=ReleaseGuard reason=holder released state mutex",
+                );
+            }
         }
     }
 }
@@ -4793,8 +4900,21 @@ fn set_private_freeze(
     state: &WalletState,
     req: SetMwebUtxoLockedRequest,
 ) -> Result<(), WalletError> {
-    refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked)?;
-    refuse_reserved(&state.data_dir, &req.output_id)?;
+    let target = if req.locked { "frozen" } else { "unfrozen" };
+    let from = if req.locked { "unfrozen" } else { "frozen" };
+    let coin = req.output_id.trim();
+    if let Err(err) = refuse_churn_unfreeze(&state.data_dir, &req.output_id, req.locked) {
+        diag::log(format!(
+            "coin-freeze: rejected kind=private coin={coin} from={from} to={target} reason={err}"
+        ));
+        return Err(err);
+    }
+    if let Err(err) = refuse_reserved(&state.data_dir, &req.output_id) {
+        diag::log(format!(
+            "coin-freeze: rejected kind=private coin={coin} from={from} to={target} reason={err}"
+        ));
+        return Err(err);
+    }
     if let Some(mweb) = state.mweb.as_ref() {
         if let Ok(id) = mweb_frozen::normalize_output_id(&req.output_id) {
             let tip = state.wallet.latest_checkpoint().height();
@@ -4803,12 +4923,22 @@ fn set_private_freeze(
                 .find(|row| row.output_id == id)
             {
                 if let Err(msg) = refuse_freeze_flag(req.locked, row.actions) {
+                    diag::log(format!(
+                        "coin-freeze: rejected kind=private coin={id} from={:?} to={target} reason={msg}",
+                        row.status
+                    ));
                     return Err(WalletError::Mweb(msg));
                 }
             }
         }
     }
-    mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)
+    mweb_frozen::set_locked(&state.data_dir, &req.output_id, req.locked)?;
+    if let Ok(id) = mweb_frozen::normalize_output_id(&req.output_id) {
+        diag::log(format!(
+            "coin-freeze: phase {from} -> {target} kind=private coin={id} reason=user freeze command"
+        ));
+    }
+    Ok(())
 }
 
 /// Freeze or unfreeze a public coin. An outpoint that is not in the listing
@@ -4817,13 +4947,29 @@ fn set_public_freeze(
     state: &mut WalletState,
     req: SetUtxoLockedRequest,
 ) -> Result<(), WalletError> {
-    let outpoint = parse_outpoint(&req.outpoint)?;
-    refuse_reserved_public(&state.data_dir, outpoint)?;
+    let target = if req.locked { "frozen" } else { "unfrozen" };
+    let from = if req.locked { "unfrozen" } else { "frozen" };
+    let outpoint = parse_outpoint(&req.outpoint).inspect_err(|err| {
+        diag::log(format!(
+            "coin-freeze: rejected kind=public coin={} from={from} to={target} reason={err}",
+            req.outpoint.trim()
+        ));
+    })?;
+    if let Err(err) = refuse_reserved_public(&state.data_dir, outpoint) {
+        diag::log(format!(
+            "coin-freeze: rejected kind=public coin={outpoint} from={from} to={target} reason={err}"
+        ));
+        return Err(err);
+    }
     if let Some(row) = collect_unspent(state)
         .into_iter()
         .find(|row| row.outpoint == outpoint.to_string())
     {
         if let Err(msg) = refuse_freeze_flag(req.locked, row.actions) {
+            diag::log(format!(
+                "coin-freeze: rejected kind=public coin={outpoint} from={:?} to={target} reason={msg}",
+                row.status
+            ));
             return Err(WalletError::BuildTx(msg));
         }
     }
@@ -4836,6 +4982,9 @@ fn set_public_freeze(
         .wallet
         .persist(&mut state.db)
         .map_err(|e| WalletError::Persist(e.to_string()))?;
+    diag::log(format!(
+        "coin-freeze: phase {from} -> {target} kind=public coin={outpoint} reason=user freeze command"
+    ));
     Ok(())
 }
 

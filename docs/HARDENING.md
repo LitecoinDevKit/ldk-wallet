@@ -6,6 +6,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 1. Peg-out maturity on public coins (item 26).
 2. Untrusted input bounds (item 19).
+3. After item 20: adversarial MWEB peers (item 27) and cross-layer reorg unwind (item 28). Dropped unconfirmed transparent spends (item 29) follows those. macOS full-disk flush (item 30) stays lower.
 
 ## Status
 
@@ -27,7 +28,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 14 | Keep `docs/AUDIT_NOTES.md` and `SECURITY.md` current | Process | Ongoing | | Never claim the wallet is audited. |
 | 15 | Logging for phase changes, holds and rejections | Observability | Done | [#36](https://github.com/LitecoinDevKit/ldk-wallet/pull/36) | `churn::transition`, `SyncPass`, `WalletApp` lock lifecycle, `mweb_frozen` holds, and freeze/churn command rejections log job/coin IDs, `from`/`to`, and `reason` via `diag::log` (`redact::scrub_log_line`). |
 | 16 | Secret hygiene and zeroization | High | Done | [#32](https://github.com/LitecoinDevKit/ldk-wallet/pull/32) | `Zeroizing` and `Drop` across secrets, signers, sealing keys, and armed hops; `redact::scrub_log_line` on `diag::log` and errors; redacted `Debug` and source guard in `secret_hygiene.rs` + `scripts/secret-hygiene.test.mjs`. |
-| 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. |
+| 17 | Persistence atomicity and crash recovery | High | Done | [#33](https://github.com/LitecoinDevKit/ldk-wallet/pull/33) | Temp-file + `sync_all` + rename across secret, sealed, churn, hold, metadata, sidecar, LitVM, and CLI writers; v2 seal-counter enforcement and fail-closed `MwebRuntime::open`; `db.restore_spent` fix on recalled coins; `reconcile_churn_on_load` and reorg/resync recovery pinned by `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. Windows CI already runs these tests; macOS `F_FULLFSYNC` is item 30. |
 | 18 | Transaction construction and value invariants | High | Done | [#34](https://github.com/LitecoinDevKit/ldk-wallet/pull/34) | `tx_invariants.rs` (`MAX_MONEY` checked math, `LitecoinDustCoinSelection` at 30 sat/vB, public/MWEB recipient script guards, coin-ID deduplication, post-build shape/conservation verifiers); direct peg-in PSBT construction without temporary `lock_outpoint`; post-sign index persistence; LitVM replacement target verifier; `ui/src/amounts.ts` + `scripts/amounts.test.mjs`; MWEB commitment/stealth/bulletproof/rewind verifier and seeded property tests. |
 | 19 | Untrusted input bounds | Medium | Not started | | Size, timeout, and structure limits. Includes Electrum notification spam, server-sent requests, and truncated local JSON. Refines item 10. Merkle and header validity are item 25. |
 | 20 | Backup and restore round-trips | Medium | Not started | | Seed plus metadata restores the same spendable set. Also open a frozen file from each on-disk generation. |
@@ -37,10 +38,14 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
 | 25 | SPV acceptance of Electrum data | High | Done | [#37](https://github.com/LitecoinDevKit/ldk-wallet/pull/37) | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
 | 26 | Peg-out maturity on public coins | High | Not started | | A HogEx peg-out with fewer than 6 confirmations is maturing, not Ready. Ordinary unconfirmed public coins stay selectable. |
+| 27 | Adversarial MWEB peer | High | Not started | | A disagreeing second peer warns and does not mark the balance complete. A failed HogEx anchor leaves coins and history unchanged and goes stale. Withheld leaves stay the O2 warning, including when the second peer is unreachable. LIP-0006 verification stays in `bdk_mweb`. |
+| 28 | Cross-layer reorg unwind | High | Not started | | A reorg that un-mines a peg-in, a peg-out, or a scored churn hop unwinds transparent coins, MWEB coins, history, holds, and churn depth together. Item 17 only unconfirms MWEB history above the wallet tip. |
+| 29 | Dropped unconfirmed transparent spends | Medium | Not started | | A peg-in or public spend that has left the mempool releases its inputs. Release needs own-node absence, a conflicting confirmed spend, or a 48h-style timeout. A server that merely omits a peg-in still cannot resurrect it. RBF is out of scope. |
+| 30 | macOS full-disk flush | Lower | Not started | | `F_FULLFSYNC` after `sync_all` on secret and sealed writers. A rename onto an open target fails closed and leaves the previous bytes. No new CI job. |
 
 ## Model and effort
 
-How to staff items 6–26. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
+How to staff items 6–30. Planning is Cursor chat or plan mode. Implementation is agent mode that writes the tests and code.
 
 - **Carbon:** Gemini 4 Carbon, or an equivalent high-reasoning model.
 - **Argon:** Gemini 4 Argon, or another strong coding model.
@@ -71,8 +76,12 @@ Effort is Low, Medium, or High, relative to the size of the change and the reaso
 | 24 | Release SBOM | Light · Low | Light · Low | On top of the supply-chain CI already in place. |
 | 25 | SPV acceptance of Electrum data | Carbon · Medium | Argon · Medium–High | Plan the proof and header cases. Implementation is failing tests, then a verifier that rejects them before a coin is confirmed. |
 | 26 | Peg-out maturity on public coins | Argon · Low–Medium | Argon · Medium | Failing test first. Status flags gain maturing. The 6-block boundary is the off-by-one to get right. |
+| 27 | Adversarial MWEB peer | Carbon · Medium | Argon · Medium–High | Pin the wallet's reaction to a disagreeing peer, a failed HogEx anchor, and withheld leaves. LIP-0006 verification stays in `bdk_mweb`. |
+| 28 | Cross-layer reorg unwind | Carbon · Medium–High | Argon · High | Failing tests first for an un-mined peg-in, peg-out, and scored churn hop. Transparent state, MWEB state, and churn depth move together. |
+| 29 | Dropped unconfirmed transparent spends | Carbon · Medium | Argon · Medium–High | Release needs own-node absence, a conflicting confirmed spend, or a 48h-style timeout. A server omitting a peg-in still cannot resurrect it. RBF is out of scope. |
+| 30 | macOS full-disk flush | Light · Low | Argon · Low–Medium | `F_FULLFSYNC` after `sync_all` on secret and sealed writers. A rename onto an open target fails closed. No new CI job. |
 
-Plan items 16, 17, 18, and 25 with Carbon. Items 11 and 19 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
+Plan items 16, 17, 18, 25, 27, and 28 with Carbon. Items 11, 19, and 29 also benefit from Carbon when the failure cases or the threat model are the hard part. Use Argon for almost all implementation, and for planning the rest. Use a light model for process, CI wiring, and documentation. Carbon stays on the fund-safety items, where multi-step adversarial reasoning pays off. A strong coding model writes the PRs.
 
 ## Already planned
 
@@ -147,7 +156,7 @@ These are the only three generated diagrams (`churn-transitions`, `lock-transiti
 - `fs_atomic` (`write_atomic`, `write_atomic_0600`, `sweep_temp_files` in `crates/wallet-core/src/fs_atomic.rs`), plus atomic `0600` temp-file + `sync_all` + rename in `crates/wallet-litvm/src/settings.rs` and `crates/wallet-cli/src/main.rs`, replace in-place truncation across `wallet.mnemonic.enc`, `mweb_*.enc`, `mweb_seal_counter.txt`, `churn_job.json`, `churn_armed.json`, `churn_depth.json`, `mweb_frozen.json`, `wallet_meta.json`, `accounts.json`, and metadata sidecars. Leftover `*.tmp.*` files are swept on `load` and `wipe`.
 - `MwebRuntime::open` enforces `mweb_seal_counter.txt` (`open_changeset_with_context` and `open_with_context_at_least`), rejects legacy v1 downgrades once upgraded, and rejects a `>1` counter spread across the four sealed blobs while recovering cleanly from a `{C, C+1}` mid-persist cut (`Index -> Coins -> History -> SyncState -> save_seal_counter`). `open_wallet_state` and `create_or_restore` propagate `MwebRuntime::open` errors instead of silently loading with `mweb: None`.
 - Fixed a persistence bug in `mweb::recall_unlanded_spend` and `mweb::restore_stale_unconfirmed_inputs`: both called `db.insert(coin)` instead of `db.restore_spent(&id)`, which omitted `id` from `ChangeSet.restored` so `ChangeSet::merge` discarded the recall on `persist` and left cancelled, expired, or dropped-spend coins marked spent in `mweb_coins.enc` after restart.
-- `reconcile_churn_on_load` (plus idempotent `churn::inherit_depth`, `churn::revert_depth`, and `churn::commit_score`), `reconcile_mweb_chain_with_wallet`, `resync_mweb` pre-wipe `needs_mweb_scan` persistence, and cross-account stale-hold cleanup recover cleanly from process aborts and `SIGKILL` across `crash_recovery_tests.rs` and `crates/wallet-core/tests/crash_recovery.rs`.
+- `reconcile_churn_on_load` (plus idempotent `churn::inherit_depth`, `churn::revert_depth`, and `churn::commit_score`), `reconcile_mweb_chain_with_wallet`, `resync_mweb` pre-wipe `needs_mweb_scan` persistence, and cross-account stale-hold cleanup recover cleanly from process aborts and `SIGKILL` across `crash_recovery_tests.rs` and `crates/wallet-core/tests/crash_recovery.rs`. Windows CI already runs these tests; macOS `F_FULLFSYNC` is item 30.
 
 **18. Transaction construction and value invariants.** Checked arithmetic on amounts and fees, dust limits, and change selection. Constructed transactions, especially peg-in and peg-out, meet the expected shape and do not leave a stuck or attacker-spendable output when the path returns an error. MWEB commitment and kernel balance sit here, beside the coin-status tests.
 - `tx_invariants` (`crates/wallet-core/src/tx_invariants.rs`) enforces `MAX_MONEY` (`84,000,000` LTC) checked addition/summation, fee-rate bounds (`1..=100,000` sat/vB), deduplicating coin-control normalizers, `validate_public_recipient` (rejecting MWEB stealth addresses whose `script_pubkey()` is empty and witness v8/v9 bridge scripts on both normal and `drain` sends), `validate_mweb_recipient`, and post-construction shape/conservation verifiers (`verify_transparent_psbt`, `verify_pegin_tx`, `verify_mweb_spend_tx`).
@@ -198,3 +207,27 @@ Done. `crates/wallet-core/src/spv.rs` replaces `bdk_electrum`'s `full_scan` and 
 Tests use a thread-local regtest proof-of-work override (`spv::easy_pow_for_test`) so mock chains mine in a hash or two. Residuals are in `docs/AUDIT_NOTES.md`.
 
 **26. Peg-out maturity on public coins.** Litecoin consensus will not spend a HogEx peg-out until 6 confirmations (`PEGOUT_MATURITY` in Electrum-LTC `electrum/bitcoin.py`, and `CanonicalTxOut::is_mature` in `bdk`). `collect_unspent` never asks `is_mature`. `public_coin_status` marks any public coin with one or more confirmations Ready and selectable, so a peg-out at 1–5 confirmations offers spend. Those coins are maturing: spend buttons off, through the same flag path private maturing coins already use. Update `AGENTS.md` in that PR so the public status list includes maturing. An ordinary unconfirmed public coin stays selectable, as item 4 pinned. Coinbase outputs follow the same `is_mature` check (100 confirmations) so the rule is not a peg-out special case. The boundary is `tip - confirmation_height + 1 >= maturity`.
+
+## MWEB peers, reorgs, and dropped spends
+
+These follow items 19 and 20. They do not jump ahead of item 26. Item 19 still owns size, timeout, and structure limits on MWEB peer messages. HogEx anchoring and peer frame caps stay in `bdk_mweb` (`VerifyMode::Anchored`, audit notes in `docs/AUDIT_NOTES.md`). This repo does not reimplement LIP-0006 verification.
+
+**27. Adversarial MWEB peer.** The MWEB analogue of item 25. Item 5 covers a dead or unreachable peer. `MwebRuntime::cross_check_leafset` in `crates/wallet-core/src/mweb.rs` asks up to two peers for the header at the tip and checks the synced leafset against each `leafset_root`. Disagreement sets `cross_check_warning` and returns. Agreement, or no second peer, only appends to `last_status`. There is no test.
+
+A second peer whose `leafset_root` or `output_mmr_size` disagrees must warn, and that warning must keep the first peer's leafset from being treated as a complete balance. A sync that fails HogEx anchoring (the peer's MWEB header is not bound to the block) must leave the coin store and history unchanged and mark MWEB stale. Withheld UTXO leaves are audit note O2: omission is a warning today. Pin that warning, including the path where the second peer is unreachable (`cross-check unavailable`). LIP-0006 proofs, Bulletproofs, and HogEx commitment checks stay in `bdk_mweb`.
+
+**28. Cross-layer reorg unwind.** Item 17's `crash_mid_reorg_sync_and_resync_mweb_and_cross_account_holds_recover_on_restart` checks that MWEB history confirmed above the wallet tip is unconfirmed on load and that stale holds are swept. `WalletApp::sync` calls `mweb.disconnect_from` when the tip height falls, and `reconcile_mweb_chain_with_wallet` when the MWEB tip hash disagrees with the wallet chain. `disconnect_from` rewinds the MWEB store, drops the leafset, and clears `confirmed_height`. `churn::commit_score` only increases `non_solo_blocks`. A reorg that un-mines a scored hop leaves that depth counted.
+
+Failing tests first, one reorg each:
+
+- A confirmed peg-in leaves the chain. The public input is spendable again, the private peg-in coin is gone, and the history row is unconfirmed.
+- A confirmed peg-out leaves the chain. The HogEx output is gone and the private input is restored.
+- A scored churn hop leaves the chain. Depth, in-flight holds, and the churn phase unwind with the chain.
+
+Transparent state, MWEB state, and churn depth move together. If they cannot, the sync fails closed and persists nothing from that pass.
+
+**29. Dropped unconfirmed transparent spends.** Item 18 pins dust and the minimum fee. LitVM EIP-1559 replacement is separate. An unconfirmed MWEB spend reverts after 48 hours (`UNCONFIRMED_MWEB_REVERT_SECS` in `crates/wallet-core/src/mweb.rs`). Transparent peg-ins are kept on purpose: `pegin_txids` in `crates/wallet-core/src/app.rs` and `merge_protected` in `crates/wallet-core/src/spv.rs` are never evicted, and a spend of our own outputs stays when the server omits it. That stops a server from resurrecting inputs by hiding a peg-in. Audit note O14 (a kept spend with an invalid signature) stays that finding.
+
+The gap is a peg-in or public spend that has left the mempool, after a fee spike or a long unconfirmed window, and remains spent in the local graph. The release rule is stronger than "this Electrum server did not list it": the wallet's own node reports it absent, a conflicting spend is confirmed, or a timeout in the same family as the 48-hour MWEB revert has passed. Fee bumping and RBF are out of scope.
+
+**30. macOS full-disk flush.** `fs_atomic` (`crates/wallet-core/src/fs_atomic.rs`) flushes with `File::sync_all`, which is `fsync`. On macOS that returns before the drive cache is flushed. Secret and sealed writers (`write_atomic_0600`, and the same pattern in `crates/wallet-litvm/src/settings.rs` and `crates/wallet-cli/src/main.rs`) call `F_FULLFSYNC` after `sync_all`. A rename onto a path another handle holds open fails closed and leaves the previous bytes in place, which is the Windows sharing and antivirus case. The Windows `rust-windows` job already runs `crash_recovery_tests.rs` and `tests/crash_recovery.rs`. No new CI job.

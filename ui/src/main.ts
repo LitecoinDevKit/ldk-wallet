@@ -222,9 +222,11 @@ type UtxoRecord = {
   amount_sats: number;
   keychain: string;
   confirmations: number;
+  mature?: boolean;
+  maturity_blocks_left?: number;
   locked: boolean;
   label?: string;
-  /** From `public_coin_status`: sending, pending, frozen or ready. */
+  /** From `public_coin_status`: sending, pending, maturing, frozen or ready. */
   status: CoinStatus;
   actions: CoinActions;
 };
@@ -6175,15 +6177,17 @@ function mwebRowChip(coin: MwebUtxoRecord, justSpent: boolean): RowChip | null {
   return COIN_CHIPS[coin.status] ?? null;
 }
 
-/** The status chip for a public row: Sending or Frozen, else none (the line says pending). */
+/** The status chip for a public row: Sending, Maturing or Frozen, else none (the line says pending). */
 function publicRowChip(utxo: UtxoRecord): RowChip | null {
   if (utxo.status === "sending") return COIN_CHIPS.sending ?? null;
+  if (utxo.status === "maturing") return COIN_CHIPS.maturing ?? null;
   if (utxo.actions.blocked?.kind === "frozen") return COIN_CHIPS.frozen ?? null;
   return null;
 }
 
 function publicRowClass(utxo: UtxoRecord): string | null {
   if (utxo.status === "sending") return "is-pending";
+  if (utxo.status === "maturing") return "is-maturing";
   if (utxo.actions.blocked?.kind === "frozen") return "is-frozen";
   return null;
 }
@@ -6197,6 +6201,10 @@ function publicConfLabel(utxo: UtxoRecord): string {
 function publicRowStatusLine(utxo: UtxoRecord): string {
   if (utxo.status === "sending") return "Sending · waiting for the broadcast";
   const kind = utxo.keychain === "internal" ? "change" : "receive";
+  if (utxo.status === "maturing") {
+    const left = utxo.maturity_blocks_left ?? 0;
+    return `${kind} · Maturing · ${left} block${left === 1 ? "" : "s"} left`;
+  }
   return `${kind} · ${publicConfLabel(utxo)}`;
 }
 

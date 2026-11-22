@@ -3592,14 +3592,81 @@ fn auto_pegin_transparent_fee(
     Ok(rate.saturating_mul(estimated_vb).max(500))
 }
 
+fn utxo_confirmations(
+    pos: &ChainPosition<bdk_wallet::chain::ConfirmationBlockTime>,
+    tip: u32,
+) -> u32 {
+    match pos {
+        ChainPosition::Confirmed { anchor, .. } => {
+            tip.saturating_sub(anchor.block_id.height).saturating_add(1)
+        }
+        ChainPosition::Unconfirmed { .. } => 0,
+    }
+}
+
+/// Litecoin consensus maturity for a transparent outpoint (`CanonicalTxOut::is_mature`).
+///
+/// Ordinary outputs are always mature (`(true, 0)`), including while unconfirmed. HogEx peg-out
+/// outputs require `PEGOUT_MATURITY` (6) confirmations and coinbase outputs require
+/// `COINBASE_MATURITY` (100) confirmations (`tip - conf_height + 1 >= maturity`).
+fn public_utxo_maturity(
+    wallet: &PersistedWallet<Connection>,
+    outpoint: OutPoint,
+    tip: u32,
+    confirmations: u32,
+) -> (bool, u32) {
+    let Some(txo) = wallet.canonical_view().txout(outpoint) else {
+        return (true, 0);
+    };
+    let mature = txo.is_mature(tip);
+    if mature {
+        return (true, 0);
+    }
+    let maturity = if txo.is_on_coinbase {
+        bdk_wallet::bitcoin::constants::COINBASE_MATURITY
+    } else if txo.is_hogex_pegout {
+        bdk_wallet::chain::PEGOUT_MATURITY
+    } else {
+        1
+    };
+    (false, maturity.saturating_sub(confirmations).max(1))
+}
+
+fn refuse_immature_public(
+    wallet: &PersistedWallet<Connection>,
+    outpoint: OutPoint,
+    tip: u32,
+    confirmations: u32,
+) -> Result<(), WalletError> {
+    let (mature, blocks_left) = public_utxo_maturity(wallet, outpoint, tip, confirmations);
+    if mature {
+        return Ok(());
+    }
+    let block = if confirmations == 0 {
+        crate::dto::CoinBlock::Unconfirmed
+    } else {
+        crate::dto::CoinBlock::Maturing { blocks_left }
+    };
+    Err(WalletError::BuildTx(format!(
+        "selected outpoint {outpoint}: {}",
+        mweb::coin_block_message(block)
+    )))
+}
+
 fn selectable_public_utxo_amounts(
     state: &WalletState,
     held: &std::collections::BTreeSet<OutPoint>,
 ) -> Vec<u64> {
+    let tip = state.wallet.local_chain().tip().height();
     let mut amounts: Vec<u64> = state
         .wallet
         .list_unspent()
-        .filter(|u| !state.wallet.is_outpoint_locked(u.outpoint) && !held.contains(&u.outpoint))
+        .filter(|u| {
+            let confs = utxo_confirmations(&u.chain_position, tip);
+            !state.wallet.is_outpoint_locked(u.outpoint)
+                && !held.contains(&u.outpoint)
+                && public_utxo_maturity(&state.wallet, u.outpoint, tip, confs).0
+        })
         .map(|u| u.txout.value.to_sat())
         .collect();
     amounts.sort_unstable_by_key(|&a| std::cmp::Reverse(a));
@@ -3622,6 +3689,7 @@ fn resolve_pegin_request(
         crate::tx_invariants::parse_and_dedup_outpoints(req.selected_outpoints.as_deref())?;
 
     let (utxo_amounts, spendable) = if let Some(ref outpoints) = selected {
+        let tip = state.wallet.local_chain().tip().height();
         let mut amounts = Vec::with_capacity(outpoints.len());
         for op in outpoints {
             let Some(utxo) = state.wallet.get_utxo(*op) else {
@@ -3635,6 +3703,8 @@ fn resolve_pegin_request(
                 )));
             }
             refuse_reserved_public(&state.data_dir, *op)?;
+            let confs = utxo_confirmations(&utxo.chain_position, tip);
+            refuse_immature_public(&state.wallet, *op, tip, confs)?;
             amounts.push(utxo.txout.value.to_sat());
         }
         let sum = crate::tx_invariants::checked_sum_sats(
@@ -4323,17 +4393,20 @@ fn build_send_psbt(
         crate::tx_invariants::parse_and_dedup_outpoints(req.selected_outpoints.as_deref())?;
 
     if let Some(ref outpoints) = selected {
+        let tip = state.wallet.local_chain().tip().height();
         for op in outpoints {
-            if state.wallet.get_utxo(*op).is_none() {
+            let Some(utxo) = state.wallet.get_utxo(*op) else {
                 return Err(WalletError::BuildTx(format!(
                     "selected outpoint {op} is not an unspent output in this wallet"
                 )));
-            }
+            };
             if state.wallet.is_outpoint_locked(*op) {
                 return Err(WalletError::BuildTx(format!(
                     "selected outpoint {op} is frozen — unfreeze it before spending"
                 )));
             }
+            let confs = utxo_confirmations(&utxo.chain_position, tip);
+            refuse_immature_public(&state.wallet, *op, tip, confs)?;
         }
     }
     let held = mweb_frozen::public_reserved_outpoints(&state.data_dir)?;
@@ -4413,17 +4486,13 @@ fn public_split_utxo(state: &WalletState, raw: &str) -> Result<(OutPoint, u64), 
     }
     refuse_reserved_public(&state.data_dir, op)?;
     let tip = state.wallet.local_chain().tip().height();
-    let confirmations = match utxo.chain_position {
-        ChainPosition::Confirmed { anchor, .. } => {
-            tip.saturating_sub(anchor.block_id.height).saturating_add(1)
-        }
-        ChainPosition::Unconfirmed { .. } => 0,
-    };
+    let confirmations = utxo_confirmations(&utxo.chain_position, tip);
     if confirmations == 0 {
         return Err(WalletError::BuildTx(
             "Split is disabled until the coin is confirmed".into(),
         ));
     }
+    refuse_immature_public(&state.wallet, op, tip, confirmations)?;
     Ok((op, utxo.txout.value.to_sat()))
 }
 
@@ -4728,12 +4797,9 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
         .wallet
         .list_unspent()
         .map(|utxo| {
-            let confirmations = match utxo.chain_position {
-                ChainPosition::Confirmed { anchor, .. } => {
-                    tip.saturating_sub(anchor.block_id.height).saturating_add(1)
-                }
-                ChainPosition::Unconfirmed { .. } => 0,
-            };
+            let confirmations = utxo_confirmations(&utxo.chain_position, tip);
+            let (mature, maturity_blocks_left) =
+                public_utxo_maturity(&state.wallet, utxo.outpoint, tip, confirmations);
             let keychain = match utxo.keychain {
                 KeychainKind::External => "external",
                 KeychainKind::Internal => "internal",
@@ -4743,6 +4809,8 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
             let locked = state.wallet.is_outpoint_locked(utxo.outpoint);
             let (status, actions) = mweb::public_coin_status(&mweb::PublicCoinFacts {
                 confirmations,
+                mature,
+                maturity_blocks_left,
                 locked,
                 reserved: held.contains(&utxo.outpoint),
             });
@@ -4753,6 +4821,8 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
                 amount_sats: utxo.txout.value.to_sat(),
                 keychain: keychain.into(),
                 confirmations,
+                mature,
+                maturity_blocks_left,
                 locked,
                 label,
                 status,
@@ -6806,10 +6876,104 @@ mod tests {
         _public_hold: CoinHold,
     }
 
+    fn insert_hogex_pegout_utxo(
+        wallet: &mut PersistedWallet<Connection>,
+        amount: Amount,
+        receive_to: bdk_wallet::test_utils::ReceiveTo,
+        seed_byte: u8,
+    ) -> OutPoint {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            absolute::LockTime, transaction::Version, Sequence, TxIn, TxOut, Txid, WitnessProgram,
+            WitnessVersion,
+        };
+        use bdk_wallet::test_utils::insert_tx;
+
+        let addr = wallet.reveal_next_address(KeychainKind::External).address;
+        let hog_addr = ScriptBuf::new_witness_program(
+            &WitnessProgram::new(WitnessVersion::V8, &[seed_byte; 32]).unwrap(),
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([seed_byte; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Default::default(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(100_000_000),
+                    script_pubkey: hog_addr,
+                },
+                TxOut {
+                    value: amount,
+                    script_pubkey: addr.script_pubkey(),
+                },
+            ],
+            is_hog_ex: true,
+            mw_tx: None,
+        };
+        let txid = tx.compute_txid();
+        insert_tx(wallet, tx);
+        match receive_to {
+            bdk_wallet::test_utils::ReceiveTo::Block(anchor) => {
+                bdk_wallet::test_utils::insert_anchor(wallet, txid, anchor);
+            }
+            bdk_wallet::test_utils::ReceiveTo::Mempool(seen_at) => {
+                bdk_wallet::test_utils::insert_seen_at(wallet, txid, seen_at);
+            }
+        }
+        OutPoint::new(txid, 1)
+    }
+
+    fn insert_coinbase_utxo(
+        wallet: &mut PersistedWallet<Connection>,
+        amount: Amount,
+        receive_to: bdk_wallet::test_utils::ReceiveTo,
+        seed_byte: u8,
+    ) -> OutPoint {
+        use bdk_wallet::bitcoin::{
+            absolute::LockTime, script::Builder, transaction::Version, Sequence, TxIn, TxOut,
+        };
+        use bdk_wallet::test_utils::insert_tx;
+
+        let addr = wallet.reveal_next_address(KeychainKind::External).address;
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(i64::from(seed_byte)).into_script(),
+                sequence: Sequence::MAX,
+                witness: Default::default(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: addr.script_pubkey(),
+            }],
+            is_hog_ex: false,
+            mw_tx: None,
+        };
+        let txid = tx.compute_txid();
+        assert!(tx.is_coinbase());
+        insert_tx(wallet, tx);
+        match receive_to {
+            bdk_wallet::test_utils::ReceiveTo::Block(anchor) => {
+                bdk_wallet::test_utils::insert_anchor(wallet, txid, anchor);
+            }
+            bdk_wallet::test_utils::ReceiveTo::Mempool(seen_at) => {
+                bdk_wallet::test_utils::insert_seen_at(wallet, txid, seen_at);
+            }
+        }
+        OutPoint::new(txid, 0)
+    }
+
     fn open_status_wallet(dir: &Path) -> StatusWallet {
         use bdk_wallet::bitcoin::hashes::Hash;
         use bdk_wallet::bitcoin::BlockHash;
-        use bdk_wallet::chain::BlockId;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
         use bdk_wallet::test_utils::{
             insert_checkpoint, receive_output, receive_output_in_latest_block, ReceiveTo,
         };
@@ -6828,19 +6992,26 @@ mod tests {
             insert_private_coin(state, held, 1_000_000, Some(0), false);
             insert_private_coin(state, pending, 1_000_000, None, false);
             insert_private_coin(state, maturing, 1_000_000, Some(0), true);
-            insert_checkpoint(
-                &mut state.wallet,
-                BlockId {
-                    height: 1,
-                    hash: BlockHash::all_zeros(),
-                },
-            );
+            let block1 = BlockId {
+                height: 1,
+                hash: BlockHash::all_zeros(),
+            };
+            insert_checkpoint(&mut state.wallet, block1);
             let _confirmed =
                 receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
             let public_frozen =
                 receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
             let public_held =
                 receive_output_in_latest_block(&mut state.wallet, Amount::from_sat(1_000_000));
+            let _public_maturing = insert_hogex_pegout_utxo(
+                &mut state.wallet,
+                Amount::from_sat(1_000_000),
+                ReceiveTo::Block(ConfirmationBlockTime {
+                    block_id: block1,
+                    confirmation_time: 100,
+                }),
+                0x91,
+            );
             let _unconfirmed = receive_output(
                 &mut state.wallet,
                 Amount::from_sat(1_000_000),
@@ -7234,6 +7405,7 @@ mod tests {
             CoinStatus::Frozen,
             CoinStatus::Sending,
             CoinStatus::Pending,
+            CoinStatus::Maturing,
         ] {
             assert!(
                 public_rows.iter().any(|row| row.status == status),
@@ -7259,6 +7431,8 @@ mod tests {
         for row in &public_rows {
             let (status, actions) = mweb::public_coin_status(&mweb::PublicCoinFacts {
                 confirmations: row.confirmations,
+                mature: row.mature,
+                maturity_blocks_left: row.maturity_blocks_left,
                 locked: row.locked,
                 reserved: file.public_reserved.contains_key(&row.outpoint),
             });
@@ -7368,6 +7542,7 @@ mod tests {
         for status in [
             CoinStatus::Ready,
             CoinStatus::Pending,
+            CoinStatus::Maturing,
             CoinStatus::Frozen,
             CoinStatus::Sending,
         ] {
@@ -7472,7 +7647,7 @@ mod tests {
             .into_iter()
             .map(|row| (row.outpoint, row.actions.select, row.status))
             .collect();
-        assert!(cases.len() >= 4, "expected every public status");
+        assert!(cases.len() >= 5, "expected every public status");
         for (outpoint, select, status) in cases {
             let result = build_send_psbt(
                 state,
@@ -7490,6 +7665,297 @@ mod tests {
                 "{outpoint} ({status:?}): {result:?}"
             );
         }
+    }
+
+    /// HogEx peg-outs require 6 confirmations (`PEGOUT_MATURITY`) and coinbase outputs require 100
+    /// (`COINBASE_MATURITY`) before becoming `Ready`. Ordinary unconfirmed public coins stay
+    /// selectable (`Pending`, `select: true`).
+    #[test]
+    fn hogex_pegout_and_coinbase_maturity_boundaries_in_public_coins() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use bdk_wallet::test_utils::{insert_checkpoint, receive_output, ReceiveTo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+        let recipient = app.receive_address().unwrap();
+
+        let (ordinary_op, hogex_op, coinbase_op) = {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let block10 = BlockId {
+                height: 10,
+                hash: BlockHash::from_byte_array([10; 32]),
+            };
+            insert_checkpoint(&mut state.wallet, block10);
+            let ordinary_op = receive_output(
+                &mut state.wallet,
+                Amount::from_sat(1_000_000),
+                ReceiveTo::Mempool(1),
+            );
+            let hogex_op = insert_hogex_pegout_utxo(
+                &mut state.wallet,
+                Amount::from_sat(2_000_000),
+                ReceiveTo::Mempool(2),
+                0xa1,
+            );
+            let coinbase_op = insert_coinbase_utxo(
+                &mut state.wallet,
+                Amount::from_sat(3_000_000),
+                ReceiveTo::Mempool(3),
+                0xb1,
+            );
+            state.wallet.persist(&mut state.db).unwrap();
+            (ordinary_op, hogex_op, coinbase_op)
+        };
+
+        let row_for = |op: OutPoint| {
+            app.list_unspent()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.outpoint == op.to_string())
+                .unwrap()
+        };
+
+        // At 0 confirmations: ordinary unconfirmed public coin stays selectable (`Pending`, `mature: true`),
+        // while an unconfirmed HogEx peg-out is not selectable (`Pending`, `mature: false`, `maturity_blocks_left: 6`).
+        let ord0 = row_for(ordinary_op);
+        assert_eq!(ord0.confirmations, 0);
+        assert!(ord0.mature);
+        assert_eq!(ord0.maturity_blocks_left, 0);
+        assert_eq!(ord0.status, CoinStatus::Pending);
+        assert_eq!(ord0.actions.blocked, Some(CoinBlock::Unconfirmed));
+        assert!(ord0.actions.select && ord0.actions.freeze);
+        assert!(!ord0.actions.split && !ord0.actions.transfer);
+
+        let hog0 = row_for(hogex_op);
+        assert_eq!(hog0.confirmations, 0);
+        assert!(!hog0.mature);
+        assert_eq!(hog0.maturity_blocks_left, 6);
+        assert_eq!(hog0.status, CoinStatus::Pending);
+        assert_eq!(hog0.actions.blocked, Some(CoinBlock::Unconfirmed));
+        assert!(actions_off(&hog0.actions));
+
+        // Anchor the HogEx and coinbase outputs at height 10.
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            let block10 = BlockId {
+                height: 10,
+                hash: BlockHash::from_byte_array([10; 32]),
+            };
+            bdk_wallet::test_utils::insert_anchor(
+                &mut state.wallet,
+                hogex_op.txid,
+                ConfirmationBlockTime {
+                    block_id: block10,
+                    confirmation_time: 100,
+                },
+            );
+            bdk_wallet::test_utils::insert_anchor(
+                &mut state.wallet,
+                coinbase_op.txid,
+                ConfirmationBlockTime {
+                    block_id: block10,
+                    confirmation_time: 100,
+                },
+            );
+            state.wallet.persist(&mut state.db).unwrap();
+        }
+
+        // Advance tip from 10 (1 conf) through 14 (5 confs): HogEx stays Maturing with 5..=1 blocks left.
+        for tip in 10..=14u32 {
+            {
+                let mut guard = app.lock_state().unwrap();
+                let state = guard.as_mut().unwrap();
+                if tip > 10 {
+                    insert_checkpoint(
+                        &mut state.wallet,
+                        BlockId {
+                            height: tip,
+                            hash: BlockHash::from_byte_array([tip as u8; 32]),
+                        },
+                    );
+                }
+            }
+            let confs = tip - 10 + 1;
+            let expected_left = 6 - confs;
+            let hog = row_for(hogex_op);
+            assert_eq!(hog.confirmations, confs, "tip={tip}");
+            assert!(!hog.mature, "tip={tip}");
+            assert_eq!(hog.maturity_blocks_left, expected_left, "tip={tip}");
+            assert_eq!(hog.status, CoinStatus::Maturing, "tip={tip}");
+            assert_eq!(
+                hog.actions.blocked,
+                Some(CoinBlock::Maturing {
+                    blocks_left: expected_left
+                }),
+                "tip={tip}"
+            );
+            assert!(actions_off(&hog.actions), "tip={tip}: {:?}", hog.actions);
+
+            // Commands must refuse maturing HogEx coin at 1..=5 confirmations.
+            assert!(
+                app.set_utxo_locked(SetUtxoLockedRequest {
+                    outpoint: hogex_op.to_string(),
+                    locked: true,
+                })
+                .is_err(),
+                "freeze must fail at {confs} confs"
+            );
+            {
+                let mut guard = app.lock_state().unwrap();
+                let state = guard.as_mut().unwrap();
+                assert!(
+                    build_send_psbt(
+                        state,
+                        &SendRequest {
+                            address: recipient.clone(),
+                            amount_sats: 10_000,
+                            fee_rate_sat_vb: Some(1),
+                            drain: false,
+                            selected_outpoints: Some(vec![hogex_op.to_string()]),
+                        },
+                    )
+                    .is_err(),
+                    "manual send must fail at {confs} confs"
+                );
+                assert!(
+                    plan_split_request(state, &public_split_req(hogex_op)).is_err(),
+                    "split must fail at {confs} confs"
+                );
+                assert!(
+                    resolve_pegin_request(
+                        state,
+                        PeginRequest {
+                            amount_sats: 100_000,
+                            mweb_fee_sats: 2_100,
+                            transparent_fee_sats: 1_000,
+                            drain: false,
+                            selected_outpoints: Some(vec![hogex_op.to_string()]),
+                        },
+                    )
+                    .is_err(),
+                    "manual peg-in must fail at {confs} confs"
+                );
+                // Auto-selection pool for peg-in excludes the maturing 2_000_000 HogEx and 3_000_000 coinbase,
+                // leaving only the 1_000_000 ordinary coin.
+                let held = mweb_frozen::public_reserved_outpoints(&state.data_dir).unwrap();
+                assert_eq!(
+                    selectable_public_utxo_amounts(state, &held),
+                    vec![1_000_000],
+                    "auto peg-in pool must exclude immature HogEx and coinbase at {confs} confs"
+                );
+            }
+        }
+
+        // At tip = 15 (6 confirmations: `15 - 10 + 1 == 6 >= PEGOUT_MATURITY`): HogEx is Ready and spendable.
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_checkpoint(
+                &mut state.wallet,
+                BlockId {
+                    height: 15,
+                    hash: BlockHash::from_byte_array([15; 32]),
+                },
+            );
+        }
+        let hog6 = row_for(hogex_op);
+        assert_eq!(hog6.confirmations, 6);
+        assert!(hog6.mature);
+        assert_eq!(hog6.maturity_blocks_left, 0);
+        assert_eq!(hog6.status, CoinStatus::Ready);
+        assert_eq!(hog6.actions.blocked, None);
+        assert!(
+            hog6.actions.select
+                && hog6.actions.split
+                && hog6.actions.transfer
+                && hog6.actions.freeze
+        );
+        assert!(!hog6.actions.unfreeze && !hog6.actions.spend_to_self);
+
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert!(build_send_psbt(
+                state,
+                &SendRequest {
+                    address: recipient.clone(),
+                    amount_sats: 10_000,
+                    fee_rate_sat_vb: Some(1),
+                    drain: false,
+                    selected_outpoints: Some(vec![hogex_op.to_string()]),
+                },
+            )
+            .is_ok());
+            assert!(plan_split_request(state, &public_split_req(hogex_op)).is_ok());
+            assert!(resolve_pegin_request(
+                state,
+                PeginRequest {
+                    amount_sats: 100_000,
+                    mweb_fee_sats: 2_100,
+                    transparent_fee_sats: 1_000,
+                    drain: false,
+                    selected_outpoints: Some(vec![hogex_op.to_string()]),
+                },
+            )
+            .is_ok());
+            let held = mweb_frozen::public_reserved_outpoints(&state.data_dir).unwrap();
+            assert_eq!(
+                selectable_public_utxo_amounts(state, &held),
+                vec![2_000_000, 1_000_000]
+            );
+        }
+
+        // Coinbase boundary: at tip = 108 (99 confirmations) still Maturing with 1 block left;
+        // at tip = 109 (100 confirmations) Ready.
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_checkpoint(
+                &mut state.wallet,
+                BlockId {
+                    height: 108,
+                    hash: BlockHash::from_byte_array([108; 32]),
+                },
+            );
+        }
+        let cb99 = row_for(coinbase_op);
+        assert_eq!(cb99.confirmations, 99);
+        assert!(!cb99.mature);
+        assert_eq!(cb99.maturity_blocks_left, 1);
+        assert_eq!(cb99.status, CoinStatus::Maturing);
+        assert_eq!(
+            cb99.actions.blocked,
+            Some(CoinBlock::Maturing { blocks_left: 1 })
+        );
+        assert!(actions_off(&cb99.actions));
+
+        {
+            let mut guard = app.lock_state().unwrap();
+            let state = guard.as_mut().unwrap();
+            insert_checkpoint(
+                &mut state.wallet,
+                BlockId {
+                    height: 109,
+                    hash: BlockHash::from_byte_array([109; 32]),
+                },
+            );
+        }
+        let cb100 = row_for(coinbase_op);
+        assert_eq!(cb100.confirmations, 100);
+        assert!(cb100.mature);
+        assert_eq!(cb100.maturity_blocks_left, 0);
+        assert_eq!(cb100.status, CoinStatus::Ready);
+        assert_eq!(cb100.actions.blocked, None);
+        assert!(
+            cb100.actions.select
+                && cb100.actions.split
+                && cb100.actions.transfer
+                && cb100.actions.freeze
+        );
     }
 
     /// A hold written by an earlier process is gone after the next load.

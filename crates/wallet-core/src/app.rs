@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -461,6 +461,10 @@ pub struct WalletApp {
     /// Copied from wallet state on load and settings save. Insights reads this
     /// instead of the wallet mutex.
     insights_endpoint: Mutex<Option<InsightsEndpoint>>,
+    /// When a missing peg-in's slow fallbacks (local RPC, another Electrum
+    /// server, a public explorer) last failed. The sync server is still asked
+    /// every pass. Not a secret.
+    pegin_repair_fallback_at: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl WalletApp {
@@ -481,6 +485,30 @@ impl WalletApp {
             session: hex::encode(rand::random::<[u8; 16]>()),
             last_good_electrum: Mutex::new(None),
             insights_endpoint: Mutex::new(None),
+            pegin_repair_fallback_at: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Slow peg-in fallbacks ran and failed recently. The connected Electrum
+    /// server is still worth asking; the others are not, until the backoff ends.
+    fn pegin_fallback_due(&self, id: &str) -> bool {
+        let Ok(map) = self.pegin_repair_fallback_at.lock() else {
+            return true;
+        };
+        match map.get(id) {
+            Some(at) => at.elapsed() >= PEGIN_REPAIR_BACKOFF,
+            None => true,
+        }
+    }
+
+    fn note_pegin_fallback(&self, id: &str, failed: bool) {
+        let Ok(mut map) = self.pegin_repair_fallback_at.lock() else {
+            return;
+        };
+        if failed {
+            map.insert(id.to_string(), std::time::Instant::now());
+        } else {
+            map.remove(id);
         }
     }
 
@@ -1669,15 +1697,24 @@ impl WalletApp {
         Ok(current_receive_address(&mut wallet))
     }
 
+    fn log_sync_failure(err: WalletError) -> WalletError {
+        diag::log(format!("sync: failed: {err}"));
+        err
+    }
+
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
         let pass = self.sync_pass();
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        let state = guard
+            .as_mut()
+            .ok_or(WalletError::NotLoaded)
+            .map_err(Self::log_sync_failure)?;
 
         let electrum_started = std::time::Instant::now();
         let prefer = self.remembered_electrum();
-        let client = connect_electrum_prefer(state, prefer.as_deref())?;
+        let client =
+            connect_electrum_prefer(state, prefer.as_deref()).map_err(Self::log_sync_failure)?;
         let used = state
             .active_electrum_url
             .clone()
@@ -1707,15 +1744,21 @@ impl WalletApp {
                 // A server that failed verification is not tried first again.
                 self.forget_electrum();
                 state.active_electrum_url = None;
-                return Err(e);
+                return Err(Self::log_sync_failure(e));
             }
         };
 
-        state
+        let persist_started = std::time::Instant::now();
+        let persisted = state
             .wallet
             .persist(&mut state.db)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        outcome.persist_state()?;
+            .map_err(|e| WalletError::Persist(e.to_string()))
+            .and_then(|_| outcome.persist_state());
+        diag::log(format!(
+            "sync: electrum persist ms={}",
+            persist_started.elapsed().as_millis() as u64
+        ));
+        persisted.map_err(Self::log_sync_failure)?;
         self.remember_electrum(used);
         crate::crashpoint::maybe_crash("sync_after_electrum_persist");
         let electrum_ms = electrum_started.elapsed().as_millis() as u64;
@@ -1749,6 +1792,7 @@ impl WalletApp {
             .active_electrum_url
             .clone()
             .unwrap_or_else(|| state.electrum_url.clone());
+        let cross_started = std::time::Instant::now();
         if let Some(alt) = electrum_candidates(state)
             .into_iter()
             .find(|url| *url != used_server)
@@ -1767,10 +1811,17 @@ impl WalletApp {
                 Err(_) => {}
             }
         }
+        diag::log(format!(
+            "sync: cross-check tip ms={}",
+            cross_started.elapsed().as_millis() as u64
+        ));
 
         // Skip the long MWEB pass if the user locked during Electrum sync.
-        guard.check_lock()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        guard.check_lock().map_err(Self::log_sync_failure)?;
+        let state = guard
+            .as_mut()
+            .ok_or(WalletError::NotLoaded)
+            .map_err(Self::log_sync_failure)?;
 
         // MWEB sync (best-effort; peer failure → stale, not hard error).
         let mut mweb_ms = 0u64;
@@ -1810,29 +1861,61 @@ impl WalletApp {
             diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
         }
 
-        guard.check_lock()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        guard.check_lock().map_err(Self::log_sync_failure)?;
+        let state = guard
+            .as_mut()
+            .ok_or(WalletError::NotLoaded)
+            .map_err(Self::log_sync_failure)?;
+        let churn_started = std::time::Instant::now();
         if state.mweb.is_some() {
             let _ = drive_churn(state, Some(&client));
         }
+        diag::log(format!(
+            "sync: churn ms={}",
+            churn_started.elapsed().as_millis() as u64
+        ));
 
-        guard.check_lock()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        guard.check_lock().map_err(Self::log_sync_failure)?;
+        let state = guard
+            .as_mut()
+            .ok_or(WalletError::NotLoaded)
+            .map_err(Self::log_sync_failure)?;
 
         // Repair peg-ins that credited MWEB without spending transparent UTXOs
         // (bug in earlier builds). Prefer Electrum raw tx; fall back to RPC.
-        if state.mweb.is_some() {
-            if let Some(repair_warning) = repair_missing_pegin_spends(state, &client)? {
-                warnings.push(repair_warning);
-            }
+        let repair_started = std::time::Instant::now();
+        let missing = missing_pegin_ids(state);
+        let fallbacks = missing
+            .iter()
+            .filter(|id| self.pegin_fallback_due(id))
+            .count();
+        let missing_pegins = missing.len();
+        let repaired = if state.mweb.is_some() {
+            repair_missing_pegin_spends(self, state, &client)
+        } else {
+            Ok(None)
+        };
+        diag::log(format!(
+            "sync: pegin-repair missing={missing_pegins} fallbacks={fallbacks} ms={}",
+            repair_started.elapsed().as_millis() as u64
+        ));
+        if let Some(repair_warning) = repaired.map_err(Self::log_sync_failure)? {
+            warnings.push(repair_warning);
         }
 
-        meta::write_meta(&state.data_dir, &meta_from_state(state))?;
+        meta::write_meta(&state.data_dir, &meta_from_state(state))
+            .map_err(Self::log_sync_failure)?;
 
         let tx_count_after = state.wallet.transactions().count();
         let new_txs = tx_count_after.saturating_sub(tx_count_before) as u32;
-        let summary = build_summary(state)?;
-        guard.check_lock()?;
+        let summary_started = std::time::Instant::now();
+        let summary = build_summary(state);
+        diag::log(format!(
+            "sync: summary ms={}",
+            summary_started.elapsed().as_millis() as u64
+        ));
+        let summary = summary.map_err(Self::log_sync_failure)?;
+        guard.check_lock().map_err(Self::log_sync_failure)?;
         pass.finish();
         diag::log(format!(
             "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs}"
@@ -4771,15 +4854,12 @@ fn collect_unspent(state: &WalletState) -> Vec<UtxoRecord> {
 
 /// Find history peg-ins missing from the transparent graph and apply their spends.
 /// Returns a user-facing warning when repair is still needed but no source worked.
-fn repair_missing_pegin_spends(
-    state: &mut WalletState,
-    client: &crate::electrum::ElectrumClient,
-) -> Result<Option<String>, WalletError> {
+/// Peg-in ids whose transparent transaction is not in the wallet yet.
+fn missing_pegin_ids(state: &WalletState) -> Vec<String> {
     let Some(mweb) = state.mweb.as_ref() else {
-        return Ok(None);
+        return Vec::new();
     };
-    let missing: Vec<String> = mweb
-        .history
+    mweb.history
         .entries
         .iter()
         .filter(|e| e.kind == TxKind::Pegin)
@@ -4791,7 +4871,22 @@ fn repair_missing_pegin_spends(
                 Some(e.id.clone())
             }
         })
-        .collect();
+        .collect()
+}
+
+/// How long a dead RPC node, Electrum fallback, or explorer may stall one
+/// repair attempt. A missing peg-in is retried on a later sync.
+const PEGIN_REPAIR_FALLBACK: std::time::Duration = std::time::Duration::from_secs(2);
+/// After the slow fallbacks fail, skip them for this long. The server that
+/// just synced is still asked, because that call is already connected.
+const PEGIN_REPAIR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn repair_missing_pegin_spends(
+    app: &WalletApp,
+    state: &mut WalletState,
+    client: &crate::electrum::ElectrumClient,
+) -> Result<Option<String>, WalletError> {
+    let missing = missing_pegin_ids(state);
     if missing.is_empty() {
         return Ok(None);
     }
@@ -4800,12 +4895,17 @@ fn repair_missing_pegin_spends(
     let mut still_missing = 0u32;
     let mut last_err: Option<String> = None;
     for id in &missing {
-        match fetch_pegin_raw_tx(id, client, state) {
+        let allow_fallbacks = app.pegin_fallback_due(id);
+        match fetch_pegin_raw_tx(id, client, state, allow_fallbacks) {
             Ok(tx) => {
+                app.note_pegin_fallback(id, false);
                 mweb::apply_pegin_transparent_spend(&mut state.wallet, Arc::unwrap_or_clone(tx));
                 repaired += 1;
             }
             Err(e) => {
+                if allow_fallbacks {
+                    app.note_pegin_fallback(id, true);
+                }
                 last_err = Some(e);
                 still_missing += 1;
             }
@@ -4853,6 +4953,7 @@ fn fetch_pegin_raw_tx(
     txid_hex: &str,
     client: &crate::electrum::ElectrumClient,
     state: &WalletState,
+    allow_fallbacks: bool,
 ) -> Result<Arc<Transaction>, String> {
     use bdk_electrum::electrum_client::ElectrumApi;
 
@@ -4875,6 +4976,10 @@ fn fetch_pegin_raw_tx(
         Err(e) => errors.push(format!("sync Electrum: {e}")),
     }
 
+    if !allow_fallbacks {
+        return Err(errors.join("; "));
+    }
+
     let mut rpc_urls: Vec<String> = Vec::new();
     if let Some(url) = &state.litecoin_rpc_url {
         rpc_urls.push(url.clone());
@@ -4885,7 +4990,7 @@ fn fetch_pegin_raw_tx(
     }
     for url in &rpc_urls {
         let safe_url = crate::redact::redact_userinfo(url);
-        match crate::rpc::get_raw_transaction_hex(url, txid_hex) {
+        match crate::rpc::get_raw_transaction_hex_within(url, txid_hex, PEGIN_REPAIR_FALLBACK) {
             Ok(hex) => match hex::decode(hex.trim()) {
                 Ok(raw) if !raw.is_empty() => {
                     if let Some(tx) = accept(raw, &format!("RPC {safe_url}"), &mut errors) {
@@ -4906,7 +5011,11 @@ fn fetch_pegin_raw_tx(
             continue;
         }
         let safe_url = crate::redact::redact_userinfo(&url);
-        match electrum::connect_with_timeout(&url, state.electrum_validate_domain, 10) {
+        match electrum::connect_with_timeout(
+            &url,
+            state.electrum_validate_domain,
+            PEGIN_REPAIR_FALLBACK.as_secs() as u8,
+        ) {
             Ok(alt) => match alt.inner.transaction_get_raw(&txid) {
                 Ok(raw) if !raw.is_empty() => {
                     if let Some(tx) = accept(raw, &safe_url, &mut errors) {
@@ -4937,6 +5046,7 @@ fn fetch_pegin_raw_tx(
 fn fetch_tx_hex_litecoinspace(txid_hex: &str) -> Result<Vec<u8>, String> {
     let url = format!("https://litecoinspace.org/api/tx/{txid_hex}/hex");
     let body = ureq::get(&url)
+        .timeout(PEGIN_REPAIR_FALLBACK)
         .set("Accept", "text/plain")
         .call()
         .map_err(|e| e.to_string())?
@@ -8239,7 +8349,7 @@ mod lock_lifecycle_tests {
             state.litecoin_rpc_url = Some(format!(
                 "http://rpcadmin:SuperSecretRpcPass42@127.0.0.1:{closed_rpc_port}"
             ));
-            super::fetch_pegin_raw_tx(&"11".repeat(32), &client, state)
+            super::fetch_pegin_raw_tx(&"11".repeat(32), &client, state, true)
                 .expect_err("closed electrum + closed rpc must fail")
         };
         let _ = handle.join();

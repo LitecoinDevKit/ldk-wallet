@@ -20,7 +20,25 @@ pub fn send_raw_transaction(rpc_url: &str, tx_hex: &str) -> Result<String, Walle
 
 /// Fetch a raw transaction hex via litecoind `getrawtransaction`.
 pub fn get_raw_transaction_hex(rpc_url: &str, txid: &str) -> Result<String, WalletError> {
-    let value = rpc_call(rpc_url, "getrawtransaction", json!([txid, false]))?;
+    raw_transaction_hex(rpc_url, txid, None)
+}
+
+/// [`get_raw_transaction_hex`] with a bound on connect and read. Peg-in repair
+/// uses this so a dead local node cannot stall a sync for ureq's default.
+pub fn get_raw_transaction_hex_within(
+    rpc_url: &str,
+    txid: &str,
+    timeout: std::time::Duration,
+) -> Result<String, WalletError> {
+    raw_transaction_hex(rpc_url, txid, Some(timeout))
+}
+
+fn raw_transaction_hex(
+    rpc_url: &str,
+    txid: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<String, WalletError> {
+    let value = rpc_call_timeout(rpc_url, "getrawtransaction", json!([txid, false]), timeout)?;
     value
         .as_str()
         .map(|s| s.to_string())
@@ -54,6 +72,15 @@ fn rpc_call(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, WalletError> {
+    rpc_call_timeout(rpc_url, method, params, None)
+}
+
+fn rpc_call_timeout(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Option<std::time::Duration>,
+) -> Result<serde_json::Value, WalletError> {
     let rpc_url = &normalize_rpc_url(rpc_url);
     let body = json!({
         "jsonrpc": "1.0",
@@ -62,6 +89,9 @@ fn rpc_call(
         "params": params,
     });
     let mut request = ureq::post(rpc_url).set("Content-Type", "application/json");
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     if !url_has_credentials(rpc_url) {
         if let Some(cookie) = read_default_cookie() {
             let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);

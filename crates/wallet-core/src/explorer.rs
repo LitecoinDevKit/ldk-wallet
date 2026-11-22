@@ -49,7 +49,7 @@ pub fn is_chain_txid(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// `{base}/tx/{txid}`
+/// `{base}/explorer/tx/{txid}`
 pub fn tx_url(base: &str, txid: &str) -> Result<String, WalletError> {
     let base = normalize_base_url(base)?;
     let txid = txid.trim();
@@ -58,17 +58,17 @@ pub fn tx_url(base: &str, txid: &str) -> Result<String, WalletError> {
             "not a transparent transaction id — cannot open in explorer".into(),
         ));
     }
-    Ok(format!("{base}/tx/{txid}"))
+    Ok(format!("{base}/explorer/tx/{txid}"))
 }
 
-/// `{base}/block/{hash}` when hash looks like a block hash.
+/// `{base}/explorer/block/{hash}` when hash looks like a block hash.
 pub fn block_url(base: &str, block_hash: &str) -> Result<String, WalletError> {
     let base = normalize_base_url(base)?;
     let hash = block_hash.trim();
     if !is_chain_txid(hash) {
         return Err(WalletError::Meta("invalid block hash".into()));
     }
-    Ok(format!("{base}/block/{hash}"))
+    Ok(format!("{base}/explorer/block/{hash}"))
 }
 
 /// Reject non-http(s) URLs before handing them to the OS opener.
@@ -113,10 +113,10 @@ fn get_text(url: &str) -> Result<String, WalletError> {
         .map_err(|e| WalletError::Explorer(format!("read failed: {e}")))
 }
 
-/// `GET {base}/api/mempool/price` — plain number body.
+/// `GET {base}/api/oracle/price` — plain number body (USD).
 pub fn fetch_spot_price(base: &str) -> Result<f64, WalletError> {
     let base = normalize_base_url(base)?;
-    let url = format!("{base}/api/mempool/price");
+    let url = format!("{base}/api/oracle/price");
     let body = get_text(&url)?;
     body.trim()
         .parse::<f64>()
@@ -290,9 +290,13 @@ mod tests {
         let txid = "cf24383eacf8c34c01a0114df0d58e438a5d4fb685570f43c2cef84522361bd0";
         assert_eq!(
             tx_url("https://litview.space", txid).unwrap(),
-            format!("https://litview.space/tx/{txid}")
+            format!("https://litview.space/explorer/tx/{txid}")
         );
         assert!(tx_url("https://litview.space", "not-a-txid").is_err());
+        assert_eq!(
+            block_url("https://litview.space", txid).unwrap(),
+            format!("https://litview.space/explorer/block/{txid}")
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use bdk_electrum::electrum_client::{Client, ConfigBuilder, ElectrumApi, Param};
 use bdk_electrum::BdkElectrumClient;
 
 use crate::error::WalletError;
+use crate::network::WalletNetwork;
 
 pub const STOP_GAP: usize = 50;
 pub const BATCH_SIZE: usize = 5;
@@ -153,17 +154,14 @@ fn handshake(client: &ElectrumClient) -> Result<(), bdk_electrum::electrum_clien
     }
 }
 
-/// Unix time of the block header at `height` on this server.
-pub fn header_time(client: &ElectrumClient, height: u32) -> Result<u64, WalletError> {
-    let header = client
-        .inner
-        .block_header(height as usize)
-        .map_err(|e| WalletError::Electrum(e.to_string()))?;
-    Ok(u64::from(header.time))
-}
-
 /// Connect, handshake, and read tip height — used by Settings “Test connection”.
-pub fn probe_tip(url: &str, validate_domain: bool) -> Result<(u32, u64), WalletError> {
+/// Refuses a server on another network (genesis mismatch) or whose tip header
+/// fails Litecoin proof of work.
+pub fn probe_tip(
+    url: &str,
+    validate_domain: bool,
+    network: WalletNetwork,
+) -> Result<(u32, u64), WalletError> {
     let started = std::time::Instant::now();
     let client = connect_with_timeout(url, validate_domain, 15)?;
     handshake(&client).map_err(|e| WalletError::Electrum(e.to_string()))?;
@@ -171,7 +169,14 @@ pub fn probe_tip(url: &str, validate_domain: bool) -> Result<(u32, u64), WalletE
         .inner
         .block_headers_subscribe()
         .map_err(|e| WalletError::Electrum(e.to_string()))?;
-    let tip_height = sub.height as u32;
+    let tip_height = u32::try_from(sub.height)
+        .map_err(|_| WalletError::Electrum(format!("tip height {} overflows u32", sub.height)))?;
+    let genesis = client
+        .inner
+        .block_header(0)
+        .map_err(|e| WalletError::Electrum(e.to_string()))?;
+    crate::spv::verify_header_pow(&genesis, 0, network)?;
+    crate::spv::verify_header_pow(&sub.header, tip_height, network)?;
     let latency_ms = started.elapsed().as_millis() as u64;
     Ok((tip_height, latency_ms))
 }

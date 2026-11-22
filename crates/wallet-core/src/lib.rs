@@ -36,6 +36,7 @@ mod secrets;
 mod seed;
 mod split;
 mod split_ids;
+mod spv;
 mod tx_invariants;
 mod utxo_labels;
 

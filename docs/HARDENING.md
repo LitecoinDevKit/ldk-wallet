@@ -4,9 +4,8 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 
 ## Next up
 
-1. SPV acceptance of Electrum data (item 25).
-2. Peg-out maturity on public coins (item 26).
-3. Untrusted input bounds (item 19).
+1. Peg-out maturity on public coins (item 26).
+2. Untrusted input bounds (item 19).
 
 ## Status
 
@@ -36,7 +35,7 @@ The one living checklist for hardening this wallet, which is an unaudited protot
 | 22 | Error-message sanitization | Lower | Not started | | UI and logs omit stack traces and extra address or amount detail. |
 | 23 | Lookalike addresses and confirmations | Lower | Not started | | Beyond the existing wipe phrase. |
 | 24 | Release SBOM | Lower | Not started | | On top of the supply-chain CI already in place. |
-| 25 | SPV acceptance of Electrum data | High | Not started | | Forged merkle proofs and headers that fail Litecoin proof-of-work must not confirm a coin. `cross_check_tip` stays a warning. |
+| 25 | SPV acceptance of Electrum data | High | Done | [#37](https://github.com/LitecoinDevKit/ldk-wallet/pull/37) | `spv.rs` verifies scrypt proof-of-work, targets and retargets, header links, and fork work, plus hardened merkle proofs and raw-tx txids, before an Electrum update is applied. Mock-server tests in `app/tests/spv_tests.rs`. `cross_check_tip` stays a warning. |
 | 26 | Peg-out maturity on public coins | High | Not started | | A HogEx peg-out with fewer than 6 confirmations is maturing, not Ready. Ordinary unconfirmed public coins stay selectable. |
 
 ## Model and effort
@@ -186,5 +185,16 @@ Taken from Electrum-LTC (`ltc-electrum/electrum-ltc`, branch `mweb`). That suite
 `tests/test_blockchain.py` (`TestVerifyHeader`, `TestHeaderChainResolution`) rejects a prev-hash mismatch, a target mismatch, insufficient proof-of-work, a lagging server, and a fork. This wallet's `apply_electrum_chain_update` applies the server's update as given. `cross_check_tip` compares header hashes with a second server and warns. It does not check scrypt proof-of-work, and it does not fail the sync. That warning stays. It does not replace a local check. Audit note O11 (a server hiding mempool transactions) is a different residual.
 
 A transaction the server claims is mined is not confirmed until the proof passes. An invalid transaction is rejected. Switching servers drops unconfirmed state that was cached only because of the previous server (`tests/test_address_synchronizer.py`). Item 5 covers a dead peer, not a lying one.
+
+Done. `crates/wallet-core/src/spv.rs` replaces `bdk_electrum`'s `full_scan` and `sync` with a driver that verifies everything before `wallet.apply_update`:
+
+- Headers: genesis per network, Litecoin scrypt(1024, 1, 1) proof of work, compact targets decoded as Core's `SetCompact` and capped at `powLimit`, the 2016-block retarget (Litecoin's 2015-block first lookback and the one-bit shift near `powLimit`), Testnet4 min-difficulty blocks, and `prev_blockhash` links. The window is the last 2016 headers, or back to the fork point.
+- Chain choice: a server behind the local tip is refused as lagging. A fork up to 2160 blocks deep is accepted only with strictly more cumulative work than the local branch.
+- Proofs: a merkle branch is checked against the verified header and refuses a 64-byte inner node that parses as a transaction (CVE-2017-12842), a duplicated left sibling, a duplicate off the right edge (CVE-2012-2459), and a position outside the tree. A failing branch fails the sync. A server that has no branch leaves the transaction unconfirmed.
+- Transactions: raw bytes must hash to the requested txid. Duplicate inputs, `MAX_MONEY` overflow, and 64-byte transactions are refused. Peg-in repair checks every source the same way and moves on to the next one when the check fails.
+- Server switch: `electrum_spv.json` records which unconfirmed transactions only the last server reported. `update_settings` evicts them on a server change, keeping peg-ins and transactions that spend our own coins. A server that fails verification is forgotten, not tried first again.
+- `probe_tip` (Settings, Test connection) checks genesis and the tip header's proof of work. Churn scoring's `block_hash_at` uses only local, stored-verified, or proof-of-work-checked headers.
+
+Tests use a thread-local regtest proof-of-work override (`spv::easy_pow_for_test`) so mock chains mine in a hash or two. Residuals are in `docs/AUDIT_NOTES.md`.
 
 **26. Peg-out maturity on public coins.** Litecoin consensus will not spend a HogEx peg-out until 6 confirmations (`PEGOUT_MATURITY` in Electrum-LTC `electrum/bitcoin.py`, and `CanonicalTxOut::is_mature` in `bdk`). `collect_unspent` never asks `is_mature`. `public_coin_status` marks any public coin with one or more confirmations Ready and selectable, so a peg-out at 1–5 confirmations offers spend. Those coins are maturing: spend buttons off, through the same flag path private maturing coins already use. Update `AGENTS.md` in that PR so the public status list includes maturing. An ordinary unconfirmed public coin stays selectable, as item 4 pinned. Coinbase outputs follow the same `is_mature` check (100 confirmations) so the rule is not a peg-out special case. The boundary is `tip - confirmation_height + 1 >= maturity`.

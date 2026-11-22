@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -8,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_mweb::mweb_sync::SyncProgress;
 
-use bdk_wallet::bitcoin::consensus::encode::deserialize;
 use bdk_wallet::bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::psbt::PsbtUtils;
@@ -37,7 +36,7 @@ use crate::dto::{
     UpsertContactRequest, UtxoRecord, WalletListItem, WalletSettings, WalletSummary,
     CHURN_AMOUNT_NOTE, DEFAULT_MWEB_FEE_SATS,
 };
-use crate::electrum::{self, BATCH_SIZE, MIN_FEE_RATE_SAT_VB, STOP_GAP};
+use crate::electrum::{self, MIN_FEE_RATE_SAT_VB};
 use crate::error::WalletError;
 use crate::labels;
 use crate::meta::{self, WalletMeta};
@@ -49,6 +48,7 @@ use crate::secrets::{EncryptedFileSecretStore, SecretStore, UnlockableSecretStor
 use crate::seed::MasterSecret;
 use crate::split::{self, PlanParams};
 use crate::split_ids;
+use crate::spv;
 use crate::utxo_labels;
 use crate::{MNEMONIC_ENC_FILE, MNEMONIC_FILE};
 
@@ -210,33 +210,37 @@ fn connect_from_meta(
     Ok((client, used))
 }
 
-/// One Electrum full scan or incremental sync applied to `wallet`. Does not persist.
+/// One SPV-verified Electrum full scan or incremental sync applied to
+/// `wallet`. Does not persist: persist the wallet, then the outcome's state.
 fn apply_electrum_chain_update(
     wallet: &mut PersistedWallet<Connection>,
     client: &crate::electrum::ElectrumClient,
+    network: WalletNetwork,
+    account_dir: &Path,
+    server_url: &str,
     full_scan: bool,
-) -> Result<(), WalletError> {
-    client.populate_tx_cache(wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx));
-    if full_scan {
-        diag::log("sync: electrum full_scan starting");
-        let request = wallet.start_full_scan();
-        let update = client
-            .full_scan(request, STOP_GAP, BATCH_SIZE, false)
-            .map_err(|e| WalletError::Electrum(e.to_string()))?;
-        wallet
-            .apply_update(update)
-            .map_err(|e| WalletError::Electrum(e.to_string()))?;
-    } else {
-        diag::log("sync: electrum sync starting");
-        let request = wallet.start_sync_with_revealed_spks();
-        let update = client
-            .sync(request, BATCH_SIZE, false)
-            .map_err(|e| WalletError::Electrum(e.to_string()))?;
-        wallet
-            .apply_update(update)
-            .map_err(|e| WalletError::Electrum(e.to_string()))?;
-    }
-    Ok(())
+    protected: &HashSet<Txid>,
+) -> Result<spv::SpvSyncOutcome, WalletError> {
+    spv::sync_electrum_spv(
+        wallet,
+        &client.inner,
+        network,
+        account_dir,
+        server_url,
+        full_scan,
+        protected,
+    )
+}
+
+/// Peg-in txids in MWEB history. Their transparent spends are ours even when
+/// no Electrum server reports them, so SPV eviction never drops them.
+fn pegin_txids(history: &crate::mweb_history::MwebHistory) -> HashSet<Txid> {
+    history
+        .entries
+        .iter()
+        .filter(|e| e.kind == TxKind::Pegin)
+        .filter_map(|e| parse_txid(&e.id))
+        .collect()
 }
 
 /// True when `wallet`'s chain still contains the previous tip header and the tip
@@ -1411,7 +1415,8 @@ impl WalletApp {
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| state.electrum_url.clone());
         meta::validate_electrum_url(&url)?;
-        let (tip_height, latency_ms) = electrum::probe_tip(&url, state.electrum_validate_domain)?;
+        let (tip_height, latency_ms) =
+            electrum::probe_tip(&url, state.electrum_validate_domain, state.network)?;
         Ok(ElectrumProbe {
             url,
             tip_height,
@@ -1438,7 +1443,24 @@ impl WalletApp {
         let explorer_base_url = crate::explorer::normalize_base_url(&req.explorer_base_url)?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-        state.electrum_url = req.electrum_url.trim().to_string();
+        let electrum_url = req.electrum_url.trim().to_string();
+        if electrum_url != state.electrum_url
+            || req.electrum_use_public_fallback != state.electrum_use_public_fallback
+        {
+            let protected = state
+                .mweb
+                .as_ref()
+                .map(|mweb| pegin_txids(&mweb.history))
+                .unwrap_or_default();
+            spv::evict_unconfirmed_on_server_switch(
+                &mut state.wallet,
+                &mut state.db,
+                &state.data_dir,
+                &electrum_url,
+                &protected,
+            )?;
+        }
+        state.electrum_url = electrum_url;
         state.electrum_validate_domain = req.electrum_validate_domain;
         state.electrum_use_public_fallback = req.electrum_use_public_fallback;
         state.auto_lock_minutes = req.auto_lock_minutes;
@@ -1593,11 +1615,27 @@ impl WalletApp {
         let pass = self.sync_pass();
         let prefer = self.remembered_electrum();
         let (client, used) = connect_from_meta(&meta, prefer.as_deref())?;
-        self.remember_electrum(used);
 
         let full_scan = meta.needs_full_scan;
         pass.electrum(full_scan);
-        apply_electrum_chain_update(&mut wallet, &client, full_scan)?;
+        // MWEB history is sealed while locked; the SPV state keeps the peg-ins
+        // an unlocked sync recorded.
+        let outcome = match apply_electrum_chain_update(
+            &mut wallet,
+            &client,
+            meta.network,
+            &account_dir,
+            &used,
+            full_scan,
+            &HashSet::new(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.forget_electrum();
+                return Err(e);
+            }
+        };
+        self.remember_electrum(used);
 
         if !chain_extended_in_place(&wallet, prev_height, prev_hash) {
             diag::log("prefetch: electrum update looked like a reorg; not persisting");
@@ -1607,6 +1645,7 @@ impl WalletApp {
         wallet
             .persist(&mut db)
             .map_err(|e| WalletError::Persist(e.to_string()))?;
+        outcome.persist_state()?;
         if full_scan {
             meta.needs_full_scan = false;
             meta::write_meta(&account_dir, &meta)?;
@@ -1639,21 +1678,45 @@ impl WalletApp {
         let electrum_started = std::time::Instant::now();
         let prefer = self.remembered_electrum();
         let client = connect_electrum_prefer(state, prefer.as_deref())?;
-        if let Some(used) = state.active_electrum_url.clone() {
-            self.remember_electrum(used);
-        }
+        let used = state
+            .active_electrum_url
+            .clone()
+            .unwrap_or_else(|| state.electrum_url.clone());
 
         let tx_count_before = state.wallet.transactions().count();
         let did_full_scan = state.needs_full_scan;
         let prev_tip = state.last_tip_height;
 
         pass.electrum(did_full_scan);
-        apply_electrum_chain_update(&mut state.wallet, &client, did_full_scan)?;
+        let protected = state
+            .mweb
+            .as_ref()
+            .map(|mweb| pegin_txids(&mweb.history))
+            .unwrap_or_default();
+        let outcome = match apply_electrum_chain_update(
+            &mut state.wallet,
+            &client,
+            state.network,
+            &state.data_dir,
+            &used,
+            did_full_scan,
+            &protected,
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // A server that failed verification is not tried first again.
+                self.forget_electrum();
+                state.active_electrum_url = None;
+                return Err(e);
+            }
+        };
 
         state
             .wallet
             .persist(&mut state.db)
             .map_err(|e| WalletError::Persist(e.to_string()))?;
+        outcome.persist_state()?;
+        self.remember_electrum(used);
         crate::crashpoint::maybe_crash("sync_after_electrum_persist");
         let electrum_ms = electrum_started.elapsed().as_millis() as u64;
 
@@ -1668,17 +1731,11 @@ impl WalletApp {
             reconcile_mweb_chain_with_wallet(&state.wallet, mweb);
         }
         state.last_tip_height = tip_height;
-        let timed_height = state.wallet.local_chain().tip().height();
-        match electrum::header_time(&client, timed_height) {
-            Ok(time) => {
-                state.tip_time = Some(time);
-                state.tip_time_height = timed_height;
-            }
-            Err(_) => {
-                if state.tip_time_height != timed_height {
-                    state.tip_time = None;
-                }
-            }
+        if outcome.tip_height == tip_height {
+            state.tip_time = Some(outcome.tip_time);
+            state.tip_time_height = tip_height;
+        } else if state.tip_time_height != tip_height {
+            state.tip_time = None;
         }
 
         if did_full_scan {
@@ -4744,16 +4801,10 @@ fn repair_missing_pegin_spends(
     let mut last_err: Option<String> = None;
     for id in &missing {
         match fetch_pegin_raw_tx(id, client, state) {
-            Ok(bytes) => match deserialize::<bdk_wallet::bitcoin::Transaction>(&bytes) {
-                Ok(tx) => {
-                    mweb::apply_pegin_transparent_spend(&mut state.wallet, tx);
-                    repaired += 1;
-                }
-                Err(e) => {
-                    last_err = Some(format!("decode {id}: {e}"));
-                    still_missing += 1;
-                }
-            },
+            Ok(tx) => {
+                mweb::apply_pegin_transparent_spend(&mut state.wallet, Arc::unwrap_or_clone(tx));
+                repaired += 1;
+            }
             Err(e) => {
                 last_err = Some(e);
                 still_missing += 1;
@@ -4802,14 +4853,24 @@ fn fetch_pegin_raw_tx(
     txid_hex: &str,
     client: &crate::electrum::ElectrumClient,
     state: &WalletState,
-) -> Result<Vec<u8>, String> {
+) -> Result<Arc<Transaction>, String> {
     use bdk_electrum::electrum_client::ElectrumApi;
 
     let mut errors: Vec<String> = Vec::new();
     let txid = parse_txid(txid_hex).ok_or_else(|| format!("invalid peg-in txid {txid_hex}"))?;
+    // Every source is untrusted: bytes count only when they are the asked-for tx.
+    let accept = |raw: Vec<u8>, source: &str, errors: &mut Vec<String>| {
+        spv::verify_transaction(&raw, &txid)
+            .map_err(|e| errors.push(format!("{source}: {e}")))
+            .ok()
+    };
 
     match client.inner.transaction_get_raw(&txid) {
-        Ok(raw) if !raw.is_empty() => return Ok(raw),
+        Ok(raw) if !raw.is_empty() => {
+            if let Some(tx) = accept(raw, "sync Electrum", &mut errors) {
+                return Ok(tx);
+            }
+        }
         Ok(_) => errors.push("sync Electrum returned empty tx".into()),
         Err(e) => errors.push(format!("sync Electrum: {e}")),
     }
@@ -4826,7 +4887,11 @@ fn fetch_pegin_raw_tx(
         let safe_url = crate::redact::redact_userinfo(url);
         match crate::rpc::get_raw_transaction_hex(url, txid_hex) {
             Ok(hex) => match hex::decode(hex.trim()) {
-                Ok(raw) if !raw.is_empty() => return Ok(raw),
+                Ok(raw) if !raw.is_empty() => {
+                    if let Some(tx) = accept(raw, &format!("RPC {safe_url}"), &mut errors) {
+                        return Ok(tx);
+                    }
+                }
                 Ok(_) => errors.push(format!("RPC {safe_url}: empty hex")),
                 Err(e) => errors.push(format!("RPC {safe_url}: bad hex ({e})")),
             },
@@ -4843,7 +4908,11 @@ fn fetch_pegin_raw_tx(
         let safe_url = crate::redact::redact_userinfo(&url);
         match electrum::connect_with_timeout(&url, state.electrum_validate_domain, 10) {
             Ok(alt) => match alt.inner.transaction_get_raw(&txid) {
-                Ok(raw) if !raw.is_empty() => return Ok(raw),
+                Ok(raw) if !raw.is_empty() => {
+                    if let Some(tx) = accept(raw, &safe_url, &mut errors) {
+                        return Ok(tx);
+                    }
+                }
                 Ok(_) => errors.push(format!("{safe_url}: empty tx")),
                 Err(e) => errors.push(format!("{safe_url}: {e}")),
             },
@@ -4853,7 +4922,11 @@ fn fetch_pegin_raw_tx(
 
     if state.network == WalletNetwork::Mainnet {
         match fetch_tx_hex_litecoinspace(txid_hex) {
-            Ok(raw) => return Ok(raw),
+            Ok(raw) => {
+                if let Some(tx) = accept(raw, "litecoinspace", &mut errors) {
+                    return Ok(tx);
+                }
+            }
             Err(e) => errors.push(format!("litecoinspace: {e}")),
         }
     }
@@ -5073,16 +5146,23 @@ fn hash_at(
     wallet.local_chain().get(height).map(|cp| cp.hash())
 }
 
+/// The local chain's hash at `height`, else a header an earlier sync verified,
+/// else a server header that passes Litecoin proof of work.
 fn block_hash_at(
     wallet: &PersistedWallet<Connection>,
+    account_dir: &Path,
+    network: WalletNetwork,
     electrum: Option<&electrum::ElectrumClient>,
     height: u32,
 ) -> Option<bdk_wallet::bitcoin::BlockHash> {
     if let Some(hash) = hash_at(wallet, height) {
         return Some(hash);
     }
+    if let Some(header) = spv::verified_header_at(account_dir, height) {
+        return Some(header.block_hash());
+    }
     let header = electrum?.inner.block_header(height as usize).ok()?;
-    Some(header.block_hash())
+    spv::verify_header_pow(&header, height, network).ok()
 }
 
 enum ResolvedHop {
@@ -5139,6 +5219,8 @@ impl HopCheck {
 /// sync height map, so a pass that lost its peer halfway does not start over.
 struct HopReader<'a> {
     wallet: &'a PersistedWallet<Connection>,
+    account_dir: &'a Path,
+    network: WalletNetwork,
     electrum: Option<&'a electrum::ElectrumClient>,
     lookup: mweb::MmrLookup,
     height_map: &'a std::collections::BTreeMap<u32, u64>,
@@ -5151,8 +5233,14 @@ impl HopReader<'_> {
         if let Some(hit) = self.cache.get(&height) {
             return Some(*hit);
         }
-        let fetched = block_hash_at(self.wallet, self.electrum, height)
-            .and_then(|hash| self.lookup.get(hash));
+        let fetched = block_hash_at(
+            self.wallet,
+            self.account_dir,
+            self.network,
+            self.electrum,
+            height,
+        )
+        .and_then(|hash| self.lookup.get(hash));
         match fetched {
             Some(sizes) => {
                 self.cache.insert(height, sizes);
@@ -5294,6 +5382,8 @@ fn resolve_after_broadcast(
 
     let mut reader = HopReader {
         wallet: &state.wallet,
+        account_dir: &state.data_dir,
+        network: state.network,
         electrum,
         lookup: mweb::MmrLookup::new(addrs, state.network),
         height_map: &height_map,
@@ -5405,7 +5495,13 @@ fn score_hop_window(
     let mut hashes = Vec::with_capacity(heights.len());
     let mut index_of = Vec::with_capacity(heights.len());
     for height in &heights {
-        if let Some(hash) = block_hash_at(&state.wallet, electrum, *height) {
+        if let Some(hash) = block_hash_at(
+            &state.wallet,
+            &state.data_dir,
+            state.network,
+            electrum,
+            *height,
+        ) {
             index_of.push(Some(hashes.len()));
             hashes.push(hash);
         } else {
@@ -7466,6 +7562,7 @@ mod tests {
 
     mod crash_recovery_tests;
     mod error_path_tests;
+    mod spv_tests;
     mod tx_invariants_tests;
 }
 

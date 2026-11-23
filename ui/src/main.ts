@@ -8689,6 +8689,9 @@ el.sendForm.addEventListener("submit", async (event) => {
   const pendingLabel = readLabel();
   el.sendNote.value = pendingLabel;
 
+  // Confirm already closed the modal; force-hide so the loading blur does not
+  // composite a ghost of the review panel underneath.
+  el.modalOverlay.hidden = true;
   updateBusyUi();
   showLoading("Broadcasting transaction…");
   let result: SendResult;

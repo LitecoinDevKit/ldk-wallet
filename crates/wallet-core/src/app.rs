@@ -2283,40 +2283,60 @@ impl WalletApp {
 
     pub fn send(&self, req: SendRequest) -> Result<SendResult, WalletError> {
         self.ensure_unlocked()?;
-        let mut guard = self.lock_state()?;
-        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        // Sign under the lock, then broadcast without it. Electrum connect and
+        // broadcast can take long enough that sync and other spends must not wait.
+        let (data_dir, electrum_candidates, electrum_validate_domain, tx, fee_sats, hold) = {
+            let mut guard = self.lock_state()?;
+            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
-        let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &req)?;
+            let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &req)?;
+            sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
 
-        sign_and_finalize(&state.wallet, &state.signer, &mut psbt)?;
+            let fee_sats = psbt
+                .fee_amount()
+                .ok_or_else(|| WalletError::BuildTx("unable to compute fee".into()))?
+                .to_sat();
+            let tx = psbt
+                .extract_tx()
+                .map_err(|e| WalletError::BuildTx(e.to_string()))?;
+            let outpoints: Vec<_> = tx.input.iter().map(|input| input.previous_output).collect();
+            let hold = CoinHold::take_public(&state.data_dir, outpoints, &self.session)?;
+            (
+                state.data_dir.clone(),
+                electrum_candidates(state),
+                state.electrum_validate_domain,
+                tx,
+                fee_sats,
+                hold,
+            )
+        };
 
-        let fee_sats = psbt
-            .fee_amount()
-            .ok_or_else(|| WalletError::BuildTx("unable to compute fee".into()))?
-            .to_sat();
-        let tx = psbt
-            .extract_tx()
-            .map_err(|e| WalletError::BuildTx(e.to_string()))?;
-
-        let client = connect_electrum(state)?;
+        let (client, _) = electrum::connect_first(&electrum_candidates, electrum_validate_domain)?;
         client.transaction_broadcast(&tx).map_err(|e| {
             WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
         })?;
 
+        let result = self.commit_public_send(&data_dir, tx, fee_sats);
+        drop(hold);
+        result
+    }
+
+    fn commit_public_send(
+        &self,
+        source_dir: &Path,
+        tx: Transaction,
+        fee_sats: u64,
+    ) -> Result<SendResult, WalletError> {
+        let txid = tx.compute_txid().to_string();
         // Keep local balance honest until the next sync sees the broadcast.
-        state
-            .wallet
-            .apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
-
-        state
-            .wallet
-            .persist(&mut state.db)
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-
-        Ok(SendResult {
-            txid: tx.compute_txid().to_string(),
-            fee_sats,
-        })
+        self.with_account_wallet(source_dir, |wallet, db| {
+            wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
+            wallet
+                .persist(db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            Ok(())
+        })?;
+        Ok(SendResult { txid, fee_sats })
     }
 
     pub fn preview_pegin(&self, req: PeginRequest) -> Result<PeginPreview, WalletError> {

@@ -478,6 +478,51 @@ fn lock_during_public_split_broadcast_releases_hold_and_drops_state() {
 }
 
 #[test]
+fn lock_during_public_send_broadcast_releases_hold_and_drops_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, outs) = app_with_public_coins(dir.path(), &[1_000_000, 2_000_000]);
+    app.set_utxo_locked(SetUtxoLockedRequest {
+        outpoint: outs[1].to_string(),
+        locked: true,
+    })
+    .unwrap();
+    let data_dir = account_dir(&app);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let electrum = format!("tcp://{}", listener.local_addr().unwrap());
+    configure(&app, &electrum, None, &[], false);
+    let address = app.receive_address().unwrap();
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            app.send(SendRequest {
+                address: address.clone(),
+                amount_sats: 10_000,
+                fee_rate_sat_vb: Some(1),
+                drain: false,
+                selected_outpoints: Some(vec![outs[0].to_string()]),
+            })
+        });
+        let stream = take_speaking_connection(&listener);
+        assert_eq!(public_row(&app, &outs[0]).status, CoinStatus::Sending);
+        assert!(mweb_frozen::read_ids(&data_dir)
+            .unwrap()
+            .public_reserved
+            .contains_key(&outs[0].to_string()));
+        app.lock();
+        drop(stream);
+        assert!(worker.join().unwrap().is_err());
+    });
+
+    assert_locked(&app);
+    let file = mweb_frozen::read_ids(&data_dir).unwrap();
+    assert!(file.public_reserved.is_empty());
+    unlock_load(&app, dir.path());
+    assert_eq!(public_row(&app, &outs[0]).status, CoinStatus::Ready);
+    assert_eq!(public_row(&app, &outs[1]).status, CoinStatus::Frozen);
+    assert!(public_row(&app, &outs[1]).locked);
+}
+
+#[test]
 fn lock_during_resync_aborts_at_check_lock_and_resets_sync_phase() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);

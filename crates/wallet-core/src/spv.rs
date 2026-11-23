@@ -1033,6 +1033,18 @@ fn verify_server_chain<E: ElectrumApi>(
             server_tip,
         });
     }
+    if server_tip == local_tip
+        && notification.header.block_hash() == local_cp.hash()
+        && local_headers.get(&local_tip) == Some(&notification.header)
+    {
+        return Ok(VerifiedChain {
+            tip_height: server_tip,
+            agreement: local_tip,
+            headers: BTreeMap::from([(local_tip, notification.header)]),
+            local_hashes,
+            cached_headers: local_headers.clone(),
+        });
+    }
 
     let mut server = BTreeMap::new();
     let mut start = local_tip
@@ -1182,8 +1194,13 @@ fn scan_spks<E: ElectrumApi>(
 ) -> Result<Option<u32>, WalletError> {
     let mut unused = 0usize;
     let mut last_active = None;
+    let batch_size = if stop_gap == usize::MAX {
+        (BATCH_SIZE * 2).max(1)
+    } else {
+        BATCH_SIZE.max(1)
+    };
     loop {
-        let batch: Vec<_> = spks.by_ref().take(BATCH_SIZE.max(1)).collect();
+        let batch: Vec<_> = spks.by_ref().take(batch_size).collect();
         if batch.is_empty() {
             return Ok(last_active);
         }

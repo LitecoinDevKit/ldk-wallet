@@ -53,6 +53,10 @@ struct MockChainState {
     broadcast_txs: Vec<Transaction>,
     /// Heights passed to `blockchain.block.header` (one entry per call).
     header_calls: Vec<u32>,
+    /// Number of `blockchain.block.headers` batch calls.
+    headers_batch_calls: usize,
+    /// Number of `blockchain.scripthash.get_history` calls.
+    script_history_calls: usize,
 }
 
 struct MockElectrumServer {
@@ -167,6 +171,7 @@ fn handle_single_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
             }
         }
         "blockchain.block.headers" => {
+            st.headers_batch_calls += 1;
             let start = params.first().and_then(Value::as_u64).unwrap_or(0) as u32;
             let count = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
             let mut raw = Vec::new();
@@ -190,6 +195,7 @@ fn handle_single_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
             })
         }
         "blockchain.scripthash.get_history" => {
+            st.script_history_calls += 1;
             let sh = params.first().and_then(Value::as_str).unwrap_or("");
             let entries: Vec<Value> = st
                 .histories
@@ -1066,4 +1072,144 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
         second_ms < 1_500,
         "a peg-in that just failed its fallbacks must not stall the next sync, got {second_ms} ms"
     );
+}
+
+#[test]
+fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x71);
+    let (state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    // Simulate a peg-in coin absorbed by `absorb_received_coins` (where `id` is the MWEB
+    // output_id and `output_ids` contains `id`, with positive `net_sats` and no `fee_sats`).
+    let absorbed_output_id = "cd".repeat(32);
+    {
+        let mut guard = app.lock_state().unwrap();
+        let st = guard.as_mut().unwrap();
+        st.litecoin_rpc_url = Some(rpc_url);
+        st.mweb.as_mut().unwrap().history.record(MwebHistoryEntry {
+            id: absorbed_output_id.clone(),
+            kind: TxKind::Pegin,
+            net_sats: 500_000,
+            fee_sats: None,
+            timestamp: crate::mweb_history::now_ts(),
+            output_ids: vec![absorbed_output_id],
+            input_ids: Vec::new(),
+            confirmed_height: Some(1),
+        });
+        let data_dir = st.data_dir.clone();
+        st.mweb.as_mut().unwrap().persist(&data_dir).unwrap();
+    }
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+
+    let started = std::time::Instant::now();
+    let res = app.sync().expect("sync succeeds");
+    let elapsed_ms = started.elapsed().as_millis();
+    assert!(
+        res.warnings.is_empty(),
+        "absorbed MWEB peg-in coin must not trigger missing transparent peg-in warning: {:?}",
+        res.warnings
+    );
+    assert!(
+        elapsed_ms < 1_000,
+        "absorbed MWEB peg-in coin must not stall sync on RPC fallback, took {elapsed_ms} ms"
+    );
+}
+
+#[test]
+fn unchanged_tip_skips_redundant_header_window_fetch_and_fresh_prefetch_skips_duplicate_scan() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x72);
+    let (mut state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+    extend_chain(&mut state, 5);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+
+    app.sync().expect("first sync at tip 5");
+    assert_eq!(app.summary().unwrap().tip_height, 5);
+
+    // Second sync at the same tip height/hash should not re-fetch the header window.
+    server.update(|st| {
+        st.header_calls.clear();
+        st.headers_batch_calls = 0;
+    });
+    app.sync().expect("second sync at unchanged tip 5");
+    {
+        let st = server.state.lock().unwrap();
+        assert!(
+            st.header_calls.is_empty() && st.headers_batch_calls == 0,
+            "unchanged tip must not re-fetch headers: header_calls={:?}, batch_calls={}",
+            st.header_calls,
+            st.headers_batch_calls
+        );
+    }
+
+    // Lock the wallet, advance the chain to 8, run prefetch_transparent, then unlock + load + sync.
+    app.lock();
+    server.update(|st| {
+        extend_chain(st, 8);
+    });
+    assert!(
+        app.prefetch_transparent(dir.path()).expect("prefetch"),
+        "locked prefetch should advance chain to 8"
+    );
+    app.unlock(crate::dto::UnlockRequest {
+        passphrase: "correct horse battery staple".into(),
+    })
+    .expect("unlock");
+    let summary = app.load(dir.path()).expect("load");
+    assert_eq!(summary.tip_height, 8);
+
+    server.update(|st| {
+        st.header_calls.clear();
+        st.headers_batch_calls = 0;
+        st.script_history_calls = 0;
+    });
+    let res = app.sync().expect("sync right after prefetch");
+    assert_eq!(res.summary.tip_height, 8);
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(
+            st.script_history_calls, 0,
+            "sync right after fresh prefetch must reuse the prefetched script scan"
+        );
+        assert_eq!(
+            st.headers_batch_calls, 0,
+            "sync right after fresh prefetch must not re-download headers"
+        );
+    }
 }

@@ -9,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize};
@@ -24,9 +24,13 @@ use crate::network::WalletNetwork;
 const NODE_MWEB_LIGHT_CLIENT: u64 = 1 << 23;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Once at least [`MIN_EARLY_PEERS`] have answered, wait at most this much
+/// longer for slower peers before returning the pool to the syncer.
+const EARLY_RETURN_GRACE: Duration = Duration::from_millis(600);
+const MIN_EARLY_PEERS: usize = 2;
 /// Sync runs every 60s; re-crawling that often would be rude to the seeders.
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-const MAX_PROBES: usize = 32;
+const MAX_PROBES_PER_SEED: usize = 10;
 const WANT_PEERS: usize = 8;
 
 struct Cached {
@@ -36,6 +40,9 @@ struct Cached {
 }
 
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+/// Serializes cache-miss crawls so `warm_mweb_peers_in_background` and `sync`
+/// share a single crawl instead of racing two parallel crawls.
+static CRAWL_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
@@ -59,15 +66,12 @@ pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
     if OFFLINE.with(std::cell::Cell::get) {
         return Vec::new();
     }
-    if let Ok(guard) = CACHE.lock() {
-        if let Some(cached) = guard.as_ref() {
-            if cached.network == network
-                && cached.at.elapsed() < CACHE_TTL
-                && !cached.addrs.is_empty()
-            {
-                return cached.addrs.clone();
-            }
-        }
+    if let Some(addrs) = cached_peers(network) {
+        return addrs;
+    }
+    let _crawl_guard = CRAWL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(addrs) = cached_peers(network) {
+        return addrs;
     }
     let addrs = crawl(network);
     if let Ok(mut guard) = CACHE.lock() {
@@ -80,6 +84,16 @@ pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
     addrs
 }
 
+fn cached_peers(network: WalletNetwork) -> Option<Vec<SocketAddr>> {
+    let guard = CACHE.lock().ok()?;
+    let cached = guard.as_ref()?;
+    if cached.network == network && cached.at.elapsed() < CACHE_TTL && !cached.addrs.is_empty() {
+        Some(cached.addrs.clone())
+    } else {
+        None
+    }
+}
+
 /// Forget cached peers so the next call re-crawls (used after a settings change).
 pub fn clear_cache() {
     if let Ok(mut guard) = CACHE.lock() {
@@ -87,40 +101,75 @@ pub fn clear_cache() {
     }
 }
 
+/// Pre-warm the MWEB peer cache on a background thread when it is cold.
+pub(crate) fn warm_mweb_peers_in_background(network: WalletNetwork) {
+    #[cfg(test)]
+    if OFFLINE.with(std::cell::Cell::get) {
+        return;
+    }
+    if cached_peers(network).is_some() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = discover_mweb_peers(network);
+    });
+}
+
 fn crawl(network: WalletNetwork) -> Vec<SocketAddr> {
     let port = network.p2p_port();
-    let mut candidates: Vec<SocketAddr> = Vec::new();
-    for host in network.dns_seeds() {
-        let Ok(resolved) = (*host, port).to_socket_addrs() else {
-            continue;
-        };
-        for addr in resolved {
-            if !candidates.contains(&addr) {
-                candidates.push(addr);
-            }
-        }
+    let seeds = network.dns_seeds();
+    if seeds.is_empty() {
+        return Vec::new();
     }
-    // Spread load across the seeder's answer instead of always taking the
-    // first few, which would concentrate every install on the same nodes.
-    shuffle(&mut candidates);
-    candidates.truncate(MAX_PROBES);
 
-    let found = Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        for &addr in &candidates {
-            let found = &found;
-            scope.spawn(move || {
-                if serves_mweb(addr, network) {
-                    if let Ok(mut found) = found.lock() {
-                        found.push(addr);
+    // Do NOT wrap `to_socket_addrs()` in `std::thread::scope`: a single dead DNS
+    // seeder can stall `getaddrinfo` for 30s on macOS. Instead, each seed thread
+    // resolves detached and immediately spawns probes for its own candidates.
+    let (tx, rx) = mpsc::channel();
+    for &host in seeds {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let Ok(resolved) = (host, port).to_socket_addrs() else {
+                return;
+            };
+            let mut candidates: Vec<SocketAddr> = resolved.collect();
+            shuffle(&mut candidates);
+            candidates.truncate(MAX_PROBES_PER_SEED);
+            for addr in candidates {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    if serves_mweb(addr, network) {
+                        let _ = tx.send(addr);
+                    }
+                });
+            }
+        });
+    }
+    drop(tx);
+
+    let hard_deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut grace_deadline: Option<Instant> = None;
+    let mut addrs = Vec::with_capacity(WANT_PEERS);
+    while addrs.len() < WANT_PEERS {
+        let effective_deadline = match grace_deadline {
+            Some(g) => hard_deadline.min(g),
+            None => hard_deadline,
+        };
+        let Some(wait) = effective_deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(wait) {
+            Ok(addr) => {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                    if addrs.len() >= MIN_EARLY_PEERS && grace_deadline.is_none() {
+                        grace_deadline = Some(Instant::now() + EARLY_RETURN_GRACE);
                     }
                 }
-            });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         }
-    });
-
-    let mut addrs = found.into_inner().unwrap_or_default();
-    addrs.truncate(WANT_PEERS);
+    }
     addrs
 }
 
@@ -130,6 +179,7 @@ fn serves_mweb(addr: SocketAddr, network: WalletNetwork) -> bool {
 
 /// Handshake far enough to read the peer's advertised service flags, then hang up.
 fn peer_services(addr: SocketAddr, network: WalletNetwork) -> Option<u64> {
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     let magic = network.to_bitcoin_network().magic();
     let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
     stream.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
@@ -159,8 +209,15 @@ fn peer_services(addr: SocketAddr, network: WalletNetwork) -> Option<u64> {
     stream.write_all(&serialize(&raw)).ok()?;
 
     for _ in 0..8 {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
         let msg = recv(&mut stream)?;
         if let NetworkMessage::Version(peer) = msg.payload() {
+            let verack = RawNetworkMessage::new(magic, NetworkMessage::Verack);
+            let _ = stream.write_all(&serialize(&verack));
             return Some(u64::from(peer.services));
         }
     }

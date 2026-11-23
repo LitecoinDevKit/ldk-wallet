@@ -143,7 +143,9 @@ pub fn cross_check_tip(
 /// `server.version` first: some ElectrumX deployments refuse every other call
 /// until the client identifies itself. Servers that don't care about
 /// identification are covered by the plain ping fallback.
-fn handshake(client: &ElectrumClient) -> Result<(), bdk_electrum::electrum_client::Error> {
+pub(crate) fn handshake(
+    client: &ElectrumClient,
+) -> Result<(), bdk_electrum::electrum_client::Error> {
     let version = client.inner.raw_call(
         "server.version",
         vec![

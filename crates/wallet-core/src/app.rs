@@ -232,13 +232,22 @@ fn apply_electrum_chain_update(
     )
 }
 
+/// True when a `TxKind::Pegin` history row records a locally broadcast
+/// transparent peg-in transaction (`id` is the transparent `txid`), rather than
+/// a coin synthesized by `absorb_received_coins` (`id` is the MWEB `output_id`).
+fn is_local_pegin_entry(entry: &crate::mweb_history::MwebHistoryEntry) -> bool {
+    entry.kind == TxKind::Pegin
+        && entry.net_sats < 0
+        && !entry.output_ids.iter().any(|oid| oid == &entry.id)
+}
+
 /// Peg-in txids in MWEB history. Their transparent spends are ours even when
 /// no Electrum server reports them, so SPV eviction never drops them.
 fn pegin_txids(history: &crate::mweb_history::MwebHistory) -> HashSet<Txid> {
     history
         .entries
         .iter()
-        .filter(|e| e.kind == TxKind::Pegin)
+        .filter(|e| is_local_pegin_entry(e))
         .filter_map(|e| parse_txid(&e.id))
         .collect()
 }
@@ -392,6 +401,31 @@ fn activate_parked(
     Ok(Some(summary))
 }
 
+/// How long a completed locked prefetch can stand in for the unlocked Electrum
+/// pass that runs right after `load_wallet`.
+const PREFETCH_REUSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Cached result of [`electrum::cross_check_tip`] so unchanged tips do not
+/// reconnect to the second Electrum server on every sync.
+struct CrossCheckCache {
+    server_url: String,
+    tip_height: u32,
+    tip_hash: bdk_wallet::bitcoin::BlockHash,
+    warning: Option<String>,
+}
+
+/// Result of a recent locked transparent prefetch so the immediate post-unlock
+/// [`WalletApp::sync`] does not repeat the same Electrum scan.
+struct FreshPrefetch {
+    account_dir: PathBuf,
+    server_url: String,
+    tip_height: u32,
+    tip_hash: bdk_wallet::bitcoin::BlockHash,
+    tip_time: u64,
+    new_txs: u32,
+    completed_at: std::time::Instant,
+}
+
 /// The only writer of [`WalletApp::sync_phase`] during a pass. Dropped without
 /// [`SyncPass::finish`], it puts the phase back to Idle, so no early return can
 /// leave pollers reading a step that has stopped.
@@ -416,6 +450,13 @@ impl SyncPass<'_> {
     /// Done stays visible until the next pass starts.
     fn finish(mut self) {
         self.set(SyncPhase::Done, "pass finished");
+        self.finished = true;
+    }
+
+    /// Locked prefetch only warms the transparent chain; return to Idle cleanly
+    /// instead of logging an aborted pass on drop.
+    fn finish_prefetch(mut self) {
+        self.set(SyncPhase::Idle, "prefetch finished");
         self.finished = true;
     }
 
@@ -458,6 +499,10 @@ pub struct WalletApp {
     /// Electrum URL that connected most recently. Survives lock so the next
     /// sync does not retry a dead configured server first. Not a secret.
     last_good_electrum: Mutex<Option<String>>,
+    /// Recent locked prefetch that `sync()` can reuse immediately after unlock.
+    last_prefetch: Mutex<Option<FreshPrefetch>>,
+    /// Last Electrum tip already audited against a second server.
+    last_cross_check: Mutex<Option<CrossCheckCache>>,
     /// Copied from wallet state on load and settings save. Insights reads this
     /// instead of the wallet mutex.
     insights_endpoint: Mutex<Option<InsightsEndpoint>>,
@@ -484,6 +529,8 @@ impl WalletApp {
             pending_lock: AtomicBool::new(false),
             session: hex::encode(rand::random::<[u8; 16]>()),
             last_good_electrum: Mutex::new(None),
+            last_prefetch: Mutex::new(None),
+            last_cross_check: Mutex::new(None),
             insights_endpoint: Mutex::new(None),
             pegin_repair_fallback_at: Mutex::new(HashMap::new()),
         }
@@ -528,6 +575,74 @@ impl WalletApp {
     fn forget_electrum(&self) {
         if let Ok(mut slot) = self.last_good_electrum.lock() {
             *slot = None;
+        }
+        if let Ok(mut slot) = self.last_prefetch.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.last_cross_check.lock() {
+            *slot = None;
+        }
+    }
+
+    fn cached_cross_check(
+        &self,
+        server_url: &str,
+        tip_height: u32,
+        tip_hash: bdk_wallet::bitcoin::BlockHash,
+    ) -> Option<Option<String>> {
+        let slot = self.last_cross_check.lock().ok()?;
+        let cached = slot.as_ref()?;
+        if cached.server_url == server_url
+            && cached.tip_height == tip_height
+            && cached.tip_hash == tip_hash
+        {
+            Some(cached.warning.clone())
+        } else {
+            None
+        }
+    }
+
+    fn note_cross_check(
+        &self,
+        server_url: String,
+        tip_height: u32,
+        tip_hash: bdk_wallet::bitcoin::BlockHash,
+        warning: Option<String>,
+    ) {
+        if let Ok(mut slot) = self.last_cross_check.lock() {
+            *slot = Some(CrossCheckCache {
+                server_url,
+                tip_height,
+                tip_hash,
+                warning,
+            });
+        }
+    }
+
+    fn note_fresh_prefetch(&self, prefetch: FreshPrefetch) {
+        if let Ok(mut slot) = self.last_prefetch.lock() {
+            *slot = Some(prefetch);
+        }
+    }
+
+    fn take_fresh_prefetch(
+        &self,
+        account_dir: &Path,
+        tip_height: u32,
+        tip_hash: bdk_wallet::bitcoin::BlockHash,
+        needs_full_scan: bool,
+    ) -> Option<FreshPrefetch> {
+        let mut slot = self.last_prefetch.lock().ok()?;
+        let prefetched = slot.take()?;
+        if !needs_full_scan
+            && prefetched.account_dir == account_dir
+            && prefetched.tip_height == tip_height
+            && prefetched.tip_hash == tip_hash
+            && prefetched.completed_at.elapsed() < PREFETCH_REUSE_WINDOW
+        {
+            Some(prefetched)
+        } else {
+            None
         }
     }
 
@@ -1123,6 +1238,7 @@ impl WalletApp {
         let account_dir = accounts::active_account_dir(data_dir)?;
         let mut guard = self.lock_state()?;
         let state = self.read_account_state(&account_dir)?;
+        crate::discovery::warm_mweb_peers_in_background(state.network);
         guard.check_lock()?;
         let summary = {
             let mut park = self.lock_park()?;
@@ -1638,11 +1754,20 @@ impl WalletApp {
         let prev = wallet.latest_checkpoint();
         let prev_height = prev.height();
         let prev_hash = prev.hash();
+        let tx_count_before = wallet.transactions().count();
+
+        // Warm MWEB peer discovery in the background while the user is on the
+        // unlock screen so the subsequent unlocked sync does not wait on DNS crawl.
+        crate::discovery::warm_mweb_peers_in_background(meta.network);
 
         // Prefetch only warms the chain; the sync after it reports Done.
         let pass = self.sync_pass();
         let prefer = self.remembered_electrum();
         let (client, used) = connect_from_meta(&meta, prefer.as_deref())?;
+        if !self.secrets.is_locked() {
+            pass.finish_prefetch();
+            return Ok(false);
+        }
 
         let full_scan = meta.needs_full_scan;
         pass.electrum(full_scan);
@@ -1663,10 +1788,11 @@ impl WalletApp {
                 return Err(e);
             }
         };
-        self.remember_electrum(used);
+        self.remember_electrum(used.clone());
 
         if !chain_extended_in_place(&wallet, prev_height, prev_hash) {
             diag::log("prefetch: electrum update looked like a reorg; not persisting");
+            pass.finish_prefetch();
             return Ok(false);
         }
 
@@ -1678,6 +1804,18 @@ impl WalletApp {
             meta.needs_full_scan = false;
             meta::write_meta(&account_dir, &meta)?;
         }
+        let tx_count_after = wallet.transactions().count();
+        let latest = wallet.latest_checkpoint();
+        self.note_fresh_prefetch(FreshPrefetch {
+            account_dir,
+            server_url: used,
+            tip_height: latest.height(),
+            tip_hash: latest.hash(),
+            tip_time: outcome.tip_time,
+            new_txs: tx_count_after.saturating_sub(tx_count_before) as u32,
+            completed_at: std::time::Instant::now(),
+        });
+        pass.finish_prefetch();
         Ok(true)
     }
 
@@ -1705,63 +1843,106 @@ impl WalletApp {
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
+        let sync_started = std::time::Instant::now();
         let pass = self.sync_pass();
         let state = guard
             .as_mut()
             .ok_or(WalletError::NotLoaded)
             .map_err(Self::log_sync_failure)?;
 
-        let electrum_started = std::time::Instant::now();
-        let prefer = self.remembered_electrum();
-        let client =
-            connect_electrum_prefer(state, prefer.as_deref()).map_err(Self::log_sync_failure)?;
-        let used = state
-            .active_electrum_url
-            .clone()
-            .unwrap_or_else(|| state.electrum_url.clone());
-
         let tx_count_before = state.wallet.transactions().count();
         let did_full_scan = state.needs_full_scan;
         let prev_tip = state.last_tip_height;
+        let current_cp = state.wallet.latest_checkpoint();
 
-        pass.electrum(did_full_scan);
-        let protected = state
-            .mweb
-            .as_ref()
-            .map(|mweb| pegin_txids(&mweb.history))
-            .unwrap_or_default();
-        let outcome = match apply_electrum_chain_update(
-            &mut state.wallet,
-            &client,
-            state.network,
+        let (
+            used,
+            electrum_ms,
+            electrum_reused,
+            outcome_tip_height,
+            outcome_tip_time,
+            prefetched_new_txs,
+            mut lazy_client,
+        ) = if let Some(prefetched) = self.take_fresh_prefetch(
             &state.data_dir,
-            &used,
+            current_cp.height(),
+            current_cp.hash(),
             did_full_scan,
-            &protected,
         ) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // A server that failed verification is not tried first again.
-                self.forget_electrum();
-                state.active_electrum_url = None;
-                return Err(Self::log_sync_failure(e));
-            }
-        };
+            pass.electrum(false);
+            state.active_electrum_url = Some(prefetched.server_url.clone());
+            self.remember_electrum(prefetched.server_url.clone());
+            diag::log(format!(
+                "sync: electrum reused from prefetch tip={} ms=0",
+                prefetched.tip_height
+            ));
+            (
+                prefetched.server_url,
+                0u64,
+                true,
+                prefetched.tip_height,
+                prefetched.tip_time,
+                prefetched.new_txs,
+                None,
+            )
+        } else {
+            let electrum_started = std::time::Instant::now();
+            let prefer = self.remembered_electrum();
+            let client = connect_electrum_prefer(state, prefer.as_deref())
+                .map_err(Self::log_sync_failure)?;
+            let used = state
+                .active_electrum_url
+                .clone()
+                .unwrap_or_else(|| state.electrum_url.clone());
 
-        let persist_started = std::time::Instant::now();
-        let persisted = state
-            .wallet
-            .persist(&mut state.db)
-            .map_err(|e| WalletError::Persist(e.to_string()))
-            .and_then(|_| outcome.persist_state());
-        diag::log(format!(
-            "sync: electrum persist ms={}",
-            persist_started.elapsed().as_millis() as u64
-        ));
-        persisted.map_err(Self::log_sync_failure)?;
-        self.remember_electrum(used);
-        crate::crashpoint::maybe_crash("sync_after_electrum_persist");
-        let electrum_ms = electrum_started.elapsed().as_millis() as u64;
+            pass.electrum(did_full_scan);
+            let protected = state
+                .mweb
+                .as_ref()
+                .map(|mweb| pegin_txids(&mweb.history))
+                .unwrap_or_default();
+            let outcome = match apply_electrum_chain_update(
+                &mut state.wallet,
+                &client,
+                state.network,
+                &state.data_dir,
+                &used,
+                did_full_scan,
+                &protected,
+            ) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A server that failed verification is not tried first again.
+                    self.forget_electrum();
+                    state.active_electrum_url = None;
+                    return Err(Self::log_sync_failure(e));
+                }
+            };
+
+            let persist_started = std::time::Instant::now();
+            let persisted = state
+                .wallet
+                .persist(&mut state.db)
+                .map_err(|e| WalletError::Persist(e.to_string()))
+                .and_then(|_| outcome.persist_state());
+            diag::log(format!(
+                "sync: electrum persist ms={}",
+                persist_started.elapsed().as_millis() as u64
+            ));
+            persisted.map_err(Self::log_sync_failure)?;
+            self.remember_electrum(used.clone());
+            crate::crashpoint::maybe_crash("sync_after_electrum_persist");
+            let electrum_ms = electrum_started.elapsed().as_millis() as u64;
+            (
+                used,
+                electrum_ms,
+                false,
+                outcome.tip_height,
+                outcome.tip_time,
+                0u32,
+                Some(client),
+            )
+        };
 
         let tip_height = state.wallet.latest_checkpoint().height();
         let tip_hash = state.wallet.latest_checkpoint().hash();
@@ -1774,8 +1955,8 @@ impl WalletApp {
             reconcile_mweb_chain_with_wallet(&state.wallet, mweb);
         }
         state.last_tip_height = tip_height;
-        if outcome.tip_height == tip_height {
-            state.tip_time = Some(outcome.tip_time);
+        if outcome_tip_height == tip_height {
+            state.tip_time = Some(outcome_tip_time);
             state.tip_time_height = tip_height;
         } else if state.tip_time_height != tip_height {
             state.tip_time = None;
@@ -1785,37 +1966,6 @@ impl WalletApp {
             state.needs_full_scan = false;
         }
 
-        // Privacy-preserving second opinion: compare the served chain against
-        // an independent server (headers only, never our scripts).
-        let mut warnings: Vec<String> = Vec::new();
-        let used_server = state
-            .active_electrum_url
-            .clone()
-            .unwrap_or_else(|| state.electrum_url.clone());
-        let cross_started = std::time::Instant::now();
-        if let Some(alt) = electrum_candidates(state)
-            .into_iter()
-            .find(|url| *url != used_server)
-        {
-            let chain = state.wallet.local_chain();
-            let local_hash_at = |height: u32| chain.get(height).map(|cp| cp.hash());
-            match electrum::cross_check_tip(
-                &alt,
-                state.electrum_validate_domain,
-                tip_height,
-                &local_hash_at,
-            ) {
-                Ok(Some(warning)) => warnings.push(warning),
-                Ok(None) => {}
-                // Unreachable second server is not a finding; skip quietly.
-                Err(_) => {}
-            }
-        }
-        diag::log(format!(
-            "sync: cross-check tip ms={}",
-            cross_started.elapsed().as_millis() as u64
-        ));
-
         // Skip the long MWEB pass if the user locked during Electrum sync.
         guard.check_lock().map_err(Self::log_sync_failure)?;
         let state = guard
@@ -1823,43 +1973,109 @@ impl WalletApp {
             .ok_or(WalletError::NotLoaded)
             .map_err(Self::log_sync_failure)?;
 
-        // MWEB sync (best-effort; peer failure → stale, not hard error).
-        let mut mweb_ms = 0u64;
-        if let Some(ref mut mweb) = state.mweb {
-            pass.mweb();
-            diag::log("sync: mweb download starting");
-            let mweb_started = std::time::Instant::now();
-            let peers = state.mweb_peers.clone();
-            let network = state.network;
-            // Hash on the current chain at the previous MWEB sync height, so the syncer
-            // can detect a pure extension and skip the full UTXO re-download.
-            let prev_tip_hash = mweb
-                .sync_state
-                .tip_height
-                .and_then(|h| state.wallet.local_chain().get(h))
-                .map(|cp| cp.hash());
-            let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
-            self.with_mweb_progress(|progress| {
-                let _ = mweb.sync_at_tip(
-                    tip_height,
-                    tip_hash,
-                    prev_tip_hash,
-                    &peers,
-                    network,
-                    Some(progress),
-                    &hold_spent,
-                );
-            });
-            if state.needs_mweb_scan {
-                state.needs_mweb_scan = false;
-            }
-            if let Some(warning) = mweb.cross_check_warning.clone() {
-                warnings.push(warning);
-            }
-            let _ = mweb.persist(&state.data_dir);
-            mweb_ms = mweb_started.elapsed().as_millis() as u64;
-            diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
+        // Privacy-preserving second opinion: compare the served chain against
+        // an independent server (headers only, never our scripts), overlapped
+        // with MWEB download when MWEB is active and skipped when this exact
+        // (server, tip_height, tip_hash) was already audited.
+        let mut warnings: Vec<String> = Vec::new();
+        let used_server = state
+            .active_electrum_url
+            .clone()
+            .unwrap_or_else(|| state.electrum_url.clone());
+        let cached_cross = self.cached_cross_check(&used_server, tip_height, tip_hash);
+        if let Some(Some(ref w)) = cached_cross {
+            warnings.push(w.clone());
         }
+        let alt_electrum = if cached_cross.is_some() {
+            None
+        } else {
+            electrum_candidates(state)
+                .into_iter()
+                .find(|url| *url != used_server)
+        };
+        let validate_domain = state.electrum_validate_domain;
+        let local_chain_hashes: HashMap<u32, bdk_wallet::bitcoin::BlockHash> =
+            if alt_electrum.is_some() {
+                state
+                    .wallet
+                    .local_chain()
+                    .iter_checkpoints()
+                    .map(|cp| (cp.height(), cp.hash()))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
+        let mweb_stage_started = std::time::Instant::now();
+        let mut mweb_ms = 0u64;
+        let mut cross_ms = 0u64;
+        let mut fresh_cross_result: Option<Option<String>> = None;
+        std::thread::scope(|scope| {
+            let cross_handle = alt_electrum.as_ref().map(|alt| {
+                let hashes = &local_chain_hashes;
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let local_hash_at = |height: u32| hashes.get(&height).copied();
+                    let outcome =
+                        electrum::cross_check_tip(alt, validate_domain, tip_height, &local_hash_at);
+                    (outcome, started.elapsed().as_millis() as u64)
+                })
+            });
+
+            // MWEB sync (best-effort; peer failure → stale, not hard error).
+            if let Some(ref mut mweb) = state.mweb {
+                pass.mweb();
+                diag::log("sync: mweb download starting");
+                let mweb_started = std::time::Instant::now();
+                let peers = state.mweb_peers.clone();
+                let network = state.network;
+                // Hash on the current chain at the previous MWEB sync height, so the syncer
+                // can detect a pure extension and skip the full UTXO re-download.
+                let prev_tip_hash = mweb
+                    .sync_state
+                    .tip_height
+                    .and_then(|h| state.wallet.local_chain().get(h))
+                    .map(|cp| cp.hash());
+                let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
+                self.with_mweb_progress(|progress| {
+                    let _ = mweb.sync_at_tip(
+                        tip_height,
+                        tip_hash,
+                        prev_tip_hash,
+                        &peers,
+                        network,
+                        Some(progress),
+                        &hold_spent,
+                    );
+                });
+                if state.needs_mweb_scan {
+                    state.needs_mweb_scan = false;
+                }
+                if let Some(warning) = mweb.cross_check_warning.clone() {
+                    warnings.push(warning);
+                }
+                let _ = mweb.persist(&state.data_dir);
+                mweb_ms = mweb_started.elapsed().as_millis() as u64;
+                diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
+            }
+
+            if let Some(handle) = cross_handle {
+                if let Ok((outcome, elapsed)) = handle.join() {
+                    cross_ms = elapsed;
+                    if let Ok(warning) = outcome {
+                        if let Some(ref w) = warning {
+                            warnings.insert(0, w.clone());
+                        }
+                        fresh_cross_result = Some(warning);
+                    }
+                }
+            }
+        });
+        if let Some(warning) = fresh_cross_result {
+            self.note_cross_check(used_server.clone(), tip_height, tip_hash, warning);
+        }
+        let mweb_wall_ms = mweb_stage_started.elapsed().as_millis() as u64;
+        diag::log(format!("sync: cross-check tip ms={cross_ms}"));
 
         guard.check_lock().map_err(Self::log_sync_failure)?;
         let state = guard
@@ -1868,12 +2084,23 @@ impl WalletApp {
             .map_err(Self::log_sync_failure)?;
         let churn_started = std::time::Instant::now();
         if state.mweb.is_some() {
-            let _ = drive_churn(state, Some(&client));
+            if lazy_client.is_none()
+                && churn::read_job(&state.data_dir)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|job| {
+                        matches!(
+                            job.phase(),
+                            ChurnPhase::WaitingConfirm | ChurnPhase::PausedUnscored
+                        )
+                    })
+            {
+                lazy_client = connect_electrum_prefer(state, Some(used.as_str())).ok();
+            }
+            let _ = drive_churn(state, lazy_client.as_ref());
         }
-        diag::log(format!(
-            "sync: churn ms={}",
-            churn_started.elapsed().as_millis() as u64
-        ));
+        let churn_ms = churn_started.elapsed().as_millis() as u64;
+        diag::log(format!("sync: churn ms={churn_ms}"));
 
         guard.check_lock().map_err(Self::log_sync_failure)?;
         let state = guard
@@ -1890,14 +2117,20 @@ impl WalletApp {
             .filter(|id| self.pegin_fallback_due(id))
             .count();
         let missing_pegins = missing.len();
-        let repaired = if state.mweb.is_some() {
-            repair_missing_pegin_spends(self, state, &client)
+        let repaired = if state.mweb.is_some() && !missing.is_empty() {
+            if lazy_client.is_none() {
+                lazy_client = Some(
+                    connect_electrum_prefer(state, Some(used.as_str()))
+                        .map_err(Self::log_sync_failure)?,
+                );
+            }
+            repair_missing_pegin_spends(self, state, lazy_client.as_ref().unwrap())
         } else {
             Ok(None)
         };
+        let repair_ms = repair_started.elapsed().as_millis() as u64;
         diag::log(format!(
-            "sync: pegin-repair missing={missing_pegins} fallbacks={fallbacks} ms={}",
-            repair_started.elapsed().as_millis() as u64
+            "sync: pegin-repair missing={missing_pegins} fallbacks={fallbacks} ms={repair_ms}"
         ));
         if let Some(repair_warning) = repaired.map_err(Self::log_sync_failure)? {
             warnings.push(repair_warning);
@@ -1907,18 +2140,20 @@ impl WalletApp {
             .map_err(Self::log_sync_failure)?;
 
         let tx_count_after = state.wallet.transactions().count();
-        let new_txs = tx_count_after.saturating_sub(tx_count_before) as u32;
+        let new_txs = prefetched_new_txs
+            .saturating_add(tx_count_after.saturating_sub(tx_count_before) as u32);
         let summary_started = std::time::Instant::now();
         let summary = build_summary(state);
-        diag::log(format!(
-            "sync: summary ms={}",
-            summary_started.elapsed().as_millis() as u64
-        ));
+        let summary_ms = summary_started.elapsed().as_millis() as u64;
+        diag::log(format!("sync: summary ms={summary_ms}"));
         let summary = summary.map_err(Self::log_sync_failure)?;
         guard.check_lock().map_err(Self::log_sync_failure)?;
         pass.finish();
+        let total_ms = sync_started.elapsed().as_millis() as u64;
         diag::log(format!(
-            "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs}"
+            "sync: done electrum_ms={electrum_ms} mweb_ms={mweb_ms} new_txs={new_txs} \
+             total_ms={total_ms} electrum_reused={electrum_reused} mweb_wall_ms={mweb_wall_ms} \
+             cross_ms={cross_ms} churn_ms={churn_ms} repair_ms={repair_ms} summary_ms={summary_ms}"
         ));
         Ok(SyncResult {
             summary,
@@ -4929,10 +5164,27 @@ fn missing_pegin_ids(state: &WalletState) -> Vec<String> {
     let Some(mweb) = state.mweb.as_ref() else {
         return Vec::new();
     };
+    let db = mweb.store.db();
     mweb.history
         .entries
         .iter()
-        .filter(|e| e.kind == TxKind::Pegin)
+        .filter(|e| is_local_pegin_entry(e))
+        .filter(|e| {
+            // A dropped peg-in whose outputs are no longer in the MWEB coin store
+            // (or were moved to `spent` with `leaf_index == None` because a full
+            // scan saw they never landed on chain) never credited private funds,
+            // so its transparent inputs were not spent.
+            e.output_ids.is_empty()
+                || e.output_ids.iter().any(|oid_hex| {
+                    hex::decode(oid_hex)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                        .is_some_and(|id| {
+                            db.get(&id).is_some()
+                                || db.get_spent(&id).is_some_and(|c| c.leaf_index.is_some())
+                        })
+                })
+        })
         .filter_map(|e| {
             let txid = parse_txid(&e.id)?;
             if state.wallet.get_tx(txid).is_some() {
@@ -4947,9 +5199,86 @@ fn missing_pegin_ids(state: &WalletState) -> Vec<String> {
 /// How long a dead RPC node, Electrum fallback, or explorer may stall one
 /// repair attempt. A missing peg-in is retried on a later sync.
 const PEGIN_REPAIR_FALLBACK: std::time::Duration = std::time::Duration::from_secs(2);
+/// Cap across all slow fallback sources for one missing peg-in so multiple
+/// unreachable endpoints cannot stack 2-second timeouts sequentially.
+const PEGIN_REPAIR_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// After the slow fallbacks fail, skip them for this long. The server that
 /// just synced is still asked, because that call is already connected.
 const PEGIN_REPAIR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+struct PeginFetchFailure {
+    message: String,
+    /// At least two independent indexers explicitly reported that the txid does
+    /// not exist in the mempool or blockchain.
+    confirmed_absent: bool,
+}
+
+impl std::ops::Deref for PeginFetchFailure {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for PeginFetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn pegin_has_onchain_mweb_output(state: &WalletState, entry_id: &str) -> bool {
+    let Some(mweb) = state.mweb.as_ref() else {
+        return false;
+    };
+    let Some(entry) = mweb.history.entries.iter().find(|e| e.id == entry_id) else {
+        return false;
+    };
+    if entry.confirmed_height.is_some() {
+        return true;
+    }
+    let db = mweb.store.db();
+    entry.output_ids.iter().any(|oid_hex| {
+        hex::decode(oid_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .and_then(|id| db.get(&id).or_else(|| db.get_spent(&id)))
+            .is_some_and(|coin| coin.leaf_index.is_some())
+    })
+}
+
+fn prune_unlanded_pegin(state: &mut WalletState, entry_id: &str) {
+    let Some(ref mut mweb) = state.mweb else {
+        return;
+    };
+    let output_ids: Vec<String> = mweb
+        .history
+        .entries
+        .iter()
+        .find(|e| e.id == entry_id)
+        .map(|e| e.output_ids.clone())
+        .unwrap_or_default();
+    for oid_hex in output_ids {
+        if let Some(id) = hex::decode(&oid_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            if mweb
+                .store
+                .db()
+                .get(&id)
+                .is_some_and(|c| c.leaf_index.is_none())
+            {
+                let _ = mweb.store.db_mut().mark_spent(&id);
+            }
+        }
+    }
+    mweb.history.forget_ids(&[entry_id.to_string()]);
+    let _ = mweb.persist(&state.data_dir);
+    diag::log(format!(
+        "sync: pruned unlanded peg-in {entry_id} confirmed absent by 2+ indexers"
+    ));
+}
 
 fn repair_missing_pegin_spends(
     app: &WalletApp,
@@ -4972,11 +5301,16 @@ fn repair_missing_pegin_spends(
                 mweb::apply_pegin_transparent_spend(&mut state.wallet, Arc::unwrap_or_clone(tx));
                 repaired += 1;
             }
-            Err(e) => {
+            Err(failure) => {
+                if failure.confirmed_absent && !pegin_has_onchain_mweb_output(state, id) {
+                    app.note_pegin_fallback(id, false);
+                    prune_unlanded_pegin(state, id);
+                    continue;
+                }
                 if allow_fallbacks {
                     app.note_pegin_fallback(id, true);
                 }
-                last_err = Some(e);
+                last_err = Some(failure.message);
                 still_missing += 1;
             }
         }
@@ -5016,6 +5350,13 @@ fn repair_missing_pegin_spends(
     }
 }
 
+fn is_explicit_tx_not_found(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("no such mempool or blockchain transaction")
+        || lower.contains("status code 404")
+        || (lower.contains("tx ") && lower.contains(" not found"))
+}
+
 /// Fetch peg-in raw tx bytes. Electrum often omits MWEB peg-ins, so we also try
 /// configured RPC, a stock local litecoind, other Electrum servers, and (mainnet)
 /// a public explorer hex endpoint.
@@ -5024,11 +5365,15 @@ fn fetch_pegin_raw_tx(
     client: &crate::electrum::ElectrumClient,
     state: &WalletState,
     allow_fallbacks: bool,
-) -> Result<Arc<Transaction>, String> {
+) -> Result<Arc<Transaction>, PeginFetchFailure> {
     use bdk_electrum::electrum_client::ElectrumApi;
 
     let mut errors: Vec<String> = Vec::new();
-    let txid = parse_txid(txid_hex).ok_or_else(|| format!("invalid peg-in txid {txid_hex}"))?;
+    let mut absent_confirmations = 0u32;
+    let txid = parse_txid(txid_hex).ok_or_else(|| PeginFetchFailure {
+        message: format!("invalid peg-in txid {txid_hex}"),
+        confirmed_absent: false,
+    })?;
     // Every source is untrusted: bytes count only when they are the asked-for tx.
     let accept = |raw: Vec<u8>, source: &str, errors: &mut Vec<String>| {
         spv::verify_transaction(&raw, &txid)
@@ -5043,12 +5388,31 @@ fn fetch_pegin_raw_tx(
             }
         }
         Ok(_) => errors.push("sync Electrum returned empty tx".into()),
-        Err(e) => errors.push(format!("sync Electrum: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_explicit_tx_not_found(&msg) {
+                absent_confirmations += 1;
+            }
+            errors.push(format!("sync Electrum: {msg}"));
+        }
     }
 
     if !allow_fallbacks {
-        return Err(errors.join("; "));
+        return Err(PeginFetchFailure {
+            message: errors.join("; "),
+            confirmed_absent: false,
+        });
     }
+
+    let fallback_deadline = std::time::Instant::now() + PEGIN_REPAIR_TOTAL_BUDGET;
+    let remaining_timeout = |deadline: std::time::Instant| -> Option<std::time::Duration> {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        if left.is_zero() {
+            None
+        } else {
+            Some(left.min(PEGIN_REPAIR_FALLBACK))
+        }
+    };
 
     let mut rpc_urls: Vec<String> = Vec::new();
     if let Some(url) = &state.litecoin_rpc_url {
@@ -5059,8 +5423,11 @@ fn fetch_pegin_raw_tx(
         rpc_urls.push(local);
     }
     for url in &rpc_urls {
+        let Some(timeout) = remaining_timeout(fallback_deadline) else {
+            break;
+        };
         let safe_url = crate::redact::redact_userinfo(url);
-        match crate::rpc::get_raw_transaction_hex_within(url, txid_hex, PEGIN_REPAIR_FALLBACK) {
+        match crate::rpc::get_raw_transaction_hex_within(url, txid_hex, timeout) {
             Ok(hex) => match hex::decode(hex.trim()) {
                 Ok(raw) if !raw.is_empty() => {
                     if let Some(tx) = accept(raw, &format!("RPC {safe_url}"), &mut errors) {
@@ -5070,47 +5437,80 @@ fn fetch_pegin_raw_tx(
                 Ok(_) => errors.push(format!("RPC {safe_url}: empty hex")),
                 Err(e) => errors.push(format!("RPC {safe_url}: bad hex ({e})")),
             },
-            Err(e) => errors.push(format!("RPC {safe_url}: {e}")),
-        }
-    }
-
-    // Other Electrum servers may still hold the raw bytes even when the sync
-    // server refuses MWEB txs.
-    for url in electrum_candidates(state) {
-        if state.active_electrum_url.as_deref() == Some(url.as_str()) {
-            continue;
-        }
-        let safe_url = crate::redact::redact_userinfo(&url);
-        match electrum::connect_with_timeout(
-            &url,
-            state.electrum_validate_domain,
-            PEGIN_REPAIR_FALLBACK.as_secs() as u8,
-        ) {
-            Ok(alt) => match alt.inner.transaction_get_raw(&txid) {
-                Ok(raw) if !raw.is_empty() => {
-                    if let Some(tx) = accept(raw, &safe_url, &mut errors) {
-                        return Ok(tx);
-                    }
+            Err(e) => {
+                let msg = e.to_string();
+                if is_explicit_tx_not_found(&msg) {
+                    absent_confirmations += 1;
                 }
-                Ok(_) => errors.push(format!("{safe_url}: empty tx")),
-                Err(e) => errors.push(format!("{safe_url}: {e}")),
-            },
-            Err(e) => errors.push(format!("{safe_url}: {e}")),
+                errors.push(format!("RPC {safe_url}: {msg}"));
+            }
         }
     }
 
-    if state.network == WalletNetwork::Mainnet {
+    if state.network == WalletNetwork::Mainnet
+        && absent_confirmations < 2
+        && remaining_timeout(fallback_deadline).is_some()
+    {
         match fetch_tx_hex_litecoinspace(txid_hex) {
             Ok(raw) => {
                 if let Some(tx) = accept(raw, "litecoinspace", &mut errors) {
                     return Ok(tx);
                 }
             }
-            Err(e) => errors.push(format!("litecoinspace: {e}")),
+            Err(e) => {
+                if is_explicit_tx_not_found(&e) {
+                    absent_confirmations += 1;
+                }
+                errors.push(format!("litecoinspace: {e}"));
+            }
         }
     }
 
-    Err(errors.join("; "))
+    // Other Electrum servers may still hold the raw bytes even when the sync
+    // server refuses MWEB txs. Skip them once two indexers already confirmed
+    // the transaction does not exist on chain.
+    for url in electrum_candidates(state) {
+        if absent_confirmations >= 2 {
+            break;
+        }
+        if state.active_electrum_url.as_deref() == Some(url.as_str()) {
+            continue;
+        }
+        let Some(timeout) = remaining_timeout(fallback_deadline) else {
+            break;
+        };
+        let timeout_secs = (timeout.as_secs() as u8).max(1);
+        let safe_url = crate::redact::redact_userinfo(&url);
+        match electrum::connect_with_timeout(&url, state.electrum_validate_domain, timeout_secs) {
+            Ok(alt) => {
+                if let Err(e) = electrum::handshake(&alt) {
+                    errors.push(format!("{safe_url}: {e}"));
+                    continue;
+                }
+                match alt.inner.transaction_get_raw(&txid) {
+                    Ok(raw) if !raw.is_empty() => {
+                        if let Some(tx) = accept(raw, &safe_url, &mut errors) {
+                            return Ok(tx);
+                        }
+                    }
+                    Ok(_) => errors.push(format!("{safe_url}: empty tx")),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if is_explicit_tx_not_found(&msg) {
+                            absent_confirmations += 1;
+                        }
+                        errors.push(format!("{safe_url}: {msg}"));
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{safe_url}: {e}")),
+        }
+    }
+
+    Err(PeginFetchFailure {
+        message: errors.join("; "),
+        confirmed_absent: absent_confirmations >= 2,
+    })
 }
 
 fn fetch_tx_hex_litecoinspace(txid_hex: &str) -> Result<Vec<u8>, String> {

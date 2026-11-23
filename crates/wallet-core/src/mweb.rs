@@ -204,6 +204,8 @@ pub struct MwebRuntime {
     pub cross_check_warning: Option<String>,
     /// Peer that served the last successful sync pass. Scoring asks it first.
     pub last_good_peer: Option<std::net::SocketAddr>,
+    /// Last tip hash whose leafset was already confirmed by a second peer.
+    last_cross_checked_tip: Option<(bdk_wallet::bitcoin::BlockHash, u32)>,
     /// Full aggregate coin changeset mirrored on disk (sealed persistence).
     agg: ChangeSet,
     /// Highest v2 envelope counter observed on open or written by `persist`.
@@ -420,6 +422,7 @@ impl MwebRuntime {
             history,
             cross_check_warning: None,
             last_good_peer: None,
+            last_cross_checked_tip: None,
             agg,
             loaded_seal_counter,
             sealing_key,
@@ -556,7 +559,17 @@ impl MwebRuntime {
         }
         // Their own node is absent or down, so fall back to public MWEB peers
         // from the DNS seeds rather than leaving MWEB dark.
-        let discovered = crate::discovery::discover_mweb_peers(network);
+        let discover_started = std::time::Instant::now();
+        let mut discovered = crate::discovery::discover_mweb_peers(network);
+        let discover_ms = discover_started.elapsed().as_millis() as u64;
+        if let Some(good) = self.last_good_peer {
+            discovered.retain(|addr| *addr != good);
+            discovered.insert(0, good);
+        }
+        crate::diag::log(format!(
+            "sync: mweb peers discovered={} ms={discover_ms}",
+            discovered.len()
+        ));
         if discovered.is_empty() {
             self.stale = true;
             self.last_status = match configured_failure {
@@ -587,8 +600,8 @@ impl MwebRuntime {
         }
     }
 
-    /// Ask up to two peers for the MWEB header at `tip_hash` and verify our
-    /// freshly synced leafset against each header's `leafset_root`.
+    /// Ask an independent peer for the MWEB header at `tip_hash` and verify our
+    /// freshly synced leafset against its `leafset_root`.
     ///
     /// A single LIP-0006 peer can understate the balance by serving an
     /// internally consistent but stale/forged header + leafset; agreement from
@@ -604,9 +617,18 @@ impl MwebRuntime {
         if self.sync_state.leafset.is_empty() {
             return;
         }
+        if let Some((checked_hash, prev_confirmed)) = self.last_cross_checked_tip {
+            if checked_hash == tip_hash && prev_confirmed >= 2 {
+                self.last_status
+                    .push_str(&format!(" · leafset confirmed by {prev_confirmed} peers"));
+                return;
+            }
+        }
+        let cross_started = std::time::Instant::now();
+        let sync_peer = self.last_good_peer;
         let mut distinct: Vec<std::net::SocketAddr> = Vec::new();
         for addr in addrs {
-            if !distinct.contains(&addr) {
+            if Some(addr) != sync_peer && !distinct.contains(&addr) {
                 distinct.push(addr);
             }
         }
@@ -615,10 +637,14 @@ impl MwebRuntime {
             leafset: self.sync_state.leafset.clone(),
         };
         let bdk_net = network.to_bitcoin_network();
-        let mut confirmed = 0u32;
+        // The sync peer already verified the leafset against its anchored header.
+        let mut confirmed = u32::from(sync_peer.is_some());
         for addr in distinct {
             if confirmed >= 2 {
                 break;
+            }
+            if std::net::TcpStream::connect_timeout(&addr, PEER_PROBE_TIMEOUT).is_err() {
+                continue;
             }
             let Ok(mut peer) = TcpMwebPeer::connect(addr, bdk_net) else {
                 continue;
@@ -642,6 +668,13 @@ impl MwebRuntime {
                 }
             }
         }
+        if confirmed >= 2 {
+            self.last_cross_checked_tip = Some((tip_hash, confirmed));
+        }
+        crate::diag::log(format!(
+            "sync: mweb cross-check confirmed={confirmed} ms={}",
+            cross_started.elapsed().as_millis() as u64
+        ));
         match confirmed {
             0 => self
                 .last_status
@@ -669,11 +702,17 @@ impl MwebRuntime {
         progress: Option<Arc<SyncProgress>>,
         hold_spent: &BTreeSet<[u8; 32]>,
     ) -> Result<(), bdk_mweb::Error> {
+        let pass_started = std::time::Instant::now();
         // Heal before this pass so a stuck split/send is included in the
         // full UTXO download rather than waiting for a later sync.
-        if pending_unverifiable_outgoing(&self.history, self.store.db()) {
+        let invalidated_for_outgoing =
+            pending_unverifiable_outgoing(&self.history, self.store.db());
+        if invalidated_for_outgoing {
             self.sync_state.invalidate_leafset();
         }
+        let prev_height = self.sync_state.tip_height;
+        let prior_leafset_bytes = self.sync_state.leafset.len();
+        let full_utxo_scan = self.sync_state.leafset.is_empty();
         let pool_first = addrs.first().copied();
         let mut pool = PeerPool::new(addrs);
         let syncer = MwebSyncer {
@@ -718,13 +757,17 @@ impl MwebRuntime {
                     result.downloaded,
                     result.found.len()
                 );
-                self.apply_post_sync(tip_height, hold_spent);
-                // Inputs recorded before leaf backfill cannot be checked against
-                // the current leafset. Force a full UTXO download next pass so
-                // sync can re-find the live coins and date or restore them.
-                if pending_unverifiable_outgoing(&self.history, self.store.db()) {
-                    self.sync_state.invalidate_leafset();
-                }
+                let completed_full_scan = full_utxo_scan && self.sync_state.utxo_cursor.is_none();
+                self.apply_post_sync(tip_height, hold_spent, completed_full_scan);
+                crate::diag::log(format!(
+                    "sync: mweb pass prev_height={prev_height:?} tip={tip_height} full_scan={full_utxo_scan} \
+                     invalidated_outgoing={invalidated_for_outgoing} prior_leafset_bytes={prior_leafset_bytes} \
+                     leafset_bytes={} downloaded={} found={} ms={}",
+                    self.sync_state.leafset.len(),
+                    result.downloaded,
+                    result.found.len(),
+                    pass_started.elapsed().as_millis() as u64,
+                ));
                 Ok(())
             }
             Err(e) => Err(e),
@@ -734,6 +777,7 @@ impl MwebRuntime {
     pub fn disconnect_from(&mut self, height: u32) {
         self.store.disconnect_from(height);
         self.sync_state.height_map.retain(|&h, _| h < height);
+        self.last_cross_checked_tip = None;
         if self.sync_state.tip_height.is_some_and(|h| h >= height) {
             self.sync_state.tip_height = height.checked_sub(1);
             self.sync_state.invalidate_leafset();
@@ -755,13 +799,24 @@ impl MwebRuntime {
     /// while the signed transaction still spends it. `hold_spent` is those
     /// inputs. Re-marking clears the staged restore, so the persist after this
     /// pass keeps the coin spent, and absorb does not record it as a receive.
-    fn apply_post_sync(&mut self, tip_height: u32, hold_spent: &BTreeSet<[u8; 32]>) {
+    fn apply_post_sync(
+        &mut self,
+        tip_height: u32,
+        hold_spent: &BTreeSet<[u8; 32]>,
+        completed_full_scan: bool,
+    ) {
         for id in hold_spent {
             let _ = self.store.db_mut().mark_spent(id);
         }
         self.absorb_received_coins();
         let leafset = self.sync_state.leafset.clone();
-        update_outgoing_confirmations(&mut self.history, self.store.db_mut(), &leafset, tip_height);
+        update_outgoing_confirmations_after_scan(
+            &mut self.history,
+            self.store.db_mut(),
+            &leafset,
+            tip_height,
+            completed_full_scan,
+        );
     }
 
     /// Add history entries for coins in the store that no entry accounts for
@@ -961,6 +1016,7 @@ fn forget_stale_unlanded_outgoing(history: &mut MwebHistory, db: &mut MwebCoinDa
 /// spendable. When a spend is still in the leafset after
 /// [`UNCONFIRMED_MWEB_REVERT_SECS`], the input is restored and the optimistic
 /// outputs / history row are dropped — otherwise a dropped split locks funds.
+#[cfg(test)]
 pub(crate) fn update_outgoing_confirmations(
     history: &mut MwebHistory,
     db: &mut MwebCoinDatabase,
@@ -970,12 +1026,41 @@ pub(crate) fn update_outgoing_confirmations(
     update_outgoing_confirmations_at(history, db, leafset, tip, now_ts());
 }
 
+fn update_outgoing_confirmations_after_scan(
+    history: &mut MwebHistory,
+    db: &mut MwebCoinDatabase,
+    leafset: &[u8],
+    tip: u32,
+    completed_full_scan: bool,
+) {
+    update_outgoing_confirmations_at_inner(
+        history,
+        db,
+        leafset,
+        tip,
+        now_ts(),
+        completed_full_scan,
+    );
+}
+
+#[cfg(test)]
 fn update_outgoing_confirmations_at(
     history: &mut MwebHistory,
     db: &mut MwebCoinDatabase,
     leafset: &[u8],
     tip: u32,
     now: u64,
+) {
+    update_outgoing_confirmations_at_inner(history, db, leafset, tip, now, false);
+}
+
+fn update_outgoing_confirmations_at_inner(
+    history: &mut MwebHistory,
+    db: &mut MwebCoinDatabase,
+    leafset: &[u8],
+    tip: u32,
+    now: u64,
+    completed_full_scan: bool,
 ) {
     restore_stale_unconfirmed_inputs(history, db, leafset, now);
 
@@ -1005,9 +1090,14 @@ fn update_outgoing_confirmations_at(
                 // Absent after a store wipe: a confirmed-spent coin is never
                 // re-found by sync, while an unconfirmed spend's coin would be.
                 None => true,
-                Some(coin) => coin
-                    .leaf_index
-                    .is_some_and(|leaf| !leafset_has_leaf(leafset, leaf)),
+                Some(coin) => match coin.leaf_index {
+                    Some(leaf) => !leafset_has_leaf(leafset, leaf),
+                    // A completed full UTXO download scans every unspent output on
+                    // chain and populates `leaf_index`. A spent coin that still has
+                    // no `leaf_index` after a full scan is absent from the chain's
+                    // unspent set (confirmed spent on chain).
+                    None => completed_full_scan && db.get(&id).is_none(),
+                },
             }
         });
         if all_inputs_gone {
@@ -1246,6 +1336,24 @@ mod tests {
             },
             &db
         ));
+    }
+
+    #[test]
+    fn completed_full_utxo_scan_confirms_unverifiable_outgoing_spend_without_reinvalidating_leafset(
+    ) {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(2, None, None));
+        db.mark_spent(&[2; 32]);
+        let mut history = MwebHistory::default();
+        history.record(entry(TxKind::Pegout, &[], &[2]));
+        assert!(pending_unverifiable_outgoing(&history, &db));
+
+        update_outgoing_confirmations_after_scan(&mut history, &mut db, &leafset(&[9]), TIP, true);
+        assert_eq!(history.entries[0].confirmed_height, Some(TIP));
+        assert!(
+            !pending_unverifiable_outgoing(&history, &db),
+            "after a full UTXO scan resolves the spend, subsequent syncs must not re-invalidate the leafset"
+        );
     }
 
     #[test]
@@ -2696,7 +2804,7 @@ mod tests {
         assert!(runtime.store.db_mut().mark_spent(&id));
         assert!(runtime.store.db_mut().restore_spent(&id));
 
-        runtime.apply_post_sync(100, &BTreeSet::from([id]));
+        runtime.apply_post_sync(100, &BTreeSet::from([id]), false);
 
         assert!(runtime.store.db().get(&id).is_none());
         assert!(runtime.store.db().get_spent(&id).is_some());

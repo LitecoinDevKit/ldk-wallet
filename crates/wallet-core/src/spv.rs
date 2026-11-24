@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bdk_electrum::electrum_client::{ElectrumApi, Error as ElectrumError, GetMerkleRes};
@@ -273,6 +274,32 @@ const MAX_HEADER_WINDOW: u32 = 2016;
 const MAX_FORK_DEPTH: u32 = 2160;
 /// Verified headers kept in `electrum_spv.json`.
 const KEEP_VERIFIED_HEADERS: usize = 2200;
+/// Raw transactions requested per `blockchain.transaction.get` batch.
+pub(crate) const RAW_TX_BATCH_SIZE: usize = 200;
+/// Block headers requested per `blockchain.block.header` batch.
+pub(crate) const HEADER_BATCH_SIZE: usize = 100;
+/// Merkle branches requested per `blockchain.transaction.get_merkle` batch.
+pub(crate) const MERKLE_BATCH_SIZE: usize = 100;
+
+/// Lock-free progress counters updated during an Electrum SPV pass.
+#[derive(Default)]
+pub struct ElectrumProgress {
+    pub scripts_scanned: AtomicU32,
+    pub txs_fetched: AtomicU32,
+    pub txs_total: AtomicU32,
+    pub anchors_verified: AtomicU32,
+    pub anchors_total: AtomicU32,
+}
+
+impl ElectrumProgress {
+    pub fn reset(&self) {
+        self.scripts_scanned.store(0, Ordering::Relaxed);
+        self.txs_fetched.store(0, Ordering::Relaxed);
+        self.txs_total.store(0, Ordering::Relaxed);
+        self.anchors_verified.store(0, Ordering::Relaxed);
+        self.anchors_total.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Litecoin `powLimit` on mainnet and testnet (`0x00000fff…ff`, compact `0x1e0fffff`).
 const POW_LIMIT_BE: [u8; 32] = [
@@ -952,6 +979,53 @@ struct VerifiedChain {
 }
 
 impl VerifiedChain {
+    fn verify_and_store_header(
+        &mut self,
+        height: u32,
+        header: Header,
+        network: WalletNetwork,
+    ) -> Result<Header, SpvError> {
+        let hash = verify_header_pow(&header, height, network)?;
+        if let Some(&local) = self.local_hashes.get(&height) {
+            if local != hash {
+                return Err(SpvError::Transport(format!(
+                    "Electrum header at height {height} conflicts with the verified chain"
+                )));
+            }
+        }
+        self.headers.insert(height, header);
+        Ok(header)
+    }
+
+    fn prefetch_headers_at<E: ElectrumApi>(
+        &mut self,
+        api: &E,
+        heights: &[u32],
+        network: WalletNetwork,
+    ) -> Result<(), SpvError> {
+        let missing: Vec<u32> = heights
+            .iter()
+            .copied()
+            .filter(|h| !self.headers.contains_key(h) && !self.cached_headers.contains_key(h))
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .collect();
+        for chunk in missing.chunks(HEADER_BATCH_SIZE) {
+            let fetched = api.batch_block_header(chunk).map_err(transport)?;
+            if fetched.len() != chunk.len() {
+                return Err(SpvError::Transport(format!(
+                    "Electrum server returned {} headers for {} heights",
+                    fetched.len(),
+                    chunk.len()
+                )));
+            }
+            for (&height, header) in chunk.iter().zip(fetched) {
+                self.verify_and_store_header(height, header, network)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The verified header at `height`, reading and checking an isolated one
     /// below the window when needed.
     fn header_at<E: ElectrumApi>(
@@ -967,16 +1041,7 @@ impl VerifiedChain {
             return Ok(*header);
         }
         let header = api.block_header(height as usize).map_err(transport)?;
-        let hash = verify_header_pow(&header, height, network)?;
-        if let Some(&local) = self.local_hashes.get(&height) {
-            if local != hash {
-                return Err(SpvError::Transport(format!(
-                    "Electrum header at height {height} conflicts with the verified chain"
-                )));
-            }
-        }
-        self.headers.insert(height, header);
-        Ok(header)
+        self.verify_and_store_header(height, header, network)
     }
 }
 
@@ -1007,6 +1072,52 @@ fn fetch_headers<E: ElectrumApi>(
 
 fn fetch_header<E: ElectrumApi>(api: &E, height: u32) -> Result<Header, SpvError> {
     api.block_header(height as usize).map_err(transport)
+}
+
+fn fetch_headers_at<E: ElectrumApi>(
+    api: &E,
+    heights: &[u32],
+    out: &mut BTreeMap<u32, Header>,
+) -> Result<(), SpvError> {
+    let missing: Vec<u32> = heights
+        .iter()
+        .copied()
+        .filter(|h| !out.contains_key(h))
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .collect();
+    for chunk in missing.chunks(HEADER_BATCH_SIZE) {
+        let fetched = api.batch_block_header(chunk).map_err(transport)?;
+        if fetched.len() != chunk.len() {
+            return Err(SpvError::Transport(format!(
+                "Electrum server returned {} headers for {} heights",
+                fetched.len(),
+                chunk.len()
+            )));
+        }
+        for (&height, header) in chunk.iter().zip(fetched) {
+            out.insert(height, header);
+        }
+    }
+    Ok(())
+}
+
+/// Ancestors the target checks need: the window's parent and the first
+/// block of each retarget epoch that ends inside the window.
+fn needed_ancestors(start: u32, server_tip: u32) -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    if start > 1 && server_tip > 0 {
+        ancestors.push(start - 1);
+    }
+    for height in (start..=server_tip).filter(|h| h.is_multiple_of(RETARGET_INTERVAL) && *h > 0) {
+        let lookback = if height == RETARGET_INTERVAL {
+            RETARGET_INTERVAL - 1
+        } else {
+            RETARGET_INTERVAL
+        };
+        ancestors.push(height - 1 - lookback);
+    }
+    ancestors
 }
 
 /// Read the server's recent headers and verify them against the local chain.
@@ -1056,6 +1167,14 @@ fn verify_server_chain<E: ElectrumApi>(
         fetch_headers(api, start, server_tip, &mut server)?;
     }
 
+    // On a cold wallet (local_tip == 0), no fork below local_tip is possible,
+    // so genesis and the window's ancestor headers can be fetched in one batch.
+    if local_tip == 0 {
+        let mut initial = needed_ancestors(start, server_tip);
+        initial.push(0);
+        fetch_headers_at(api, &initial, &mut server)?;
+    }
+
     let mut agreement = None;
     for (&height, &hash) in local_hashes.range(..=local_tip).rev() {
         if let std::collections::btree_map::Entry::Vacant(slot) = server.entry(height) {
@@ -1078,25 +1197,8 @@ fn verify_server_chain<E: ElectrumApi>(
         start = fork + 1;
     }
 
-    // Ancestors the target checks need: the window's parent and the first
-    // block of each retarget epoch that ends inside the window.
-    let mut ancestors = Vec::new();
-    if start > 1 && server_tip > 0 {
-        ancestors.push(start - 1);
-    }
-    for height in (start..=server_tip).filter(|h| h.is_multiple_of(RETARGET_INTERVAL) && *h > 0) {
-        let lookback = if height == RETARGET_INTERVAL {
-            RETARGET_INTERVAL - 1
-        } else {
-            RETARGET_INTERVAL
-        };
-        ancestors.push(height - 1 - lookback);
-    }
-    for height in ancestors {
-        if let std::collections::btree_map::Entry::Vacant(slot) = server.entry(height) {
-            slot.insert(fetch_header(api, height)?);
-        }
-    }
+    let ancestors = needed_ancestors(start, server_tip);
+    fetch_headers_at(api, &ancestors, &mut server)?;
 
     let agreement = resolve_chain(
         &local_hashes,
@@ -1138,6 +1240,7 @@ fn anchor_at_height(wallet: &Wallet, txid: Txid, height: u32) -> Option<Confirma
 struct ScanOutput {
     tx_update: TxUpdate<ConfirmationBlockTime>,
     fetched: HashSet<Txid>,
+    missing_txids: Vec<Txid>,
     reported: HashSet<Txid>,
     unconfirmed: BTreeSet<Txid>,
     pending_anchors: BTreeSet<(Txid, u32)>,
@@ -1152,24 +1255,44 @@ struct ScanOutput {
 }
 
 impl ScanOutput {
-    fn add_tx<E: ElectrumApi>(
+    fn queue_tx(&mut self, wallet: &Wallet, txid: Txid) {
+        if !self.fetched.insert(txid) {
+            return;
+        }
+        match wallet.tx_graph().get_tx(txid) {
+            Some(tx) => self.tx_update.txs.push(tx),
+            None => self.missing_txids.push(txid),
+        }
+    }
+
+    fn fetch_missing_txs<E: ElectrumApi>(
         &mut self,
         api: &E,
-        wallet: &Wallet,
-        txid: Txid,
+        progress: Option<&ElectrumProgress>,
     ) -> Result<(), WalletError> {
-        if !self.fetched.insert(txid) {
-            return Ok(());
+        let missing = std::mem::take(&mut self.missing_txids);
+        if let Some(p) = progress {
+            p.txs_total.store(missing.len() as u32, Ordering::Relaxed);
         }
-        let tx = match wallet.tx_graph().get_tx(txid) {
-            Some(tx) => tx,
-            None => {
-                self.raw_fetches = self.raw_fetches.saturating_add(1);
-                let raw = api.transaction_get_raw(&txid).map_err(electrum_err)?;
-                verify_transaction(&raw, &txid)?
+        for chunk in missing.chunks(RAW_TX_BATCH_SIZE) {
+            self.raw_fetches = self.raw_fetches.saturating_add(chunk.len());
+            let raws = api.batch_transaction_get_raw(chunk).map_err(electrum_err)?;
+            if raws.len() != chunk.len() {
+                return Err(WalletError::Electrum(format!(
+                    "electrum server returned {} transactions for {} txids",
+                    raws.len(),
+                    chunk.len()
+                )));
             }
-        };
-        self.tx_update.txs.push(tx);
+            for (txid, raw) in chunk.iter().zip(raws) {
+                let tx = verify_transaction(&raw, txid)?;
+                self.tx_update.txs.push(tx);
+            }
+            if let Some(p) = progress {
+                p.txs_fetched
+                    .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 
@@ -1191,6 +1314,7 @@ fn scan_spks<E: ElectrumApi>(
     mut spks: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
     stop_gap: usize,
     last_revealed: Option<u32>,
+    progress: Option<&ElectrumProgress>,
 ) -> Result<Option<u32>, WalletError> {
     let mut unused = 0usize;
     let mut last_active = None;
@@ -1216,6 +1340,10 @@ fn scan_spks<E: ElectrumApi>(
                 batch.len()
             )));
         }
+        if let Some(p) = progress {
+            p.scripts_scanned
+                .store(out.scripts as u32, Ordering::Relaxed);
+        }
         for ((index, spk), history) in batch.into_iter().zip(histories) {
             out.rows = out.rows.saturating_add(history.len());
             let beyond_revealed = last_revealed.is_none_or(|lr| index > lr);
@@ -1232,7 +1360,7 @@ fn scan_spks<E: ElectrumApi>(
             out.expected_missing
                 .extend(spk.expected_txids.difference(&listed).copied());
             for res in history {
-                out.add_tx(api, wallet, res.tx_hash)?;
+                out.queue_tx(wallet, res.tx_hash);
                 out.reported.insert(res.tx_hash);
                 match u32::try_from(res.height) {
                     Ok(height) if height > 0 && height <= tip_height => {
@@ -1262,6 +1390,7 @@ fn verify_anchors<E: ElectrumApi>(
     out: &mut ScanOutput,
     network: WalletNetwork,
     sync_ts: u64,
+    progress: Option<&ElectrumProgress>,
 ) -> Result<AnchorStats, WalletError> {
     let pending_anchors = std::mem::take(&mut out.pending_anchors);
     let mut stats = AnchorStats {
@@ -1269,6 +1398,7 @@ fn verify_anchors<E: ElectrumApi>(
         merkle_fetches: 0,
         cached: 0,
     };
+    let mut unanchored = Vec::new();
     for (txid, height) in pending_anchors {
         // A transaction already anchored at this height does not need another
         // header round-trip. Heights inside this pass's window (or stored from
@@ -1285,6 +1415,14 @@ fn verify_anchors<E: ElectrumApi>(
                 Some(false) => {}
             }
         }
+        unanchored.push((txid, height));
+    }
+
+    let heights: Vec<u32> = unanchored.iter().map(|(_, h)| *h).collect();
+    chain.prefetch_headers_at(api, &heights, network)?;
+
+    let mut need_merkle = Vec::new();
+    for (txid, height) in unanchored {
         let header = chain.header_at(api, height, network)?;
         let block_id = BlockId {
             height,
@@ -1296,33 +1434,71 @@ fn verify_anchors<E: ElectrumApi>(
                 .find(|anchor| anchor.block_id == block_id)
                 .copied()
         });
-        let anchor = match known {
+        match known {
             Some(anchor) => {
                 stats.cached = stats.cached.saturating_add(1);
-                anchor
+                out.tx_update.anchors.insert((anchor, txid));
             }
-            None => {
-                stats.merkle_fetches = stats.merkle_fetches.saturating_add(1);
-                match api.transaction_get_merkle(&txid, height as usize) {
-                    Ok(proof) => {
-                        verify_merkle_proof(&txid, &header, height, &proof)?;
-                        ConfirmationBlockTime {
-                            block_id,
-                            confirmation_time: u64::from(header.time),
-                        }
-                    }
-                    Err(ElectrumError::Protocol(e)) => {
-                        diag::log(format!(
-                            "electrum: no merkle branch for {txid} at {height} ({e}); keeping it unconfirmed"
-                        ));
-                        out.mark_unconfirmed(txid, sync_ts);
-                        continue;
-                    }
-                    Err(e) => return Err(electrum_err(e)),
+            None => need_merkle.push((txid, height, header, block_id)),
+        }
+    }
+
+    if let Some(p) = progress {
+        p.anchors_total
+            .store(need_merkle.len() as u32, Ordering::Relaxed);
+    }
+
+    for chunk in need_merkle.chunks(MERKLE_BATCH_SIZE) {
+        stats.merkle_fetches = stats.merkle_fetches.saturating_add(chunk.len());
+        let reqs: Vec<(Txid, usize)> = chunk
+            .iter()
+            .map(|(txid, height, _, _)| (*txid, *height as usize))
+            .collect();
+        match api.batch_transaction_get_merkle(&reqs) {
+            Ok(proofs) => {
+                if proofs.len() != chunk.len() {
+                    return Err(WalletError::Electrum(format!(
+                        "electrum server returned {} merkle proofs for {} transactions",
+                        proofs.len(),
+                        chunk.len()
+                    )));
+                }
+                for ((txid, height, header, block_id), proof) in chunk.iter().zip(proofs) {
+                    verify_merkle_proof(txid, header, *height, &proof)?;
+                    let anchor = ConfirmationBlockTime {
+                        block_id: *block_id,
+                        confirmation_time: u64::from(header.time),
+                    };
+                    out.tx_update.anchors.insert((anchor, *txid));
                 }
             }
-        };
-        out.tx_update.anchors.insert((anchor, txid));
+            Err(ElectrumError::Protocol(_)) => {
+                for (txid, height, header, block_id) in chunk {
+                    match api.transaction_get_merkle(txid, *height as usize) {
+                        Ok(proof) => {
+                            verify_merkle_proof(txid, header, *height, &proof)?;
+                            let anchor = ConfirmationBlockTime {
+                                block_id: *block_id,
+                                confirmation_time: u64::from(header.time),
+                            };
+                            out.tx_update.anchors.insert((anchor, *txid));
+                        }
+                        Err(ElectrumError::Protocol(e)) => {
+                            diag::log(format!(
+                                "electrum: no merkle branch for {txid} at {height} ({e}); keeping it unconfirmed"
+                            ));
+                            out.mark_unconfirmed(*txid, sync_ts);
+                        }
+                        Err(e) => return Err(electrum_err(e)),
+                    }
+                }
+            }
+            Err(e) => return Err(electrum_err(e)),
+        }
+        if let Some(p) = progress {
+            p.anchors_verified
+                .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+        }
     }
     Ok(stats)
 }
@@ -1362,6 +1538,7 @@ fn build_chain_update(
 /// Does not persist: the caller persists the wallet, then
 /// [`SpvSyncOutcome::persist_state`]. `protected` transactions (peg-ins) are
 /// never evicted.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_electrum_spv<E: ElectrumApi>(
     wallet: &mut PersistedWallet<Connection>,
     api: &E,
@@ -1370,6 +1547,7 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
     server_url: &str,
     full_scan: bool,
     protected: &HashSet<Txid>,
+    progress: Option<&ElectrumProgress>,
 ) -> Result<SpvSyncOutcome, WalletError> {
     let mut state = load_spv_state(account_dir);
     let protected = merge_protected(&mut state, protected);
@@ -1405,6 +1583,7 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
                 spks,
                 STOP_GAP,
                 last_revealed,
+                progress,
             )? {
                 last_active_indices.insert(keychain, index);
             }
@@ -1427,8 +1606,10 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
             spks.into_iter(),
             usize::MAX,
             None,
+            progress,
         )?;
     }
+    out.fetch_missing_txs(api, progress)?;
     diag::log(format!(
         "sync: electrum scripts n={} batches={} rows={} raw_fetches={} ms={}",
         out.scripts,
@@ -1438,7 +1619,9 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
         scripts_started.elapsed().as_millis() as u64
     ));
     let anchors_started = std::time::Instant::now();
-    let anchors = verify_anchors(api, wallet, &mut chain, &mut out, network, sync_ts)?;
+    let anchors = verify_anchors(
+        api, wallet, &mut chain, &mut out, network, sync_ts, progress,
+    )?;
     diag::log(format!(
         "sync: electrum anchors pending={} merkle_fetches={} cached={} ms={}",
         anchors.pending,

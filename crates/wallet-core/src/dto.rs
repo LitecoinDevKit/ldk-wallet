@@ -704,6 +704,21 @@ pub struct MwebSyncProgress {
     pub fetched: u64,
     /// Total UTXO leaves the current pass will download (0 until known).
     pub total: u64,
+    /// Transparent scripts scanned so far during the Electrum pass.
+    #[serde(default)]
+    pub scripts_scanned: u32,
+    /// Raw transparent transactions fetched so far during the Electrum pass.
+    #[serde(default)]
+    pub txs_fetched: u32,
+    /// Total raw transparent transactions to fetch in the current Electrum pass.
+    #[serde(default)]
+    pub txs_total: u32,
+    /// Merkle proofs verified so far during the Electrum pass.
+    #[serde(default)]
+    pub anchors_verified: u32,
+    /// Total merkle proofs to verify in the current Electrum pass.
+    #[serde(default)]
+    pub anchors_total: u32,
 }
 
 /// Redacted support bundle (no mnemonic, passphrase, or sealed blobs).

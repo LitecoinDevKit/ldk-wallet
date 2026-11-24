@@ -440,6 +440,11 @@ type MwebSyncProgress = {
   active: boolean;
   fetched: number;
   total: number;
+  scripts_scanned?: number;
+  txs_fetched?: number;
+  txs_total?: number;
+  anchors_verified?: number;
+  anchors_total?: number;
 };
 
 /** Top-level panes. Send/Receive/Private are cards inside the Balance sheet. */
@@ -4179,12 +4184,50 @@ async function loadElectrumPresets() {
   }
 }
 
+function electrumProgressPct(p: MwebSyncProgress): number | null {
+  const anchorsTotal = p.anchors_total ?? 0;
+  if (anchorsTotal > 0) {
+    const done = p.anchors_verified ?? 0;
+    return Math.min(100, Math.round((done / anchorsTotal) * 100));
+  }
+  const txsTotal = p.txs_total ?? 0;
+  if (txsTotal > 0) {
+    const done = p.txs_fetched ?? 0;
+    return Math.min(100, Math.round((done / txsTotal) * 100));
+  }
+  return null;
+}
+
 function syncPhaseLoadingLabel(p: MwebSyncProgress): string | null {
   switch (p.phase) {
     case "electrum-full-scan":
-      return "Scanning transparent addresses…";
-    case "electrum-sync":
-      return "Syncing transparent transactions…";
+    case "electrum-sync": {
+      const anchorsTotal = p.anchors_total ?? 0;
+      if (anchorsTotal > 0) {
+        const done = p.anchors_verified ?? 0;
+        const pct = Math.min(100, Math.round((done / anchorsTotal) * 100));
+        return `Verifying transaction proofs: ${done.toLocaleString(
+          "en-US",
+        )} / ${anchorsTotal.toLocaleString("en-US")} (${pct}%)`;
+      }
+      const txsTotal = p.txs_total ?? 0;
+      if (txsTotal > 0) {
+        const done = p.txs_fetched ?? 0;
+        const pct = Math.min(100, Math.round((done / txsTotal) * 100));
+        return `Downloading transactions: ${done.toLocaleString(
+          "en-US",
+        )} / ${txsTotal.toLocaleString("en-US")} (${pct}%)`;
+      }
+      const scripts = p.scripts_scanned ?? 0;
+      if (scripts > 0) {
+        return p.phase === "electrum-full-scan"
+          ? `Scanning transparent addresses (${scripts.toLocaleString("en-US")} checked)…`
+          : `Syncing transparent transactions (${scripts.toLocaleString("en-US")} addresses)…`;
+      }
+      return p.phase === "electrum-full-scan"
+        ? "Scanning transparent addresses…"
+        : "Syncing transparent transactions…";
+    }
     case "mweb-download":
       if (p.active && p.total === 0) return "Connecting to MWEB peers…";
       if (p.active && p.total > 0) {
@@ -4202,6 +4245,14 @@ function syncPhaseLoadingLabel(p: MwebSyncProgress): string | null {
 function renderMwebProgress(p: MwebSyncProgress) {
   const phaseLabel = syncPhaseLoadingLabel(p);
   if (phaseLabel) setLoadingLabel(phaseLabel);
+
+  if (p.phase === "electrum-full-scan" || p.phase === "electrum-sync") {
+    const pct = electrumProgressPct(p) ?? 0;
+    el.mwebProgress.hidden = false;
+    el.mwebProgressFill.style.width = `${pct}%`;
+    el.mwebProgressText.textContent = phaseLabel ?? "";
+    return;
+  }
 
   if (!p.active) {
     el.mwebProgress.hidden = true;

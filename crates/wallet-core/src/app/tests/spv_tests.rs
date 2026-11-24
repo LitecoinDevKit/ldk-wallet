@@ -86,8 +86,8 @@ impl MockElectrumServer {
             for stream in listener.incoming().flatten() {
                 let st = Arc::clone(&state_clone);
                 std::thread::spawn(move || {
-                    let read_stream = stream.try_clone().unwrap();
-                    let mut reader = BufReader::new(read_stream.try_clone().unwrap());
+                    let mut reader =
+                        BufReader::with_capacity(64 * 1024, stream.try_clone().unwrap());
                     let mut writer = stream;
                     let mut line = String::new();
                     while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
@@ -100,22 +100,41 @@ impl MockElectrumServer {
                         }
                         line.clear();
 
-                        let _ =
-                            read_stream.set_read_timeout(Some(std::time::Duration::from_millis(2)));
-                        while reader.fill_buf().map(|b| !b.is_empty()).unwrap_or(false) {
-                            if reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                                let t = line.trim();
-                                if !t.is_empty() {
-                                    if let Ok(req) = serde_json::from_str::<Value>(t) {
-                                        batch_reqs.push(req);
-                                    }
-                                }
-                                line.clear();
-                            } else {
+                        // Drain any additional pipelined requests already queued on the
+                        // socket (from `RawClient::batch_call`, which writes the whole
+                        // batch in one `write_all` before waiting for responses).
+                        // Use non-blocking mode on `reader.get_ref()` rather than a
+                        // cloned socket's `SO_RCVTIMEO` (which does not propagate to
+                        // duplicated handles on Windows and leaves timed-out Winsock
+                        // TCP sockets indeterminate).
+                        let _ = reader.get_ref().set_nonblocking(true);
+                        loop {
+                            let has_newline = match reader.fill_buf() {
+                                Ok(buf) if !buf.is_empty() => buf.contains(&b'\n'),
+                                _ => break,
+                            };
+                            if !has_newline {
+                                // A partial line without `\n` means the sender's current
+                                // batch spilled past the buffer boundary; block until the
+                                // line completes, then keep draining non-blocking.
+                                let _ = reader.get_ref().set_nonblocking(false);
+                            }
+                            let got = reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false);
+                            if !has_newline {
+                                let _ = reader.get_ref().set_nonblocking(true);
+                            }
+                            if !got {
                                 break;
                             }
+                            let t = line.trim();
+                            if !t.is_empty() {
+                                if let Ok(req) = serde_json::from_str::<Value>(t) {
+                                    batch_reqs.push(req);
+                                }
+                            }
+                            line.clear();
                         }
-                        let _ = read_stream.set_read_timeout(None);
+                        let _ = reader.get_ref().set_nonblocking(false);
 
                         if batch_reqs.is_empty() {
                             continue;

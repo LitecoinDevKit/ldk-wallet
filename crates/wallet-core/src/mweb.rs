@@ -363,9 +363,11 @@ fn compact_peer_err(err: &bdk_mweb::Error, stage: &str) -> String {
     } else if is_clean_tip_lag(err, stage) {
         "tip_lag".into()
     } else if msg.contains("timed out")
+        || msg.contains("did not properly respond")
         || msg.contains("Resource temporarily unavailable")
         || msg.contains("os error 35")
         || msg.contains("os error 11")
+        || msg.contains("os error 10060")
     {
         "timeout".into()
     } else {

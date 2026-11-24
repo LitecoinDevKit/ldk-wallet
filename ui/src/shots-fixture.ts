@@ -123,6 +123,7 @@ type Coin = {
   churn_spreading?: boolean | null;
   churn_target?: number | null;
   churn_counted?: number | null;
+  churn_fee_sats?: number | null;
   churn_actions?: { retry: boolean; cancel: boolean; open_settings: boolean } | null;
   churn_error?: string | null;
   status: string;
@@ -223,6 +224,7 @@ function privateCoins(): Coin[] {
     tied.churn_actions = { retry: true, cancel: true, open_settings: false };
     tied.churn_target = 1;
     tied.churn_counted = 0;
+    tied.churn_fee_sats = 2_100;
     holdForChurn(tied);
   } else if (cover === "spent" && current !== "recovery" && current !== "balance") {
     tied.churn_phase = "waiting-for-cover";
@@ -620,14 +622,14 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
   list_mweb_unspent: () => privateCoins(),
   preview_churn: (args) => ({
     input_sats: S.p75,
-    hop_fee_sats: 50_000,
-    resulting_sats: S.p75 - 50_000,
+    hop_fee_sats: 2_100,
+    resulting_sats: S.p75 - 2_100,
     target_depth: 1,
-    total_fee_sats: 50_000,
+    total_fee_sats: 2_100,
     amount_note:
       "This subtracts the public fee. The resulting amount is still determined by where this coin started.",
     quiet_block_note:
-      "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.0005 LTC.",
+      "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.000021 LTC.",
     has_litecoin_rpc: new URLSearchParams(window.location.search).get("rpc") === "1",
     ...churnRequest(args),
   }),

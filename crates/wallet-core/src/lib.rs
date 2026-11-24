@@ -46,17 +46,16 @@ pub use dto::{
     CombinedSummary, ContactKind, ContactRecord, CoverHold, CreateAccountRequest,
     CreateWalletRequest, CreateWalletResponse, DeleteContactRequest, DeleteWalletRequest,
     DiagLogPage, DiagnosticsBundle, ElectrumProbe, FeeEstimate, FeeLadder, MetricSeries,
-    MigrateEncryptRequest,
-    MwebBroadcastResult, MwebScheme, MwebSendPreview, MwebSendRequest, MwebSyncProgress,
-    MwebUtxoRecord, NetworkPulse, PeginPreview, PeginRequest, PeginResult, PegoutPreview,
-    PegoutRequest,     RenameWalletRequest, RestoreWalletRequest, RevealMnemonicRequest,
+    MigrateEncryptRequest, MwebBroadcastResult, MwebScheme, MwebSendPreview, MwebSendRequest,
+    MwebSyncProgress, MwebUtxoRecord, NetworkPulse, PeginPreview, PeginRequest, PeginResult,
+    PegoutPreview, PegoutRequest, RenameWalletRequest, RestoreWalletRequest, RevealMnemonicRequest,
     RevealMnemonicResponse, SendPreview, SendRequest, SendResult, SetMwebUtxoLockedRequest,
     SetTxLabelRequest, SetUtxoLabelRequest, SetUtxoLockedRequest, SplitChain, SplitOutput,
     SplitPreview, SplitRequest, SplitResult, SwitchWalletRequest, SyncPhase, SyncResult,
     TransferCoinPreview, TransferCoinRequest, TransferCoinResult, TxEnrichment, TxIo, TxKind,
     TxRecord, TxStatus, UnlockRequest, UpdateSettingsRequest, UpsertContactRequest, UtxoRecord,
     WalletListItem, WalletSettings, WalletSummary, CHURN_AMOUNT_NOTE, CHURN_MAX_TARGET,
-    CHURN_QUIET_NOTE, DEFAULT_MWEB_FEE_SATS,
+    CHURN_QUIET_NOTE,
 };
 pub use error::{BroadcastFailureKind, WalletError};
 pub use explorer::{is_chain_txid, DEFAULT_EXPLORER_BASE_URL};

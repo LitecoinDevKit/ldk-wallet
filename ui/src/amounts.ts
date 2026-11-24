@@ -18,6 +18,14 @@ export function formatLtc(sats: number): string {
   return `${sign}${whole}.${frac} LTC`;
 }
 
+/** LTC amount for a sentence. Drops trailing zeros: 2100 → "0.000021 LTC", 50000 → "0.0005 LTC". */
+export function formatLtcTrimmed(sats: number): string {
+  const text = formatLtc(sats);
+  const space = text.lastIndexOf(" ");
+  const amount = text.slice(0, space).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  return `${amount}${text.slice(space)}`;
+}
+
 export function formatLitoshisPlain(sats: number): string {
   return `${sats.toLocaleString("en-US")} litoshis`;
 }

@@ -8,6 +8,7 @@ import {
   formatLitoshis,
   formatLitoshisPlain,
   formatLtc,
+  formatLtcTrimmed,
   parseLitoshisToSats,
   parseLtcToSats,
   satsToBip21Amount,
@@ -24,6 +25,13 @@ function mulberry32(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+test("formatLtcTrimmed drops trailing zeros and keeps the LTC suffix", () => {
+  assert.equal(formatLtcTrimmed(2_100), "0.000021 LTC");
+  assert.equal(formatLtcTrimmed(3_900), "0.000039 LTC");
+  assert.equal(formatLtcTrimmed(50_000), "0.0005 LTC");
+  assert.equal(formatLtcTrimmed(100_000_000), "1 LTC");
+});
 
 test("parseLtcToSats enforces 8-decimal precision and MAX_MONEY_SATS ceiling", () => {
   assert.equal(parseLtcToSats("0"), 0);

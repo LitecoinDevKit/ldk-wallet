@@ -16,6 +16,11 @@ use crate::dto::CoinStatus;
 
 const PASSPHRASE: &str = "correct horse battery staple";
 
+/// Explicit fee at the two-output relay minimum. Above every one-output floor.
+fn legal_mweb_fee() -> u64 {
+    crate::tx_invariants::min_kernel_fee(2, std::iter::empty())
+}
+
 fn account_dir(app: &WalletApp) -> PathBuf {
     app.lock_state().unwrap().as_ref().unwrap().data_dir.clone()
 }
@@ -356,7 +361,7 @@ fn mweb_send_req(address: &str, id: &str, amount_sats: u64) -> MwebSendRequest {
     MwebSendRequest {
         address: address.into(),
         amount_sats,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: legal_mweb_fee(),
         drain: false,
         selected_output_ids: Some(vec![id.into()]),
     }
@@ -369,7 +374,7 @@ fn private_split_req(id: &str) -> SplitRequest {
         equal_count: Some(2),
         amounts: Vec::new(),
         fee_rate_sat_vb: None,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: legal_mweb_fee(),
     }
 }
 
@@ -838,7 +843,7 @@ fn failed_private_spends_release_holds_and_keep_coins_ready() {
                 coin_id: ids[0].clone(),
                 to_account_index: 1,
                 fee_rate_sat_vb: None,
-                fee_sats: DEFAULT_MWEB_FEE_SATS,
+                fee_sats: legal_mweb_fee(),
             },
         )
         .is_err());
@@ -910,7 +915,7 @@ fn failed_public_spends_and_pegin_release_holds_and_unmask_locks() {
     assert!(app
         .pegin(PeginRequest {
             amount_sats: 100_000,
-            mweb_fee_sats: DEFAULT_MWEB_FEE_SATS,
+            mweb_fee_sats: legal_mweb_fee(),
             transparent_fee_sats: 10_000,
             drain: false,
             selected_outpoints: Some(vec![outs[0].to_string()]),
@@ -1284,7 +1289,9 @@ fn early_return_validations_leave_phases_holds_and_coins_untouched() {
     assert_snap(&app, &before);
 
     let dir = tempfile::tempdir().unwrap();
-    let (app, ids) = app_with_private_coins(dir.path(), &[60_000]);
+    // Exactly two one-output hop fees: `amount <= fee * target` is rejected.
+    let two_hops = crate::tx_invariants::min_kernel_fee(1, std::iter::empty()).saturating_mul(2);
+    let (app, ids) = app_with_private_coins(dir.path(), &[two_hops]);
     clear_planted_job(&app);
     let before = snap(&app);
     assert_build(
@@ -1352,7 +1359,7 @@ fn early_return_validations_leave_phases_holds_and_coins_untouched() {
                 coin_id: ids[1].clone(),
                 to_account_index: 0,
                 fee_rate_sat_vb: None,
-                fee_sats: DEFAULT_MWEB_FEE_SATS,
+                fee_sats: legal_mweb_fee(),
             },
         )
         .unwrap_err()

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_mweb::mweb_sync::SyncProgress;
 
-use bdk_wallet::bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
+use bdk_wallet::bitcoin::{Amount, OutPoint, Psbt, Script, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
@@ -34,7 +34,7 @@ use crate::dto::{
     SwitchWalletRequest, SyncPhase, SyncResult, TransferCoinPreview, TransferCoinRequest,
     TransferCoinResult, TxKind, TxRecord, UnlockRequest, UpdateSettingsRequest,
     UpsertContactRequest, UtxoRecord, WalletListItem, WalletSettings, WalletSummary,
-    CHURN_AMOUNT_NOTE, DEFAULT_MWEB_FEE_SATS,
+    CHURN_AMOUNT_NOTE,
 };
 use crate::electrum::{self, MIN_FEE_RATE_SAT_VB};
 use crate::error::WalletError;
@@ -2762,11 +2762,12 @@ impl WalletApp {
         let guard = self.lock_state()?;
         let state = guard.as_ref().ok_or(WalletError::NotLoaded)?;
         let (info, frozen, job_active, from_pegin) = churn_start_facts(state, &req.output_id)?;
+        let hop_fee = self_spend_hop_fee();
         let target = churn::check_start(&churn::StartCheck {
             mature: info.mature,
             frozen,
             amount_sats: info.amount,
-            fee_sats: DEFAULT_MWEB_FEE_SATS,
+            fee_sats: hop_fee,
             job_active,
             target_depth: req.target_depth,
         })?;
@@ -2774,12 +2775,12 @@ impl WalletApp {
         let _ = from_pegin;
         Ok(ChurnPreview {
             input_sats: info.amount,
-            hop_fee_sats: DEFAULT_MWEB_FEE_SATS,
-            resulting_sats: info.amount - DEFAULT_MWEB_FEE_SATS,
+            hop_fee_sats: hop_fee,
+            resulting_sats: info.amount - hop_fee,
             target_depth: target,
-            total_fee_sats: DEFAULT_MWEB_FEE_SATS.saturating_mul(target as u64),
+            total_fee_sats: hop_fee.saturating_mul(target as u64),
             amount_note: CHURN_AMOUNT_NOTE.to_string(),
-            quiet_block_note: crate::dto::quiet_block_note(target).to_string(),
+            quiet_block_note: crate::dto::quiet_block_note(target, hop_fee),
             has_litecoin_rpc: state
                 .litecoin_rpc_url
                 .as_deref()
@@ -2800,11 +2801,12 @@ impl WalletApp {
                     "self-spend: rejected Start coin={coin} from=None reason={err}"
                 ));
             })?;
+        let hop_fee = self_spend_hop_fee();
         let target = churn::check_start(&churn::StartCheck {
             mature: info.mature,
             frozen,
             amount_sats: info.amount,
-            fee_sats: DEFAULT_MWEB_FEE_SATS,
+            fee_sats: hop_fee,
             job_active,
             target_depth: req.target_depth,
         })
@@ -2822,7 +2824,7 @@ impl WalletApp {
             &req.output_id,
             from_pegin || info.is_pegin,
             target,
-            DEFAULT_MWEB_FEE_SATS,
+            hop_fee,
             cover_min,
             req.spread_send,
         )?;
@@ -3901,11 +3903,55 @@ impl MemoryBackedApp {
 /// Estimated vbytes for a typical peg-in (1–2 inputs + HogEx output + change).
 const PEGIN_FEE_VB_ESTIMATE: u64 = 250;
 
-fn auto_mweb_fee(explicit: u64) -> u64 {
-    if explicit == 0 {
-        DEFAULT_MWEB_FEE_SATS
+/// One-output self-spend. The request has no fee field; every new hop pays this.
+fn self_spend_hop_fee() -> u64 {
+    crate::tx_invariants::min_kernel_fee(1, std::iter::empty())
+}
+
+/// Fee of 0 pays the relay minimum for the shape coin selection actually builds.
+///
+/// Selection at the no-change weight that sums exactly to amount + fee stays on
+/// that fee. A remainder means a change output, so the fee steps up by one
+/// standard output (1,800 litoshis). A selection that cannot cover the lower
+/// fee returns that lower fee and leaves the caller's funds check to refuse it.
+fn choose_auto_kernel_fee(
+    state: &WalletState,
+    amount_sats: u64,
+    selected: Option<&[String]>,
+    no_change_outputs: usize,
+    with_change_outputs: usize,
+    pegout_scripts: &[&Script],
+    action: &str,
+) -> Result<u64, WalletError> {
+    let no_change =
+        crate::tx_invariants::min_kernel_fee(no_change_outputs, pegout_scripts.iter().copied());
+    let with_change =
+        crate::tx_invariants::min_kernel_fee(with_change_outputs, pegout_scripts.iter().copied());
+    let Ok(needed) =
+        crate::tx_invariants::checked_add_money(amount_sats, no_change, "MWEB spend needed")
+    else {
+        return Ok(no_change);
+    };
+    let Some(mweb) = state.mweb.as_ref() else {
+        return Ok(no_change);
+    };
+    let tip = state.wallet.latest_checkpoint().height();
+    let Ok(frozen) = mweb_frozen::unavailable_ids(&state.data_dir) else {
+        return Ok(no_change);
+    };
+    let coins =
+        match mweb::resolve_spend_coins(mweb.store.db(), tip, &frozen, selected, needed, action) {
+            Ok(coins) => coins,
+            Err(_) => return Ok(no_change),
+        };
+    let sum = crate::tx_invariants::checked_sum_sats(
+        coins.iter().map(|c| c.amount),
+        "MWEB selected coins",
+    )?;
+    if sum == needed {
+        Ok(no_change)
     } else {
-        explicit
+        Ok(with_change)
     }
 }
 
@@ -4015,7 +4061,11 @@ fn resolve_pegin_request(
     state: &mut WalletState,
     req: PeginRequest,
 ) -> Result<PeginRequest, WalletError> {
-    let mweb_fee_sats = auto_mweb_fee(req.mweb_fee_sats);
+    let mweb_fee_sats = if req.mweb_fee_sats == 0 {
+        self_spend_hop_fee()
+    } else {
+        req.mweb_fee_sats
+    };
     crate::tx_invariants::check_money(mweb_fee_sats, "peg-in MWEB fee")?;
     let min_mweb_fee = bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(1, []));
     if mweb_fee_sats < min_mweb_fee {
@@ -4132,14 +4182,6 @@ fn resolve_mweb_send_request(
     state: &WalletState,
     req: MwebSendRequest,
 ) -> Result<MwebSendRequest, WalletError> {
-    let fee_sats = auto_mweb_fee(req.fee_sats);
-    crate::tx_invariants::check_money(fee_sats, "private send fee")?;
-    let min_fee_no_change = bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(1, []));
-    if fee_sats < min_fee_no_change {
-        return Err(WalletError::BuildTx(format!(
-            "MWEB fee {fee_sats} litoshis is below the minimum {min_fee_no_change} litoshis"
-        )));
-    }
     let mweb = state
         .mweb
         .as_ref()
@@ -4163,6 +4205,28 @@ fn resolve_mweb_send_request(
     } else {
         mweb::spendable_mweb_sats(mweb, tip, &frozen)
     };
+    let one_output = self_spend_hop_fee();
+    let fee_sats = if req.fee_sats > 0 {
+        req.fee_sats
+    } else if req.drain {
+        one_output
+    } else {
+        choose_auto_kernel_fee(
+            state,
+            req.amount_sats,
+            selected.as_deref(),
+            1,
+            2,
+            &[],
+            "spending",
+        )?
+    };
+    crate::tx_invariants::check_money(fee_sats, "private send fee")?;
+    if fee_sats < one_output {
+        return Err(WalletError::BuildTx(format!(
+            "MWEB fee {fee_sats} litoshis is below the minimum {one_output} litoshis"
+        )));
+    }
     let amount_sats = if req.drain {
         spendable.checked_sub(fee_sats).ok_or_else(|| {
             WalletError::BuildTx(format!(
@@ -4226,8 +4290,9 @@ fn resolve_pegout_request(
     state: &WalletState,
     req: PegoutRequest,
 ) -> Result<(PegoutRequest, u64), WalletError> {
-    let fee_sats = auto_mweb_fee(req.fee_sats);
-    crate::tx_invariants::check_money(fee_sats, "peg-out fee")?;
+    if req.fee_sats > 0 {
+        crate::tx_invariants::check_money(req.fee_sats, "peg-out fee")?;
+    }
     let mweb = state
         .mweb
         .as_ref()
@@ -4256,6 +4321,17 @@ fn resolve_pegout_request(
                 "no spendable private coins to peg out".into(),
             ));
         }
+        let script = mweb::p2wpkh_script();
+        let floor = crate::tx_invariants::min_kernel_fee(
+            0,
+            std::iter::repeat(script.as_script()).take(coins.len()),
+        );
+        let fee_sats = if req.fee_sats == 0 {
+            floor
+        } else {
+            req.fee_sats
+        };
+        crate::tx_invariants::check_money(fee_sats, "peg-out fee")?;
         let coin_amounts: Vec<u64> = coins.iter().map(|c| c.amount).collect();
         let plan = mweb::plan_pegout_per_coin(&coin_amounts, fee_sats, dust_sats)?;
         let amount_sats = crate::tx_invariants::checked_sum_sats(
@@ -4280,6 +4356,28 @@ fn resolve_pegout_request(
     }
 
     let amount_sats = crate::tx_invariants::check_money(req.amount_sats, "peg-out amount")?;
+    let (_dest, spk, dust_sats) =
+        crate::tx_invariants::validate_public_recipient(&req.address, state.network)?;
+    let min_fee = crate::tx_invariants::min_kernel_fee(0, [spk.as_script()]);
+    let fee_sats = if req.fee_sats > 0 {
+        req.fee_sats
+    } else {
+        choose_auto_kernel_fee(
+            state,
+            amount_sats,
+            selected.as_deref(),
+            0,
+            1,
+            &[spk.as_script()],
+            "swapping",
+        )?
+    };
+    crate::tx_invariants::check_money(fee_sats, "peg-out fee")?;
+    if fee_sats < min_fee {
+        return Err(WalletError::BuildTx(format!(
+            "peg-out fee {fee_sats} litoshis is below the MWEB minimum of {min_fee} litoshis"
+        )));
+    }
     let needed = crate::tx_invariants::checked_add_money(amount_sats, fee_sats, "peg-out total")?;
     if let Some(ref ids) = selected {
         mweb::resolve_spend_coins(
@@ -4290,15 +4388,6 @@ fn resolve_pegout_request(
             needed,
             "swapping",
         )?;
-    }
-    let (_dest, spk, dust_sats) =
-        crate::tx_invariants::validate_public_recipient(&req.address, state.network)?;
-    let min_fee =
-        bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(0, [spk.as_script()]));
-    if fee_sats < min_fee {
-        return Err(WalletError::BuildTx(format!(
-            "peg-out fee {fee_sats} litoshis is below the MWEB minimum of {min_fee} litoshis"
-        )));
     }
     let spendable = mweb::spendable_mweb_sats(mweb, tip, &frozen);
     if amount_sats < dust_sats {
@@ -4936,7 +5025,7 @@ fn plan_split_request(
                 fee_sats: req.fee_sats,
                 fee_rate_sat_vb,
                 public: true,
-                mweb_fee: DEFAULT_MWEB_FEE_SATS,
+                mweb_fee: 0,
             })
         }
         SplitChain::Private => {
@@ -4954,7 +5043,7 @@ fn plan_split_request(
                 fee_sats: req.fee_sats,
                 fee_rate_sat_vb: 0,
                 public: false,
-                mweb_fee: auto_mweb_fee(req.fee_sats),
+                mweb_fee: 0,
             })
         }
     }
@@ -5075,6 +5164,7 @@ fn mweb_selection_creates_change(
         req.amount_sats,
         req.fee_sats,
         "spending",
+        &[],
     )
 }
 
@@ -5082,12 +5172,15 @@ fn pegout_selection_creates_change(
     state: &WalletState,
     req: &PegoutRequest,
 ) -> Result<bool, WalletError> {
+    let (_dest, spk, _dust) =
+        crate::tx_invariants::validate_public_recipient(&req.address, state.network)?;
     mweb_inputs_exceed_needed(
         state,
         req.selected_output_ids.as_deref(),
         req.amount_sats,
         req.fee_sats,
         "swapping",
+        &[spk.as_script()],
     )
 }
 
@@ -5097,6 +5190,7 @@ fn mweb_inputs_exceed_needed(
     amount_sats: u64,
     fee_sats: u64,
     action: &str,
+    pegout_scripts: &[&Script],
 ) -> Result<bool, WalletError> {
     let mweb = state
         .mweb
@@ -5112,10 +5206,11 @@ fn mweb_inputs_exceed_needed(
         "MWEB selected coins",
     )?;
     if sum > needed {
-        // When a change output is created, MWEB weight grows by 1 standard output (18 weight = 1,800 litoshis).
+        // Change adds one standard output (18 weight = 1,800 litoshis). A peg-out
+        // script is extra weight on top of that, `ceil(script_len / 42)`.
         let total_outputs = usize::from(action == "spending") + 1;
         let min_fee =
-            bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(total_outputs, []));
+            crate::tx_invariants::min_kernel_fee(total_outputs, pegout_scripts.iter().copied());
         if fee_sats < min_fee {
             return Err(WalletError::BuildTx(format!(
                 "MWEB fee {fee_sats} litoshis is below the minimum {min_fee} litoshis when change is created"

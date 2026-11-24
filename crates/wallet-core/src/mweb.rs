@@ -123,13 +123,16 @@ pub struct PegoutPerCoinPlan {
     pub fee_output_index: usize,
 }
 
-/// P2WPKH dust at the same 30 sat/vB relay rate used for typed peg-outs.
-pub fn p2wpkh_dust_sats() -> Result<u64, WalletError> {
+/// A 22-byte P2WPKH script. Per-coin peg-outs pay to fresh `ltc1` addresses of this shape.
+pub fn p2wpkh_script() -> ScriptBuf {
     let mut bytes = vec![0x00, 0x14];
     bytes.extend_from_slice(&[0u8; 20]);
-    Ok(crate::tx_invariants::ltc_dust_threshold(
-        &ScriptBuf::from_bytes(bytes),
-    ))
+    ScriptBuf::from_bytes(bytes)
+}
+
+/// P2WPKH dust at the same 30 sat/vB relay rate used for typed peg-outs.
+pub fn p2wpkh_dust_sats() -> Result<u64, WalletError> {
+    Ok(crate::tx_invariants::ltc_dust_threshold(&p2wpkh_script()))
 }
 
 /// Map each spent private coin to a public HogEx amount.
@@ -149,9 +152,11 @@ pub fn plan_pegout_per_coin(
     crate::tx_invariants::check_money(fee_sats, "peg-out fee")?;
     crate::tx_invariants::check_money(dust_sats, "peg-out dust")?;
     crate::tx_invariants::checked_sum_sats(coin_amounts.iter().copied(), "peg-out coins")?;
-    let min_weight =
-        bdk_mweb::policy::KERNEL_WITH_STEALTH_WEIGHT.saturating_add(coin_amounts.len() as u64);
-    let min_fee = bdk_mweb::policy::min_mweb_fee(min_weight);
+    let script = p2wpkh_script();
+    let min_fee = crate::tx_invariants::min_kernel_fee(
+        0,
+        std::iter::repeat(script.as_script()).take(coin_amounts.len()),
+    );
     if fee_sats < min_fee {
         return Err(WalletError::BuildTx(format!(
             "peg-out fee {fee_sats} litoshis is below the MWEB minimum of {min_fee} litoshis"
@@ -2509,8 +2514,10 @@ mod tests {
                 .collect();
 
             let res = plan_pegout_per_coin(&coins, fee_sats, dust);
-            let min_fee = bdk_mweb::policy::min_mweb_fee(
-                bdk_mweb::policy::KERNEL_WITH_STEALTH_WEIGHT + n as u64,
+            let script = p2wpkh_script();
+            let min_fee = crate::tx_invariants::min_kernel_fee(
+                0,
+                std::iter::repeat(script.as_script()).take(n),
             );
             let max_coin = coins.iter().copied().max().unwrap();
             let min_coin = coins.iter().copied().min().unwrap();
@@ -4071,6 +4078,7 @@ pub fn list_mweb_unspent(
                 churn_error: fields.churn_error,
                 churn_target: fields.churn_target,
                 churn_counted: fields.churn_counted,
+                churn_fee_sats: fields.churn_fee_sats,
                 churn_cover_hold: fields.churn_cover_hold,
                 churn_cover_min: fields.churn_cover_min,
                 churn_cover_seen: fields.churn_cover_seen,
@@ -4247,6 +4255,7 @@ struct ChurnFields {
     churn_error: Option<String>,
     churn_target: Option<u32>,
     churn_counted: Option<u32>,
+    churn_fee_sats: Option<u64>,
     churn_cover_hold: Option<crate::dto::CoverHold>,
     churn_cover_min: Option<u32>,
     churn_cover_seen: Option<u64>,
@@ -4266,6 +4275,7 @@ struct LiveJobFields {
     error: Option<String>,
     target: Option<u32>,
     counted: Option<u32>,
+    fee: Option<u64>,
     cover_hold: Option<crate::dto::CoverHold>,
     cover_min: Option<u32>,
     cover_seen: Option<u64>,
@@ -4300,6 +4310,7 @@ fn churn_fields(
                 error: job.last_error.clone(),
                 target: Some(job.target_depth),
                 counted: Some(job.effective_depth),
+                fee: Some(job.fee_sats),
                 cover_hold: job.cover_hold,
                 cover_min: Some(job.cover_min),
                 cover_seen: job.last_cover_count,
@@ -4334,6 +4345,7 @@ fn churn_fields(
         churn_error: live.error,
         churn_target: live.target,
         churn_counted: live.counted,
+        churn_fee_sats: live.fee,
         churn_cover_hold: live.cover_hold,
         churn_cover_min: live.cover_min,
         churn_cover_seen: live.cover_seen,
@@ -5559,6 +5571,7 @@ mod churn_field_tests {
         assert_eq!(fields.churn_phase, Some(ChurnPhase::PausedSolo));
         assert_eq!(fields.churn_target, Some(4));
         assert_eq!(fields.churn_counted, Some(2));
+        assert_eq!(fields.churn_fee_sats, Some(50_000));
         assert!(fields.churn_error.is_none());
     }
 
@@ -5573,6 +5586,7 @@ mod churn_field_tests {
         assert!(fields.churn_error.is_none());
         assert_eq!(fields.churn_target, Some(1));
         assert_eq!(fields.churn_counted, Some(1));
+        assert!(fields.churn_fee_sats.is_none());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use bdk_wallet::KeychainKind;
 use super::super::*;
 use super::{app_with_private_coins, app_with_public_coins};
 use crate::dto::{
-    MwebSendRequest, PeginRequest, PegoutRequest, SendRequest, SetUtxoLockedRequest, SplitOutput,
-    SplitPreview, TxKind, DEFAULT_MWEB_FEE_SATS,
+    ChurnRequest, MwebSendRequest, PeginRequest, PegoutRequest, SendRequest, SetUtxoLockedRequest,
+    SplitChain, SplitOutput, SplitPreview, SplitRequest, TxKind,
 };
 use crate::mweb_history::MwebHistoryEntry;
 
@@ -144,7 +144,7 @@ fn f3_pegin_excludes_frozen_utxos_and_checks_v9_dust_and_change() {
     // Only 1,000,000 is unfrozen; requesting 1,500,000 must fail in preview_pegin.
     let res = app.preview_pegin(PeginRequest {
         amount_sats: 1_500_000,
-        mweb_fee_sats: DEFAULT_MWEB_FEE_SATS,
+        mweb_fee_sats: crate::tx_invariants::min_kernel_fee(1, std::iter::empty()),
         transparent_fee_sats: 500,
         drain: false,
         selected_outpoints: None,
@@ -184,7 +184,7 @@ fn f3_pegin_excludes_frozen_utxos_and_checks_v9_dust_and_change() {
     let auto_preview = app
         .preview_pegin(PeginRequest {
             amount_sats: 100_000,
-            mweb_fee_sats: DEFAULT_MWEB_FEE_SATS,
+            mweb_fee_sats: crate::tx_invariants::min_kernel_fee(1, std::iter::empty()),
             transparent_fee_sats: 500,
             drain: false,
             selected_outpoints: None,
@@ -208,7 +208,7 @@ fn f4_duplicate_selected_coin_ids_do_not_double_count_balance() {
     let res = app.preview_mweb_send(MwebSendRequest {
         address: mweb_dest,
         amount_sats: 80_000,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: 50_000,
         drain: false,
         selected_output_ids: Some(vec![ids[0].clone(), ids[0].clone()]),
     });
@@ -221,7 +221,7 @@ fn f4_duplicate_selected_coin_ids_do_not_double_count_balance() {
     let (app_pub, outs) = app_with_public_coins(dir_pub.path(), &[100_000]);
     let res_pegin = app_pub.preview_pegin(PeginRequest {
         amount_sats: 120_000,
-        mweb_fee_sats: DEFAULT_MWEB_FEE_SATS,
+        mweb_fee_sats: crate::tx_invariants::min_kernel_fee(1, std::iter::empty()),
         transparent_fee_sats: 500,
         drain: false,
         selected_outpoints: Some(vec![outs[0].to_string(), outs[0].to_string()]),
@@ -244,7 +244,7 @@ fn f5_mweb_send_and_pegout_previews_enforce_address_kind_and_fee_floors() {
     let send_to_pub = app.preview_mweb_send(MwebSendRequest {
         address: pub_addr.clone(),
         amount_sats: 100_000,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: crate::tx_invariants::min_kernel_fee(2, std::iter::empty()),
         drain: false,
         selected_output_ids: None,
     });
@@ -256,7 +256,7 @@ fn f5_mweb_send_and_pegout_previews_enforce_address_kind_and_fee_floors() {
     let pegout_to_mweb = app.preview_pegout(PegoutRequest {
         address: mweb_addr.clone(),
         amount_sats: 100_000,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: crate::tx_invariants::min_kernel_fee(2, std::iter::empty()),
         drain: false,
         selected_output_ids: None,
         output_amounts: Vec::new(),
@@ -272,7 +272,7 @@ fn f5_mweb_send_and_pegout_previews_enforce_address_kind_and_fee_floors() {
     let pegout_empty = app.preview_pegout(PegoutRequest {
         address: String::new(),
         amount_sats: 100_000,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: crate::tx_invariants::min_kernel_fee(2, std::iter::empty()),
         drain: false,
         selected_output_ids: None,
         output_amounts: Vec::new(),
@@ -415,15 +415,8 @@ fn f7_failed_builds_and_signs_do_not_advance_receive_indices() {
             .get(&hex::decode(&ids[0]).unwrap().try_into().unwrap())
             .unwrap()
             .clone();
-        let res = mweb::sign_self_spend_hops(
-            &state.wallet,
-            mweb,
-            &data_dir,
-            coin,
-            2,
-            DEFAULT_MWEB_FEE_SATS,
-            network,
-        );
+        let res =
+            mweb::sign_self_spend_hops(&state.wallet, mweb, &data_dir, coin, 2, 50_000, network);
         assert!(res.is_err());
         assert_eq!(
             mweb.receive_index, mweb_idx_before,
@@ -455,7 +448,7 @@ fn f7_failed_builds_and_signs_do_not_advance_receive_indices() {
     let pegout_res = app.sign_pegout(PegoutRequest {
         address: String::new(),
         amount_sats: 0,
-        fee_sats: DEFAULT_MWEB_FEE_SATS,
+        fee_sats: crate::tx_invariants::min_kernel_fee(2, std::iter::empty()),
         drain: true,
         selected_output_ids: Some(vec![no_key_hex]),
         output_amounts: Vec::new(),
@@ -610,4 +603,197 @@ fn ltc_dust_coin_selection_tops_up_optional_utxo_to_rescue_sub_dust_change() {
         preview.fee_sats < 500,
         "fee should be 2-in-2-out (~209 sats), not burning 1,000 sats: {preview:?}"
     );
+}
+
+fn one_output_fee() -> u64 {
+    crate::tx_invariants::min_kernel_fee(1, std::iter::empty())
+}
+
+fn two_output_fee() -> u64 {
+    crate::tx_invariants::min_kernel_fee(2, std::iter::empty())
+}
+
+/// A fee of 0 pays the relay minimum for the shape, not a flat kernel fee.
+#[test]
+fn auto_mweb_fee_follows_weight() {
+    let one = one_output_fee();
+    let two = two_output_fee();
+    assert_eq!(one, 2_100);
+    assert_eq!(two, 3_900);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (app, ids) = app_with_private_coins(dir.path(), &[100_000 + one, 200_000, 500_000]);
+    let address = app.mweb_receive_address().unwrap();
+
+    let exact = app
+        .preview_mweb_send(MwebSendRequest {
+            address: address.clone(),
+            amount_sats: 100_000,
+            fee_sats: 0,
+            drain: false,
+            selected_output_ids: Some(vec![ids[0].clone()]),
+        })
+        .unwrap();
+    assert_eq!(exact.fee_sats, one);
+    assert!(!exact.creates_change);
+
+    let drained = app
+        .preview_mweb_send(MwebSendRequest {
+            address: address.clone(),
+            amount_sats: 0,
+            fee_sats: 0,
+            drain: true,
+            selected_output_ids: Some(vec![ids[1].clone()]),
+        })
+        .unwrap();
+    assert_eq!(drained.fee_sats, one);
+    assert_eq!(drained.amount_sats, 200_000 - one);
+    assert!(!drained.creates_change);
+
+    let change = app
+        .preview_mweb_send(MwebSendRequest {
+            address: address.clone(),
+            amount_sats: 100_000,
+            fee_sats: 0,
+            drain: false,
+            selected_output_ids: Some(vec![ids[2].clone()]),
+        })
+        .unwrap();
+    assert_eq!(change.fee_sats, two);
+    assert!(change.creates_change);
+
+    let below = app.preview_mweb_send(MwebSendRequest {
+        address: address.clone(),
+        amount_sats: 100_000,
+        fee_sats: 2_000,
+        drain: false,
+        selected_output_ids: Some(vec![ids[0].clone()]),
+    });
+    assert!(
+        below.is_err(),
+        "explicit fee under 2,100 must fail: {below:?}"
+    );
+
+    let no_change_fee_with_change = app.preview_mweb_send(MwebSendRequest {
+        address: address,
+        amount_sats: 100_000,
+        fee_sats: one,
+        drain: false,
+        selected_output_ids: Some(vec![ids[2].clone()]),
+    });
+    assert!(
+        no_change_fee_with_change.is_err(),
+        "explicit 2,100 must fail when change is created: {no_change_fee_with_change:?}"
+    );
+
+    let dir_pub = tempfile::tempdir().unwrap();
+    let (app_pub, _outs) = app_with_public_coins(dir_pub.path(), &[1_000_000]);
+    let pegin = app_pub
+        .preview_pegin(PeginRequest {
+            amount_sats: 100_000,
+            mweb_fee_sats: 0,
+            transparent_fee_sats: 500,
+            drain: false,
+            selected_outpoints: None,
+        })
+        .unwrap();
+    assert_eq!(pegin.mweb_fee_sats, one);
+
+    let preview = app
+        .preview_churn(ChurnRequest {
+            output_id: ids[2].clone(),
+            target_depth: 3,
+            cover_min: 0,
+            spread_send: false,
+        })
+        .unwrap();
+    assert_eq!(preview.hop_fee_sats, one);
+    assert_eq!(preview.total_fee_sats, one * 3);
+    assert_eq!(preview.quiet_block_note, crate::dto::CHURN_QUIET_CHAIN_NOTE);
+    let one_hop = app
+        .preview_churn(ChurnRequest {
+            output_id: ids[2].clone(),
+            target_depth: 1,
+            cover_min: 0,
+            spread_send: false,
+        })
+        .unwrap();
+    assert_eq!(one_hop.hop_fee_sats, one);
+    assert_eq!(one_hop.total_fee_sats, one);
+    assert_eq!(one_hop.quiet_block_note, crate::dto::CHURN_QUIET_NOTE);
+    assert!(one_hop.quiet_block_note.contains("0.000021 LTC"));
+
+    let split = app
+        .preview_split(SplitRequest {
+            chain: SplitChain::Private,
+            input: ids[2].clone(),
+            equal_count: Some(4),
+            amounts: vec![],
+            fee_rate_sat_vb: None,
+            fee_sats: 0,
+        })
+        .unwrap();
+    assert_eq!(split.fee_sats, 7_500);
+
+    let script = crate::mweb::p2wpkh_script();
+    let peg_exact = crate::tx_invariants::min_kernel_fee(0, [script.as_script()]);
+    let peg_change = crate::tx_invariants::min_kernel_fee(1, [script.as_script()]);
+    assert_eq!(peg_exact, 400);
+    assert_eq!(peg_change, 2_200);
+
+    let dir_peg = tempfile::tempdir().unwrap();
+    let (app_peg, peg_ids) =
+        app_with_private_coins(dir_peg.path(), &[100_000 + peg_exact, 500_000]);
+    let ltc1 = app_peg.receive_address().unwrap();
+    let exact_peg = app_peg
+        .preview_pegout(PegoutRequest {
+            address: ltc1.clone(),
+            amount_sats: 100_000,
+            fee_sats: 0,
+            drain: false,
+            selected_output_ids: Some(vec![peg_ids[0].clone()]),
+            output_amounts: Vec::new(),
+            addresses: Vec::new(),
+            per_coin: false,
+            fee_output_index: None,
+        })
+        .unwrap();
+    assert_eq!(exact_peg.fee_sats, peg_exact);
+    assert!(!exact_peg.creates_change);
+
+    let change_peg = app_peg
+        .preview_pegout(PegoutRequest {
+            address: ltc1,
+            amount_sats: 100_000,
+            fee_sats: 0,
+            drain: false,
+            selected_output_ids: Some(vec![peg_ids[1].clone()]),
+            output_amounts: Vec::new(),
+            addresses: Vec::new(),
+            per_coin: false,
+            fee_output_index: None,
+        })
+        .unwrap();
+    assert_eq!(change_peg.fee_sats, peg_change);
+    assert!(change_peg.creates_change);
+
+    let per_coin = app
+        .preview_pegout(PegoutRequest {
+            address: String::new(),
+            amount_sats: 0,
+            fee_sats: 0,
+            drain: true,
+            selected_output_ids: Some(vec![ids[1].clone(), ids[2].clone()]),
+            output_amounts: Vec::new(),
+            addresses: Vec::new(),
+            per_coin: false,
+            fee_output_index: None,
+        })
+        .unwrap();
+    let p2wpkh = crate::mweb::p2wpkh_script();
+    let two_scripts =
+        crate::tx_invariants::min_kernel_fee(0, std::iter::repeat(p2wpkh.as_script()).take(2));
+    assert_eq!(two_scripts, 500);
+    assert_eq!(per_coin.fee_sats, two_scripts);
+    assert!(!per_coin.creates_change);
 }

@@ -707,6 +707,13 @@ pub struct MwebSyncProgress {
     /// Transparent scripts scanned so far during the Electrum pass.
     #[serde(default)]
     pub scripts_scanned: u32,
+    /// Of those, scripts that already had history. Zero while none have.
+    #[serde(default)]
+    pub scripts_active: u32,
+    /// Electrum has been persisted and the wallet mutex released, so public
+    /// balance and public send can proceed while MWEB is still downloading.
+    #[serde(default)]
+    pub transparent_ready: bool,
     /// Raw transparent transactions fetched so far during the Electrum pass.
     #[serde(default)]
     pub txs_fetched: u32,

@@ -441,6 +441,8 @@ type MwebSyncProgress = {
   fetched: number;
   total: number;
   scripts_scanned?: number;
+  scripts_active?: number;
+  transparent_ready?: boolean;
   txs_fetched?: number;
   txs_total?: number;
   anchors_verified?: number;
@@ -613,9 +615,6 @@ const el = {
   statMweb: document.querySelector<HTMLElement>("#stat-mweb")!,
   mwebStatusCard: document.querySelector<HTMLElement>("#mweb-status-card")!,
   mwebStatus: document.querySelector<HTMLElement>("#mweb-status")!,
-  mwebProgress: document.querySelector<HTMLElement>("#mweb-progress")!,
-  mwebProgressFill: document.querySelector<HTMLElement>("#mweb-progress-fill")!,
-  mwebProgressText: document.querySelector<HTMLElement>("#mweb-progress-text")!,
   address: document.querySelector<HTMLElement>("#address")!,
   receiveQr: document.querySelector<HTMLCanvasElement>("#receive-qr")!,
   receiveAmount: document.querySelector<HTMLInputElement>("#receive-amount")!,
@@ -797,9 +796,15 @@ const el = {
   btnMwebSend: document.querySelector<HTMLButtonElement>("#btn-mweb-send")!,
   btnPegout: document.querySelector<HTMLButtonElement>("#btn-pegout")!,
   statusStrip: document.querySelector<HTMLElement>("#status-strip")!,
+  statusRest: document.querySelector<HTMLElement>("#status-rest")!,
   statusBlock: document.querySelector<HTMLButtonElement>("#status-block")!,
   statusSep: document.querySelector<HTMLElement>("#status-sep")!,
   statusMweb: document.querySelector<HTMLElement>("#status-mweb")!,
+  statusSync: document.querySelector<HTMLElement>("#status-sync")!,
+  statusSyncLabel: document.querySelector<HTMLElement>("#status-sync-label")!,
+  statusSyncCount: document.querySelector<HTMLElement>("#status-sync-count")!,
+  statusSyncTrack: document.querySelector<HTMLElement>("#status-sync-track")!,
+  statusSyncFill: document.querySelector<HTMLElement>("#status-sync-fill")!,
   coinsUtxoList: document.querySelector<HTMLUListElement>("#coins-utxo-list")!,
   coinsUtxoEmpty: document.querySelector<HTMLElement>("#coins-utxo-empty")!,
   coinsSum: document.querySelector<HTMLElement>("#coins-sum")!,
@@ -853,6 +858,8 @@ const cards = Object.fromEntries(
 ) as Record<Card, { nav: HTMLButtonElement; pane: HTMLElement }>;
 
 let syncing = false;
+/** Electrum has persisted; public send may proceed while MWEB is still downloading. */
+let transparentReady = false;
 let sending = false;
 /** A peg-out is on its way to peers. The Swap button says so until it returns. */
 let pegoutBroadcasting = false;
@@ -1513,10 +1520,6 @@ function formatAmountSubtitle(sats: number): string {
   return displayUnit === "litoshis" ? `(${formatLtc(sats)})` : formatLitoshis(sats);
 }
 
-function formatMs(ms: number): string {
-  return ms >= 1_000 ? `${(ms / 1_000).toFixed(1)}s` : `${ms}ms`;
-}
-
 function unitLabel(): string {
   return displayUnit === "litoshis" ? "litoshis" : "LTC";
 }
@@ -1875,10 +1878,12 @@ function applySegModes() {
 el.sendSegPublic.addEventListener("click", () => {
   sendMode = "public";
   applySegModes();
+  updateBusyUi();
 });
 el.sendSegPrivate.addEventListener("click", () => {
   sendMode = "private";
   applySegModes();
+  updateBusyUi();
 });
 el.receiveSegPublic.addEventListener("click", () => {
   receiveMode = "public";
@@ -2274,7 +2279,7 @@ function electrumHostLabel(url: string | null | undefined): string {
   }
 }
 
-/** Short MWEB strip label — full detail stays on the MWEB sync card. */
+/** Short MWEB strip label. A failure's full text stays on the MWEB card. */
 function formatMwebStripStatus(
   mwebStatus: string,
   mwebHeight: number | null,
@@ -2319,6 +2324,20 @@ type StatusStripModel = {
   mwebHeight: number | null;
   mwebStale: boolean;
 };
+
+type LiveSyncProgress = {
+  title: string;
+  detail: string | null;
+  /** Null while address discovery has no honest denominator. */
+  pct: number | null;
+};
+
+let liveSyncProgress: LiveSyncProgress | null = null;
+let shownSyncTitle: string | null = null;
+let pendingSync: LiveSyncProgress | null = null;
+let phaseHoldTimer: number | null = null;
+const PHASE_HOLD_MS = 600;
+let refreshedTransparent = false;
 
 let statusStripModel: StatusStripModel = {
   tip: null,
@@ -2369,6 +2388,31 @@ function paintStatusStrip() {
       el.statusMweb,
       formatMwebStripStatus(mwebStatus, mwebHeight, mwebStale, tip),
     );
+  }
+  paintLiveSyncRow();
+}
+
+function paintLiveSyncRow() {
+  const live = liveSyncProgress;
+  el.statusRest.hidden = live != null;
+  el.statusSync.hidden = live == null;
+  if (!live) return;
+  setControlText(el.statusSyncLabel, live.title);
+  if (live.detail) {
+    el.statusSyncCount.hidden = false;
+    setControlText(el.statusSyncCount, live.detail);
+  } else {
+    el.statusSyncCount.hidden = true;
+  }
+  const indeterminate = live.pct == null;
+  el.statusSyncTrack.classList.toggle("is-indeterminate", indeterminate);
+  el.statusSyncTrack.setAttribute("aria-label", live.title);
+  if (indeterminate) {
+    el.statusSyncTrack.removeAttribute("aria-valuenow");
+    el.statusSyncFill.style.width = "";
+  } else {
+    el.statusSyncTrack.setAttribute("aria-valuenow", String(live.pct));
+    el.statusSyncFill.style.width = `${live.pct}%`;
   }
 }
 
@@ -2818,12 +2862,13 @@ function flashLabel(btn: HTMLButtonElement, text: string) {
 }
 
 function updateBusyUi() {
-  const busy = syncing || sending;
-  el.btnSync.disabled = busy;
-  el.btnAddress.disabled = busy;
-  el.btnCopy.disabled = busy;
-  el.btnCopyPayment.disabled = busy;
-  el.btnSend.disabled = busy;
+  const privateBusy = syncing || sending;
+  const publicBusy = (syncing && !transparentReady) || sending;
+  el.btnSync.disabled = privateBusy;
+  el.btnAddress.disabled = publicBusy;
+  el.btnCopy.disabled = publicBusy;
+  el.btnCopyPayment.disabled = publicBusy;
+  el.btnSend.disabled = sendMode === "private" ? privateBusy : publicBusy;
   // A filled restore field means the user intends to restore; block Create so
   // the primary button can't silently generate a fresh wallet instead.
   const restorePending = el.restoreMnemonic.value.trim().length > 0;
@@ -2833,54 +2878,101 @@ function updateBusyUi() {
     requireWalletPassphrase(el.restorePassphrase.value, el.restorePassphrase2.value) == null;
   const migratePassOk =
     requireWalletPassphrase(el.migratePassphrase.value, el.migratePassphrase2.value) == null;
-  el.btnCreate.disabled = busy || restorePending || !createPassOk;
+  el.btnCreate.disabled = privateBusy || restorePending || !createPassOk;
   el.createRestoreHint.hidden = !restorePending;
-  el.btnRestore.disabled = busy || !restorePassOk || !el.restoreMnemonic.value.trim();
-  el.btnMigrate.disabled = busy || !migratePassOk;
-  el.sendAddress.disabled = busy;
-  el.sendAmount.disabled = busy;
-  el.sendNote.disabled = busy;
-  el.peginAmount.disabled = busy;
-  el.peginNote.disabled = busy;
-  el.mwebSendAmount.disabled = busy;
-  el.mwebSendNote.disabled = busy;
-  el.pegoutAmount.disabled = busy;
-  el.pegoutNote.disabled = busy;
+  el.btnRestore.disabled = privateBusy || !restorePassOk || !el.restoreMnemonic.value.trim();
+  el.btnMigrate.disabled = privateBusy || !migratePassOk;
+  el.sendAddress.disabled = publicBusy;
+  el.sendAmount.disabled = publicBusy;
+  el.sendNote.disabled = publicBusy;
+  el.peginAmount.disabled = privateBusy;
+  el.peginNote.disabled = privateBusy;
+  el.mwebSendAmount.disabled = privateBusy;
+  el.mwebSendNote.disabled = privateBusy;
+  el.pegoutAmount.disabled = privateBusy;
+  el.pegoutNote.disabled = privateBusy;
+  for (const btn of el.sendAmountPresets.querySelectorAll<HTMLButtonElement>("button")) {
+    btn.disabled = publicBusy;
+  }
   for (const group of [
-    el.sendAmountPresets,
     el.mwebSendAmountPresets,
     el.peginAmountPresets,
     el.pegoutAmountPresets,
     el.litvmSendAmountPresets,
   ]) {
     for (const btn of group.querySelectorAll<HTMLButtonElement>("button")) {
-      btn.disabled = busy;
+      btn.disabled = privateBusy;
     }
   }
-  el.btnPegin.disabled = busy;
-  el.btnMwebSend.disabled = busy;
-  el.btnPegout.disabled = busy;
+  el.btnPegin.disabled = privateBusy;
+  el.btnMwebSend.disabled = privateBusy;
+  el.btnPegout.disabled = privateBusy;
   el.btnPegout.textContent = pegoutBroadcasting ? "Swapping…" : "Move to public";
   el.btnPegout.title = syncing
-    ? "Wait for the sync to finish."
+    ? transparentReady
+      ? "Private coins are still syncing."
+      : "Wait for the sync to finish."
     : sending
       ? "Wait for the current send or swap to finish."
       : "";
-  el.btnResyncMweb.disabled = busy;
-  el.btnRevealMnemonic.disabled = busy;
+  el.btnResyncMweb.disabled = privateBusy;
+  el.btnRevealMnemonic.disabled = privateBusy;
 
   el.syncLabel.textContent = sending ? "Sending…" : syncing ? "Syncing…" : "Sync";
-  el.syncDot.dataset.state = busy ? "busy" : syncState;
-  el.syncDot.title = busy
+  el.syncDot.dataset.state = privateBusy ? "busy" : syncState;
+  el.syncDot.title = privateBusy
     ? sending
       ? "Sending"
       : "Syncing"
     : SYNC_TITLES[syncState];
 }
 
+let mwebChromeVisible = false;
+
+function mwebClauseIsProblem(lower: string): boolean {
+  return (
+    lower.includes("unavailable") ||
+    lower.includes("error") ||
+    lower.includes("failed") ||
+    lower.includes("warning") ||
+    lower.includes("no mweb peers") ||
+    lower.includes("no peers") ||
+    lower.includes("unreachable") ||
+    lower.includes("rate-limiting") ||
+    lower.includes("could not be decoded")
+  );
+}
+
+/** Idle and success lines live on the header strip. The card keeps a real failure. */
+function mwebStatusNeedsCard(status: string): boolean {
+  const lower = status.trim().toLowerCase();
+  if (
+    !lower ||
+    lower === "mweb not synced yet" ||
+    lower === "mweb idle" ||
+    lower === "synced"
+  ) {
+    return false;
+  }
+  const clauses = lower.split(" · ");
+  const head = clauses[0] ?? "";
+  if (head.startsWith("mweb synced")) {
+    return mwebClauseIsProblem(clauses.slice(1).join(" · "));
+  }
+  return mwebClauseIsProblem(lower);
+}
+
+function syncMwebStatusCard() {
+  const status = el.mwebStatus.textContent?.trim() ?? "";
+  const show = mwebChromeVisible && mwebStatusNeedsCard(status);
+  el.mwebStatusCard.hidden = !show;
+  el.mwebStatus.hidden = !show;
+}
+
 function setMwebVisible(visible: boolean) {
+  mwebChromeVisible = visible;
   el.statMweb.hidden = !visible;
-  el.mwebStatusCard.hidden = !visible;
+  syncMwebStatusCard();
   el.mwebTools.hidden = !visible;
   // Without MWEB there is only one side: hide the toggles and force public.
   el.sendToggle.hidden = !visible;
@@ -3530,8 +3622,8 @@ function renderCombined(c: CombinedSummary) {
   el.balanceMwebDetail.hidden = detailParts.length === 0;
   el.balanceMwebDetail.textContent = detailParts.join(" · ");
 
-  el.mwebStatus.hidden = false;
   el.mwebStatus.textContent = c.mweb_status;
+  syncMwebStatusCard();
   if (c.mweb_receive_address) {
     el.mwebAddress.textContent = c.mweb_receive_address;
     void renderQr(el.mwebQr, c.mweb_receive_address);
@@ -4184,97 +4276,137 @@ async function loadElectrumPresets() {
   }
 }
 
-function electrumProgressPct(p: MwebSyncProgress): number | null {
-  const anchorsTotal = p.anchors_total ?? 0;
-  if (anchorsTotal > 0) {
-    const done = p.anchors_verified ?? 0;
-    return Math.min(100, Math.round((done / anchorsTotal) * 100));
-  }
-  const txsTotal = p.txs_total ?? 0;
-  if (txsTotal > 0) {
-    const done = p.txs_fetched ?? 0;
-    return Math.min(100, Math.round((done / txsTotal) * 100));
-  }
-  return null;
+function syncCount(n: number): string {
+  return n.toLocaleString("en-US");
 }
 
-function syncPhaseLoadingLabel(p: MwebSyncProgress): string | null {
+/** Plain phase plus an honest count. Address discovery has no percentage. */
+function syncProgressCopy(p: MwebSyncProgress): LiveSyncProgress | null {
   switch (p.phase) {
     case "electrum-full-scan":
     case "electrum-sync": {
       const anchorsTotal = p.anchors_total ?? 0;
       if (anchorsTotal > 0) {
         const done = p.anchors_verified ?? 0;
-        const pct = Math.min(100, Math.round((done / anchorsTotal) * 100));
-        return `Verifying transaction proofs: ${done.toLocaleString(
-          "en-US",
-        )} / ${anchorsTotal.toLocaleString("en-US")} (${pct}%)`;
+        return {
+          title: "Verifying proofs…",
+          detail: `${syncCount(done)} / ${syncCount(anchorsTotal)}`,
+          pct: Math.min(100, Math.round((done / anchorsTotal) * 100)),
+        };
       }
       const txsTotal = p.txs_total ?? 0;
       if (txsTotal > 0) {
         const done = p.txs_fetched ?? 0;
-        const pct = Math.min(100, Math.round((done / txsTotal) * 100));
-        return `Downloading transactions: ${done.toLocaleString(
-          "en-US",
-        )} / ${txsTotal.toLocaleString("en-US")} (${pct}%)`;
+        return {
+          title: "Downloading your transactions…",
+          detail: `${syncCount(done)} / ${syncCount(txsTotal)}`,
+          pct: Math.min(100, Math.round((done / txsTotal) * 100)),
+        };
       }
       const scripts = p.scripts_scanned ?? 0;
-      if (scripts > 0) {
-        return p.phase === "electrum-full-scan"
-          ? `Scanning transparent addresses (${scripts.toLocaleString("en-US")} checked)…`
-          : `Syncing transparent transactions (${scripts.toLocaleString("en-US")} addresses)…`;
+      const active = p.scripts_active ?? 0;
+      let detail: string | null = null;
+      if (scripts > 0 && active > 0) {
+        detail = `${syncCount(scripts)} scanned, ${syncCount(active)} active`;
+      } else if (scripts > 0) {
+        detail = `${syncCount(scripts)} scanned`;
       }
-      return p.phase === "electrum-full-scan"
-        ? "Scanning transparent addresses…"
-        : "Syncing transparent transactions…";
+      return { title: "Checking your addresses…", detail, pct: null };
     }
-    case "mweb-download":
-      if (p.active && p.total === 0) return "Connecting to MWEB peers…";
+    case "mweb-download": {
       if (p.active && p.total > 0) {
-        const pct = Math.min(100, Math.round((p.fetched / p.total) * 100));
-        return `Downloading MWEB outputs: ${p.fetched.toLocaleString(
-          "en-US",
-        )} / ${p.total.toLocaleString("en-US")} (${pct}%)`;
+        return {
+          title: "Syncing confidential transactions…",
+          detail: `${syncCount(p.fetched)} / ${syncCount(p.total)}`,
+          pct: Math.min(100, Math.round((p.fetched / p.total) * 100)),
+        };
       }
-      return "Downloading MWEB outputs…";
+      return {
+        title: "Syncing confidential transactions…",
+        detail: null,
+        pct: null,
+      };
+    }
     default:
       return null;
   }
 }
 
+function syncPhaseLoadingLabel(p: MwebSyncProgress): string | null {
+  const copy = syncProgressCopy(p);
+  if (!copy) return null;
+  return copy.detail ? `${copy.title} ${copy.detail}` : copy.title;
+}
+
+function clearPhaseHold() {
+  if (phaseHoldTimer != null) {
+    window.clearTimeout(phaseHoldTimer);
+    phaseHoldTimer = null;
+  }
+  pendingSync = null;
+}
+
+function showLiveSync(copy: LiveSyncProgress) {
+  liveSyncProgress = copy;
+  shownSyncTitle = copy.title;
+  paintStatusStrip();
+}
+
+/** First label shows at once. A later phase has to stay put briefly, so a tiny wallet does not flash four titles. */
+function offerSyncProgress(copy: LiveSyncProgress | null) {
+  if (copy == null) {
+    clearPhaseHold();
+    shownSyncTitle = null;
+    liveSyncProgress = null;
+    paintStatusStrip();
+    return;
+  }
+  if (shownSyncTitle == null || shownSyncTitle === copy.title) {
+    clearPhaseHold();
+    showLiveSync(copy);
+    return;
+  }
+  pendingSync = copy;
+  if (phaseHoldTimer == null) {
+    phaseHoldTimer = window.setTimeout(() => {
+      phaseHoldTimer = null;
+      if (!pendingSync) return;
+      const next = pendingSync;
+      pendingSync = null;
+      showLiveSync(next);
+    }, PHASE_HOLD_MS);
+  }
+}
+
 function renderMwebProgress(p: MwebSyncProgress) {
-  const phaseLabel = syncPhaseLoadingLabel(p);
-  if (phaseLabel) setLoadingLabel(phaseLabel);
-
-  if (p.phase === "electrum-full-scan" || p.phase === "electrum-sync") {
-    const pct = electrumProgressPct(p) ?? 0;
-    el.mwebProgress.hidden = false;
-    el.mwebProgressFill.style.width = `${pct}%`;
-    el.mwebProgressText.textContent = phaseLabel ?? "";
-    return;
+  const copy = syncProgressCopy(p);
+  if (copy) {
+    offerSyncProgress(copy);
+    const label = syncPhaseLoadingLabel(p);
+    if (label) setLoadingLabel(label);
   }
-
-  if (!p.active) {
-    el.mwebProgress.hidden = true;
-    return;
+  if (p.transparent_ready && !transparentReady) {
+    transparentReady = true;
+    updateBusyUi();
+    if (!refreshedTransparent && currentPhase === "ready") {
+      refreshedTransparent = true;
+      void refreshCombined();
+    }
   }
-  if (p.total === 0) {
-    el.mwebProgress.hidden = false;
-    el.mwebProgressFill.style.width = "0%";
-    el.mwebProgressText.textContent = "Connecting to MWEB peers…";
-    return;
-  }
-  const pct = Math.min(100, Math.round((p.fetched / p.total) * 100));
-  const text = `Downloading MWEB outputs: ${p.fetched.toLocaleString(
-    "en-US",
-  )} / ${p.total.toLocaleString("en-US")} (${pct}%)`;
-  el.mwebProgress.hidden = false;
-  el.mwebProgressFill.style.width = `${pct}%`;
-  el.mwebProgressText.textContent = text;
 }
 
 function startMwebProgressPolling() {
-  stopMwebProgressPolling();
+  if (mwebProgressTimer != null) {
+    window.clearInterval(mwebProgressTimer);
+    mwebProgressTimer = null;
+  }
+  transparentReady = false;
+  refreshedTransparent = false;
+  offerSyncProgress({
+    title: "Checking your addresses…",
+    detail: null,
+    pct: null,
+  });
   mwebProgressTimer = window.setInterval(async () => {
     try {
       const p = await invoke<MwebSyncProgress>("mweb_sync_progress");
@@ -4287,10 +4419,12 @@ function startMwebProgressPolling() {
 
 function stopMwebProgressPolling() {
   if (mwebProgressTimer != null) {
-    clearInterval(mwebProgressTimer);
+    window.clearInterval(mwebProgressTimer);
     mwebProgressTimer = null;
   }
-  el.mwebProgress.hidden = true;
+  transparentReady = false;
+  refreshedTransparent = false;
+  offerSyncProgress(null);
 }
 
 function startAutoSync() {
@@ -4923,10 +5057,6 @@ async function runSync(opts: { quiet: boolean }): Promise<boolean> {
     await refreshCombined();
     await refreshHistory();
     syncState = "ok";
-    const timing =
-      result.mweb_ms > 0
-        ? `${formatMs(result.electrum_ms)} + ${formatMs(result.mweb_ms)} MWEB`
-        : formatMs(result.electrum_ms);
     const pendingNow =
       transparentPendingSats(result.summary) +
       (lastCombined?.mweb_unconfirmed_sats ?? 0);
@@ -4949,7 +5079,7 @@ async function runSync(opts: { quiet: boolean }): Promise<boolean> {
       for (const warning of result.warnings) console.warn(warning);
       setStatus(result.warnings[0], "error");
     } else if (receivedSignal) {
-      setStatus(`Received funds — syncing details… (${timing})`, "success");
+      setStatus("Received funds — syncing details…", "success");
       pulseRecentHistoryRows();
       const firstReceive =
         !isFirstReceiveSeen() && !hadFundsBefore && lastTotalSats > 0;
@@ -4959,7 +5089,7 @@ async function runSync(opts: { quiet: boolean }): Promise<boolean> {
         setFirstReceiveSeen(true);
       }
     } else {
-      setStatus(`Synced in ${timing}`, "success");
+      setStatus("Synced", "success");
     }
     return true;
   } catch (e) {

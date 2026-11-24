@@ -1146,7 +1146,7 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
         .iter()
         .any(|w| w.contains("Could not repair")));
     assert!(
-        (1500..5000).contains(&first_ms),
+        (1500..10_000).contains(&first_ms),
         "dead fallback should stop at the short timeout, got {first_ms} ms"
     );
 

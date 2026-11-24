@@ -10,10 +10,9 @@ use std::sync::Arc;
 use bdk_mweb::keys::{MasterKeyScheme, MasterKeys};
 use bdk_mweb::limits::MAX_REQUESTED_MWEB_UTXOS;
 use bdk_mweb::lip0006::MwebUtxoSource;
-use bdk_mweb::lip0006_tcp::{BroadcastAck, TcpMwebPeer};
+use bdk_mweb::lip0006_tcp::{BroadcastAck, PeerPolicy, TcpMwebPeer};
 use bdk_mweb::mweb_sync::{
-    leafset_has_leaf, FixedHeaderProvider, MwebSyncer, PeerPool, ReadyNotifier, SyncProgress,
-    SyncState,
+    leafset_has_leaf, FixedHeaderProvider, MwebSyncer, ReadyNotifier, SyncProgress, SyncState,
 };
 use bdk_mweb::p2p::{GetMwebUtxos, MwebLeafset, OUTPUT_FORMAT_FULL};
 use bdk_mweb::pmmr::verify_leafset;
@@ -291,6 +290,109 @@ fn classify_pass_failure(err: &bdk_mweb::Error) -> PassFailure {
     }
 }
 
+/// Outcome of a failed [`MwebRuntime::sync_pass`].
+struct SyncPassFailure {
+    err: bdk_mweb::Error,
+    tried: usize,
+    /// True when every peer tried in this pass connected cleanly and only
+    /// failed because it had not yet indexed `tip_hash` (`notfound` or an
+    /// empty `pong` on `get_header` / `get_leafset`).
+    all_tip_lag: bool,
+    hard_failed: Vec<std::net::SocketAddr>,
+}
+
+/// Maximum cumulative wall-clock time spent on *failed* peer attempts in one
+/// [`MwebRuntime::sync_pass`]. Active downloads that are making forward
+/// progress are never capped by this budget.
+const UNPRODUCTIVE_FAILOVER_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Short pause before retrying the same peer pool when every peer answered
+/// promptly with clean tip-lag (Electrum saw the new block 1–2s before P2P).
+const TIP_LAG_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PEER_POLICY: std::cell::Cell<Option<PeerPolicy>> = const { std::cell::Cell::new(None) };
+    static TEST_UNPRODUCTIVE_BUDGET: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+    static TEST_TIP_LAG_BACKOFF: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn peer_policy_for_pool(pool_size: usize) -> PeerPolicy {
+    #[cfg(test)]
+    if let Some(policy) = TEST_PEER_POLICY.with(std::cell::Cell::get) {
+        return policy;
+    }
+    let mut policy = PeerPolicy::fast_failover();
+    if pool_size <= 1 {
+        // A single configured node has nowhere to fail over to; give its
+        // serving bucket time to refill before reporting a throttle error.
+        policy.max_throttled_rounds = 5;
+    }
+    policy
+}
+
+fn unproductive_failover_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_UNPRODUCTIVE_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    UNPRODUCTIVE_FAILOVER_BUDGET
+}
+
+fn tip_lag_backoff() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(backoff) = TEST_TIP_LAG_BACKOFF.with(std::cell::Cell::get) {
+        return backoff;
+    }
+    TIP_LAG_RETRY_BACKOFF
+}
+
+fn connect_failure_stage(err: &bdk_mweb::Error) -> &'static str {
+    let msg = format!("{err}");
+    if msg.contains("handshake") {
+        "handshake"
+    } else {
+        "connect"
+    }
+}
+
+fn compact_peer_err(err: &bdk_mweb::Error, stage: &str) -> String {
+    let msg = format!("{err}");
+    if msg.contains("notfound") {
+        "notfound".into()
+    } else if is_clean_tip_lag(err, stage) {
+        "tip_lag".into()
+    } else if msg.contains("timed out")
+        || msg.contains("Resource temporarily unavailable")
+        || msg.contains("os error 35")
+        || msg.contains("os error 11")
+    {
+        "timeout".into()
+    } else {
+        msg
+    }
+}
+
+/// True when the peer connected and answered promptly during header/leafset
+/// fetch, but did not yet have `tip_hash` (`notfound` or empty `pong` flush).
+///
+/// These peers are healthy and merely 1–2s behind Electrum's block view, so
+/// they are demoted to the back of the discovery pool rather than evicted.
+fn is_clean_tip_lag(err: &bdk_mweb::Error, stage: &str) -> bool {
+    if !matches!(stage, "get_header" | "get_leafset") {
+        return false;
+    }
+    match err.ban_reason() {
+        Some(BanReason::Throttled) => true,
+        Some(BanReason::ProtocolViolation) => format!("{err}").contains("notfound"),
+        _ => false,
+    }
+}
+
+fn is_rotatable_peer_error(err: &bdk_mweb::Error) -> bool {
+    err.ban_reason().is_some()
+}
+
 /// Account-aware MWEB scan/spend paths. Account 0 matches `MasterKeyScheme` defaults.
 pub fn mweb_scan_spend_paths(
     scheme: MasterKeyScheme,
@@ -549,8 +651,8 @@ impl MwebRuntime {
                     self.cross_check_leafset(tip_hash, candidates, network);
                     return Ok(());
                 }
-                Err(e) => {
-                    let failure = classify_pass_failure(&e);
+                Err(outcome) => {
+                    let failure = classify_pass_failure(&outcome.err);
                     // A metered node is healthy and it is ours. Keep waiting on
                     // it rather than defecting to a stranger's.
                     if !failure.allow_public_fallback {
@@ -568,8 +670,12 @@ impl MwebRuntime {
         let mut discovered = crate::discovery::discover_mweb_peers(network);
         let discover_ms = discover_started.elapsed().as_millis() as u64;
         if let Some(good) = self.last_good_peer {
-            discovered.retain(|addr| *addr != good);
-            discovered.insert(0, good);
+            if crate::discovery::should_prefer_peer(&good) {
+                discovered.retain(|addr| *addr != good);
+                discovered.insert(0, good);
+            } else {
+                self.last_good_peer = None;
+            }
         }
         crate::diag::log(format!(
             "sync: mweb peers discovered={} ms={discover_ms}",
@@ -589,7 +695,7 @@ impl MwebRuntime {
             tip_hash,
             prev_tip_hash,
             network,
-            progress,
+            progress.clone(),
             hold_spent,
         ) {
             Ok(()) => {
@@ -597,9 +703,64 @@ impl MwebRuntime {
                 self.cross_check_leafset(tip_hash, discovered, network);
                 Ok(())
             }
-            Err(e) => {
+            Err(first) => {
+                // When Electrum sees a brand-new block 1–2s before P2P gossip,
+                // every healthy peer can answer `notfound` or an empty `pong`
+                // in ~50ms. Wait briefly and retry the same pool rather than
+                // evicting healthy peers or re-crawling DNS seeds.
+                if first.all_tip_lag {
+                    let backoff = tip_lag_backoff();
+                    crate::diag::log(format!(
+                        "sync: mweb all {} peer(s) lagging tip={tip_height}; waiting {}ms before retry",
+                        first.tried,
+                        backoff.as_millis()
+                    ));
+                    if !backoff.is_zero() {
+                        std::thread::sleep(backoff);
+                    }
+                    if let Ok(()) = self.sync_pass(
+                        discovered.clone(),
+                        tip_height,
+                        tip_hash,
+                        prev_tip_hash,
+                        network,
+                        progress,
+                        hold_spent,
+                    ) {
+                        self.last_status.push_str(" via public peer");
+                        self.cross_check_leafset(tip_hash, discovered, network);
+                        return Ok(());
+                    }
+                } else if discover_ms == 0 {
+                    // The pass failed on a cached peer list; flush the cache and
+                    // crawl once so a stale pool recovers within the same cycle.
+                    crate::discovery::clear_cache();
+                    let refresh_started = std::time::Instant::now();
+                    let mut refreshed = crate::discovery::discover_mweb_peers(network);
+                    let refresh_ms = refresh_started.elapsed().as_millis() as u64;
+                    refreshed.retain(|addr| !first.hard_failed.contains(addr));
+                    crate::diag::log(format!(
+                        "sync: mweb peers refreshed={} ms={refresh_ms}",
+                        refreshed.len()
+                    ));
+                    if !refreshed.is_empty() {
+                        if let Ok(()) = self.sync_pass(
+                            refreshed.clone(),
+                            tip_height,
+                            tip_hash,
+                            prev_tip_hash,
+                            network,
+                            progress,
+                            hold_spent,
+                        ) {
+                            self.last_status.push_str(" via public peer");
+                            self.cross_check_leafset(tip_hash, refreshed, network);
+                            return Ok(());
+                        }
+                    }
+                }
                 self.stale = true;
-                self.last_status = classify_pass_failure(&e).status;
+                self.last_status = classify_pass_failure(&first.err).status;
                 Ok(())
             }
         }
@@ -642,20 +803,45 @@ impl MwebRuntime {
             leafset: self.sync_state.leafset.clone(),
         };
         let bdk_net = network.to_bitcoin_network();
+        let policy = peer_policy_for_pool(distinct.len().max(2));
         // The sync peer already verified the leafset against its anchored header.
         let mut confirmed = u32::from(sync_peer.is_some());
+        let mut hard_failed = Vec::new();
+        let mut lagging = Vec::new();
         for addr in distinct {
             if confirmed >= 2 {
                 break;
             }
-            if std::net::TcpStream::connect_timeout(&addr, PEER_PROBE_TIMEOUT).is_err() {
-                continue;
-            }
-            let Ok(mut peer) = TcpMwebPeer::connect(addr, bdk_net) else {
-                continue;
+            let attempt_started = std::time::Instant::now();
+            let mut peer = match TcpMwebPeer::connect_with_policy(addr, bdk_net, policy) {
+                Ok(peer) => peer,
+                Err(e) => {
+                    let stage = connect_failure_stage(&e);
+                    crate::diag::log(format!(
+                        "sync: mweb cross-check peer={addr} stage={stage} err={} ms={}",
+                        compact_peer_err(&e, stage),
+                        attempt_started.elapsed().as_millis() as u64,
+                    ));
+                    hard_failed.push(addr);
+                    continue;
+                }
             };
-            let Ok(hdr) = peer.get_header(tip_hash) else {
-                continue;
+            let hdr = match peer.get_header(tip_hash) {
+                Ok(hdr) => hdr,
+                Err(e) => {
+                    let stage = peer.last_stage();
+                    crate::diag::log(format!(
+                        "sync: mweb cross-check peer={addr} stage={stage} err={} ms={}",
+                        compact_peer_err(&e, stage),
+                        attempt_started.elapsed().as_millis() as u64,
+                    ));
+                    if is_clean_tip_lag(&e, stage) {
+                        lagging.push(addr);
+                    } else {
+                        hard_failed.push(addr);
+                    }
+                    continue;
+                }
             };
             match verify_leafset(
                 &leafset,
@@ -664,6 +850,9 @@ impl MwebRuntime {
             ) {
                 Ok(()) => confirmed += 1,
                 Err(_) => {
+                    hard_failed.push(addr);
+                    crate::discovery::evict_peers(&hard_failed);
+                    crate::discovery::demote_peers(&lagging);
                     self.cross_check_warning = Some(format!(
                         "WARNING: MWEB peer {addr} reports a different UTXO set than the peer \
                          used for this sync — your private balance may be incomplete. Run \
@@ -673,6 +862,8 @@ impl MwebRuntime {
                 }
             }
         }
+        crate::discovery::evict_peers(&hard_failed);
+        crate::discovery::demote_peers(&lagging);
         if confirmed >= 2 {
             self.last_cross_checked_tip = Some((tip_hash, confirmed));
         }
@@ -693,7 +884,7 @@ impl MwebRuntime {
 
     /// One differential sync attempt against a fixed set of peers.
     ///
-    /// Returns the typed [`bdk_mweb::Error`] rather than a string: the
+    /// Returns the typed [`bdk_mweb::Error`] inside [`SyncPassFailure`]: the
     /// [`BanReason`] behind a failure decides both what the user is told and
     /// whether we go looking for another peer. See [`classify_pass_failure`].
     #[allow(clippy::too_many_arguments)]
@@ -706,7 +897,7 @@ impl MwebRuntime {
         network: WalletNetwork,
         progress: Option<Arc<SyncProgress>>,
         hold_spent: &BTreeSet<[u8; 32]>,
-    ) -> Result<(), bdk_mweb::Error> {
+    ) -> Result<(), SyncPassFailure> {
         let pass_started = std::time::Instant::now();
         // Heal before this pass so a stuck split/send is included in the
         // full UTXO download rather than waiting for a later sync.
@@ -718,8 +909,6 @@ impl MwebRuntime {
         let prev_height = self.sync_state.tip_height;
         let prior_leafset_bytes = self.sync_state.leafset.len();
         let full_utxo_scan = self.sync_state.leafset.is_empty();
-        let pool_first = addrs.first().copied();
-        let mut pool = PeerPool::new(addrs);
         let syncer = MwebSyncer {
             progress,
             ..MwebSyncer::tip_only()
@@ -737,46 +926,142 @@ impl MwebRuntime {
         };
         headers.set_tip(tip_hash, tip_height);
         let mut notifier = ReadyNotifier { tip_height };
-        match pool.with_failover(bdk_net, |peer| {
-            self.store.sync_differential(
+
+        let total_peers = addrs.len();
+        let policy = peer_policy_for_pool(total_peers);
+        let unproductive_budget = unproductive_failover_budget();
+        let mut unproductive_elapsed = std::time::Duration::ZERO;
+        let mut tried = 0usize;
+        let mut tip_lag_count = 0usize;
+        let mut served = 0usize;
+        let mut undecodable = 0usize;
+        let mut hard_failed: Vec<std::net::SocketAddr> = Vec::new();
+        let mut lagging: Vec<std::net::SocketAddr> = Vec::new();
+        let mut last_err: Option<bdk_mweb::Error> = None;
+
+        for (idx, addr) in addrs.iter().copied().enumerate() {
+            if idx > 0 && unproductive_elapsed >= unproductive_budget {
+                crate::diag::log(format!(
+                    "sync: mweb pass unproductive budget exhausted after {}ms ({tried}/{total_peers} peers tried)",
+                    unproductive_elapsed.as_millis()
+                ));
+                break;
+            }
+            let attempt_started = std::time::Instant::now();
+            tried += 1;
+            let mut peer = match TcpMwebPeer::connect_with_policy(addr, bdk_net, policy) {
+                Ok(peer) => peer,
+                Err(e) => {
+                    let elapsed = attempt_started.elapsed();
+                    unproductive_elapsed += elapsed;
+                    let stage = connect_failure_stage(&e);
+                    crate::diag::log(format!(
+                        "sync: mweb peer={addr} stage={stage} err={} attempt={tried}/{total_peers} ms={}",
+                        compact_peer_err(&e, stage),
+                        elapsed.as_millis() as u64,
+                    ));
+                    if self.last_good_peer == Some(addr) {
+                        self.last_good_peer = None;
+                    }
+                    hard_failed.push(addr);
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            served += 1;
+            match self.store.sync_differential(
                 bdk_wallet::MwebSyncDrivers {
                     syncer: &syncer,
                     headers: &headers,
                     notifier: &mut notifier,
                     state: &mut self.sync_state,
                 },
-                peer,
+                &mut peer,
                 bdk_wallet::MwebScanContext {
                     keys: &self.keys,
                     book: &self.book,
                     secp: &self.secp,
                 },
-            )
-        }) {
-            Ok(result) => {
-                self.last_good_peer = pool.last_connected().or_else(|| pool_first);
-                self.last_synced_height = Some(tip_height);
-                self.stale = false;
-                self.last_status = format!(
-                    "MWEB synced at {tip_height} (+{} downloaded, {} found)",
-                    result.downloaded,
-                    result.found.len()
-                );
-                let completed_full_scan = full_utxo_scan && self.sync_state.utxo_cursor.is_none();
-                self.apply_post_sync(tip_height, hold_spent, completed_full_scan);
-                crate::diag::log(format!(
-                    "sync: mweb pass prev_height={prev_height:?} tip={tip_height} full_scan={full_utxo_scan} \
-                     invalidated_outgoing={invalidated_for_outgoing} prior_leafset_bytes={prior_leafset_bytes} \
-                     leafset_bytes={} downloaded={} found={} ms={}",
-                    self.sync_state.leafset.len(),
-                    result.downloaded,
-                    result.found.len(),
-                    pass_started.elapsed().as_millis() as u64,
-                ));
-                Ok(())
+            ) {
+                Ok(result) => {
+                    crate::discovery::evict_peers(&hard_failed);
+                    crate::discovery::demote_peers(&lagging);
+                    crate::discovery::note_good_peer(addr);
+                    self.last_good_peer = Some(addr);
+                    self.last_synced_height = Some(tip_height);
+                    self.stale = false;
+                    self.last_status = format!(
+                        "MWEB synced at {tip_height} (+{} downloaded, {} found)",
+                        result.downloaded,
+                        result.found.len()
+                    );
+                    let completed_full_scan =
+                        full_utxo_scan && self.sync_state.utxo_cursor.is_none();
+                    self.apply_post_sync(tip_height, hold_spent, completed_full_scan);
+                    crate::diag::log(format!(
+                        "sync: mweb pass peer={addr} prev_height={prev_height:?} tip={tip_height} full_scan={full_utxo_scan} \
+                         invalidated_outgoing={invalidated_for_outgoing} prior_leafset_bytes={prior_leafset_bytes} \
+                         leafset_bytes={} downloaded={} found={} ms={}",
+                        self.sync_state.leafset.len(),
+                        result.downloaded,
+                        result.found.len(),
+                        pass_started.elapsed().as_millis() as u64,
+                    ));
+                    return Ok(());
+                }
+                Err(e) => {
+                    let elapsed = attempt_started.elapsed();
+                    unproductive_elapsed += elapsed;
+                    let stage = peer.last_stage();
+                    crate::diag::log(format!(
+                        "sync: mweb peer={addr} stage={stage} err={} attempt={tried}/{total_peers} ms={}",
+                        compact_peer_err(&e, stage),
+                        elapsed.as_millis() as u64,
+                    ));
+                    if self.last_good_peer == Some(addr) {
+                        self.last_good_peer = None;
+                    }
+                    if is_clean_tip_lag(&e, stage) {
+                        tip_lag_count += 1;
+                        lagging.push(addr);
+                    } else if e.ban_reason() == Some(BanReason::Throttled) {
+                        lagging.push(addr);
+                    } else if e.ban_reason() == Some(BanReason::Undecodable) {
+                        undecodable += 1;
+                    } else {
+                        hard_failed.push(addr);
+                    }
+                    if !is_rotatable_peer_error(&e) {
+                        last_err = Some(e);
+                        break;
+                    }
+                    last_err = Some(e);
+                }
             }
-            Err(e) => Err(e),
         }
+
+        crate::discovery::evict_peers(&hard_failed);
+        crate::discovery::demote_peers(&lagging);
+        let err = if served > 0 && undecodable == served {
+            let last = last_err.map(|e| format!("{e}")).unwrap_or_default();
+            bdk_mweb::Error::undecodable(format!(
+                "block data from all {served} peer(s) failed to decode; this points at a local \
+                 decoder bug (bdk_mweb / rust-litecoin), not at the peers. Last error: {last}"
+            ))
+        } else {
+            last_err
+                .unwrap_or_else(|| bdk_mweb::Error::Crypto("MWEB sync failed on all peers".into()))
+        };
+        crate::diag::log(format!(
+            "sync: mweb pass failed tip={tip_height} tried={tried}/{total_peers} err={err} ms={}",
+            pass_started.elapsed().as_millis() as u64,
+        ));
+        Err(SyncPassFailure {
+            err,
+            tried,
+            all_tip_lag: tried > 0 && tip_lag_count == tried,
+            hard_failed,
+        })
     }
 
     pub fn disconnect_from(&mut self, height: u32) {
@@ -3686,11 +3971,12 @@ pub(crate) fn broadcast_mweb_tx(
     let first_pass = first_pass_peers(&configured, &reachable);
 
     let bdk_net = route.network.to_bitcoin_network();
+    let policy = PeerPolicy::fast_failover();
     let started = std::time::Instant::now();
     let mut run = run_p2p(
         &first_pass,
         || crate::discovery::discover_mweb_peers(route.network),
-        |addr| match TcpMwebPeer::connect(addr, bdk_net) {
+        |addr| match TcpMwebPeer::connect_with_policy(addr, bdk_net, policy) {
             Ok(mut peer) => peer
                 .broadcast_tx(tx)
                 .map_err(|e| crate::error::humanize_broadcast_error(&e.to_string())),
@@ -3700,6 +3986,12 @@ pub(crate) fn broadcast_mweb_tx(
     );
     run.failed
         .extend(remembered.iter().filter(|addr| !reachable.contains(addr)));
+    crate::discovery::evict_peers(&run.failed);
+    if let Some(confirmed) = run.confirmed {
+        crate::discovery::note_good_peer(confirmed);
+    } else if !run.sent.is_empty() {
+        crate::discovery::demote_peers(&run.sent);
+    }
     if let Err(e) = crate::broadcast_peers::record(
         &route.data_dir,
         &crate::broadcast_peers::Outcome {
@@ -4532,8 +4824,10 @@ pub fn peers_for_headers(
 ) -> Vec<std::net::SocketAddr> {
     let mut configured = probe_reachable(resolve_peers(peers).unwrap_or_default());
     if let Some(first) = preferred {
-        configured.retain(|addr| *addr != first);
-        configured.insert(0, first);
+        if configured.contains(&first) || crate::discovery::should_prefer_peer(&first) {
+            configured.retain(|addr| *addr != first);
+            configured.insert(0, first);
+        }
     }
     let discovered = crate::discovery::discover_mweb_peers(network);
     merge_header_peers(&configured, &discovered)
@@ -4550,11 +4844,12 @@ pub fn fetch_mmr_sizes_many(
         return out;
     }
     let bdk_net = network.to_bitcoin_network();
+    let policy = peer_policy_for_pool(addrs.len().max(2));
     for addr in addrs {
         if out.iter().all(|slot| slot.is_some()) {
             break;
         }
-        let Ok(mut peer) = TcpMwebPeer::connect(*addr, bdk_net) else {
+        let Ok(mut peer) = TcpMwebPeer::connect_with_policy(*addr, bdk_net, policy) else {
             continue;
         };
         for (i, hash) in hashes.iter().enumerate() {
@@ -4603,9 +4898,10 @@ impl MmrLookup {
             return Some(*hit);
         }
         let bdk_net = self.network.to_bitcoin_network();
+        let policy = peer_policy_for_pool(self.addrs.len().max(2));
         while self.peer_at < self.addrs.len() {
             if self.peer.is_none() {
-                match TcpMwebPeer::connect(self.addrs[self.peer_at], bdk_net) {
+                match TcpMwebPeer::connect_with_policy(self.addrs[self.peer_at], bdk_net, policy) {
                     Ok(peer) => self.peer = Some(peer),
                     Err(_) => {
                         self.peer_at += 1;
@@ -4661,8 +4957,9 @@ pub fn find_output_leaf(
         return ChainLeaf::Unread;
     };
     let bdk_net = network.to_bitcoin_network();
+    let policy = peer_policy_for_pool(addrs.len().max(2));
     for addr in addrs {
-        let Ok(mut peer) = TcpMwebPeer::connect(*addr, bdk_net) else {
+        let Ok(mut peer) = TcpMwebPeer::connect_with_policy(*addr, bdk_net, policy) else {
             continue;
         };
         let mut start = start_index;
@@ -5938,5 +6235,567 @@ mod broadcast_tests {
         );
         assert_eq!(route(None, true).rpc_first(), None);
         assert_eq!(route(Some("  "), true).rpc_first(), None);
+    }
+}
+
+#[cfg(test)]
+mod sync_failover_tests {
+    use super::*;
+    use bdk_mweb::p2p::{
+        header_hash, MwebHeaderMsg, MwebLeafset, MSG_MWEB_HEADER, MSG_MWEB_LEAFSET,
+    };
+    use bdk_wallet::bitcoin::block::{Header, MwebBlockHeader, Version as BlockVersion};
+    use bdk_wallet::bitcoin::consensus::encode::{deserialize_partial, serialize};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::merkle_tree::PartialMerkleTree;
+    use bdk_wallet::bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
+    use bdk_wallet::bitcoin::p2p::message_blockdata::Inventory;
+    use bdk_wallet::bitcoin::p2p::message_network::VersionMessage;
+    use bdk_wallet::bitcoin::p2p::{Address, ServiceFlags};
+    use bdk_wallet::bitcoin::{
+        absolute::LockTime, Amount, BlockHash, CompactTarget, MerkleBlock, ScriptBuf, Transaction,
+        TxMerkleNode, TxOut,
+    };
+    use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    const NODE_MWEB_LIGHT_CLIENT: u64 = 1 << 23;
+
+    #[derive(Clone, Copy)]
+    enum PeerScript {
+        /// Serves valid anchored `mwebheader` and empty `mwebleafset` for `tip_hash`,
+        /// and `notfound` for any other block hash.
+        Good,
+        /// Immediately replies `notfound` to `getdata`.
+        NotFound,
+        /// Drops `getdata` and only replies `pong` to `ping` (clean tip-lag / empty pong).
+        EmptyPong,
+        /// Completes handshake, then stalls silently past `stage_timeout`.
+        SilentStall,
+    }
+
+    fn anchored_empty_block(height: u32, nonce: u32) -> (BlockHash, Vec<u8>, Vec<u8>) {
+        let leafset_bytes = Vec::new();
+        let mweb_header = MwebBlockHeader {
+            height,
+            output_root: [0u8; 32],
+            kernel_root: [0u8; 32],
+            leafset_root: bdk_mweb::hash::blake3_hash(&leafset_bytes),
+            kernel_offset: [0u8; 32],
+            stealth_offset: [0u8; 32],
+            output_mmr_size: 0,
+            kernel_mmr_size: 0,
+        };
+        let mut spk = vec![0x58u8, 0x20];
+        spk.extend_from_slice(&header_hash(&mweb_header));
+        let filler = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            mw_tx: None,
+            is_hog_ex: false,
+        };
+        let hogex = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            mw_tx: None,
+            is_hog_ex: true,
+        };
+        let txids = vec![filler.compute_txid(), hogex.compute_txid()];
+        let txn = PartialMerkleTree::from_txids(&txids, &[false, true]);
+        let merkle_root = bdk_wallet::bitcoin::merkle_tree::calculate_root(txids.into_iter())
+            .map(|h| TxMerkleNode::from_byte_array(h.to_byte_array()))
+            .expect("merkle root");
+        let header = Header {
+            version: BlockVersion::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0x22; 32]),
+            merkle_root,
+            time: 1,
+            bits: CompactTarget::from_consensus(1),
+            nonce,
+        };
+        let block_hash = header.block_hash();
+        let hdr_msg = MwebHeaderMsg {
+            merkle: MerkleBlock { header, txn },
+            hogex,
+            mweb_header,
+        };
+        let leafset_msg = MwebLeafset {
+            block_hash,
+            leafset: leafset_bytes,
+        };
+        (block_hash, serialize(&hdr_msg), serialize(&leafset_msg))
+    }
+
+    fn read_msg(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<RawNetworkMessage> {
+        let mut scratch = [0u8; 4096];
+        loop {
+            if !buf.is_empty() {
+                if let Ok((msg, consumed)) = deserialize_partial::<RawNetworkMessage>(buf) {
+                    buf.drain(..consumed);
+                    return Some(msg);
+                }
+            }
+            match stream.read(&mut scratch) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            }
+        }
+    }
+
+    fn send_msg(stream: &mut TcpStream, payload: NetworkMessage) -> bool {
+        let magic = WalletNetwork::Testnet.to_bitcoin_network().magic();
+        let raw = RawNetworkMessage::new(magic, payload);
+        let bytes = serialize(&raw);
+        stream.write_all(&bytes).is_ok() && stream.flush().is_ok()
+    }
+
+    fn send_raw_cmd(stream: &mut TcpStream, command: &str, payload: &[u8]) -> bool {
+        use bdk_wallet::bitcoin::consensus::Encodable;
+        use bdk_wallet::bitcoin::hashes::sha256d;
+        let magic = WalletNetwork::Testnet.to_bitcoin_network().magic();
+        let cmd = CommandString::try_from(command).expect("valid command");
+        let mut msg = Vec::with_capacity(24 + payload.len());
+        magic.consensus_encode(&mut msg).unwrap();
+        cmd.consensus_encode(&mut msg).unwrap();
+        (payload.len() as u32).consensus_encode(&mut msg).unwrap();
+        let checksum = sha256d::Hash::hash(payload);
+        msg.extend_from_slice(&checksum[..4]);
+        msg.extend_from_slice(payload);
+        stream.write_all(&msg).is_ok() && stream.flush().is_ok()
+    }
+
+    fn spawn_scripted_peer(
+        scripts: Vec<PeerScript>,
+        tip_hash: BlockHash,
+        hdr_payload: Vec<u8>,
+        leafset_payload: Vec<u8>,
+    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock peer");
+        let addr = listener.local_addr().expect("local_addr");
+        let connects = Arc::new(AtomicUsize::new(0));
+        let tip_header_reqs = Arc::new(AtomicUsize::new(0));
+        let connects_cl = Arc::clone(&connects);
+        let tip_reqs_cl = Arc::clone(&tip_header_reqs);
+
+        std::thread::spawn(move || {
+            for (idx, mut stream) in listener.incoming().flatten().enumerate() {
+                connects_cl.fetch_add(1, Ordering::SeqCst);
+                let script = scripts
+                    .get(idx)
+                    .copied()
+                    .or_else(|| scripts.last().copied())
+                    .unwrap_or(PeerScript::Good);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                let mut buf = Vec::new();
+
+                // Expect Version, send Version + Verack.
+                let Some(first) = read_msg(&mut stream, &mut buf) else {
+                    continue;
+                };
+                if !matches!(first.payload(), NetworkMessage::Version(_)) {
+                    continue;
+                }
+                let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let ver = VersionMessage::new(
+                    ServiceFlags::from(NODE_MWEB_LIGHT_CLIENT),
+                    0,
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    1,
+                    "/mock-mweb:0.1/".into(),
+                    100,
+                );
+                if !send_msg(&mut stream, NetworkMessage::Version(ver))
+                    || !send_msg(&mut stream, NetworkMessage::Verack)
+                {
+                    continue;
+                }
+
+                // Serve messages according to `script`.
+                while let Some(msg) = read_msg(&mut stream, &mut buf) {
+                    match msg.into_payload() {
+                        NetworkMessage::GetData(invs) => match script {
+                            PeerScript::SilentStall => {
+                                std::thread::sleep(Duration::from_millis(350));
+                                break;
+                            }
+                            PeerScript::NotFound => {
+                                let _ = send_msg(&mut stream, NetworkMessage::NotFound(invs));
+                            }
+                            PeerScript::EmptyPong => {}
+                            PeerScript::Good => {
+                                for inv in invs {
+                                    if let Inventory::Unknown { inv_type, hash } = inv {
+                                        let requested = BlockHash::from_byte_array(hash);
+                                        if inv_type == MSG_MWEB_HEADER && requested == tip_hash {
+                                            tip_reqs_cl.fetch_add(1, Ordering::SeqCst);
+                                            let _ = send_raw_cmd(
+                                                &mut stream,
+                                                "mwebheader",
+                                                &hdr_payload,
+                                            );
+                                        } else if inv_type == MSG_MWEB_LEAFSET
+                                            && requested == tip_hash
+                                        {
+                                            let _ = send_raw_cmd(
+                                                &mut stream,
+                                                "mwebleafset",
+                                                &leafset_payload,
+                                            );
+                                        } else {
+                                            let _ = send_msg(
+                                                &mut stream,
+                                                NetworkMessage::NotFound(vec![inv]),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        NetworkMessage::Ping(nonce) => {
+                            if matches!(script, PeerScript::SilentStall) {
+                                std::thread::sleep(Duration::from_millis(350));
+                                break;
+                            }
+                            if !send_msg(&mut stream, NetworkMessage::Pong(nonce)) {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        (addr, connects, tip_header_reqs)
+    }
+
+    fn test_runtime(dir: &Path) -> MwebRuntime {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let secret = crate::seed::MasterSecret::parse(mnemonic, None).unwrap();
+        MwebRuntime::open(
+            dir,
+            &secret,
+            WalletNetwork::Testnet,
+            MasterKeyScheme::LitecoinCore,
+            0,
+            None,
+        )
+        .expect("open test MwebRuntime")
+    }
+
+    fn fast_test_policy() -> PeerPolicy {
+        PeerPolicy {
+            connect_timeout: Duration::from_millis(200),
+            handshake_timeout: Duration::from_millis(200),
+            stage_timeout: Duration::from_millis(120),
+            pipeline_round_timeout: Duration::from_millis(200),
+            write_timeout: Duration::from_millis(200),
+            max_reconnects: 0,
+            max_throttled_rounds: 1,
+            ping_flush_header: true,
+        }
+    }
+
+    #[test]
+    fn silent_peer_times_out_evicts_and_rotates_to_healthy_peer_with_stage_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rt = test_runtime(tmp.path());
+        let (tip_hash, hdr_bytes, leaf_bytes) = anchored_empty_block(100, 1);
+
+        let (bad_peer, bad_connects, _) = spawn_scripted_peer(
+            vec![PeerScript::SilentStall],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (good_peer, _, _) = spawn_scripted_peer(
+            vec![PeerScript::Good],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (backup_peer, _, _) =
+            spawn_scripted_peer(vec![PeerScript::Good], tip_hash, hdr_bytes, leaf_bytes);
+
+        crate::discovery::set_peers_for_test(Some(vec![bad_peer, good_peer, backup_peer]));
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        let started = Instant::now();
+        rt.sync_at_tip(
+            100,
+            tip_hash,
+            None,
+            &[],
+            WalletNetwork::Testnet,
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("sync_at_tip");
+        let elapsed = started.elapsed();
+
+        TEST_PEER_POLICY.with(|c| c.set(None));
+        let remaining = crate::discovery::peers_for_test().unwrap_or_default();
+        crate::discovery::set_peers_for_test(None);
+
+        assert!(
+            !rt.stale,
+            "sync should succeed on good_peer: {}",
+            rt.last_status
+        );
+        assert_eq!(rt.last_good_peer, Some(good_peer));
+        assert_eq!(
+            bad_connects.load(Ordering::SeqCst),
+            1,
+            "silent peer must not be reconnected 4x in multi-peer failover"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "failover took too long: {elapsed:?}"
+        );
+        assert_eq!(
+            remaining,
+            vec![good_peer, backup_peer],
+            "hard-failing silent peer must be evicted from discovery cache"
+        );
+
+        let (_, logs) = crate::diag::since(cursor);
+        assert!(
+            logs.iter().any(|l| {
+                l.contains(&format!("sync: mweb peer={bad_peer} stage=get_header"))
+                    && l.contains("err=timeout")
+                    && l.contains("attempt=1/3")
+            }),
+            "expected per-peer stage timeout log, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn notfound_tip_lag_short_circuits_demotes_without_evicting_and_rotates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rt = test_runtime(tmp.path());
+        let (tip_hash, hdr_bytes, leaf_bytes) = anchored_empty_block(101, 2);
+
+        let (lag_peer, _, _) = spawn_scripted_peer(
+            vec![PeerScript::NotFound],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (good_peer, _, _) = spawn_scripted_peer(
+            vec![PeerScript::Good],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (backup_peer, _, _) =
+            spawn_scripted_peer(vec![PeerScript::Good], tip_hash, hdr_bytes, leaf_bytes);
+
+        crate::discovery::set_peers_for_test(Some(vec![lag_peer, good_peer, backup_peer]));
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        rt.sync_at_tip(
+            101,
+            tip_hash,
+            None,
+            &[],
+            WalletNetwork::Testnet,
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("sync_at_tip");
+
+        TEST_PEER_POLICY.with(|c| c.set(None));
+        let pool_after = crate::discovery::peers_for_test().unwrap_or_default();
+        crate::discovery::set_peers_for_test(None);
+
+        assert!(
+            !rt.stale,
+            "sync should succeed on good_peer: {}",
+            rt.last_status
+        );
+        assert_eq!(rt.last_good_peer, Some(good_peer));
+        assert_eq!(
+            pool_after,
+            vec![good_peer, backup_peer, lag_peer],
+            "clean tip-lag peer (notfound) must be demoted to back, not evicted"
+        );
+
+        let (_, logs) = crate::diag::since(cursor);
+        assert!(
+            logs.iter().any(|l| {
+                l.contains(&format!("sync: mweb peer={lag_peer} stage=get_header"))
+                    && l.contains("err=notfound")
+                    && l.contains("attempt=1/3")
+            }),
+            "expected notfound stage log, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn all_peers_tip_lag_backs_off_and_retries_without_evicting_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rt = test_runtime(tmp.path());
+        let (tip_hash, hdr_bytes, leaf_bytes) = anchored_empty_block(102, 3);
+
+        // Both peers lag on pass 1 (empty pong) and serve the block on pass 2.
+        let (peer_a, a_connects, _) = spawn_scripted_peer(
+            vec![PeerScript::EmptyPong, PeerScript::Good, PeerScript::Good],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (peer_b, _, _) = spawn_scripted_peer(
+            vec![PeerScript::EmptyPong, PeerScript::Good, PeerScript::Good],
+            tip_hash,
+            hdr_bytes,
+            leaf_bytes,
+        );
+
+        crate::discovery::set_peers_for_test(Some(vec![peer_a, peer_b]));
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        TEST_TIP_LAG_BACKOFF.with(|c| c.set(Some(Duration::from_millis(20))));
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        rt.sync_at_tip(
+            102,
+            tip_hash,
+            None,
+            &[],
+            WalletNetwork::Testnet,
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("sync_at_tip");
+
+        TEST_PEER_POLICY.with(|c| c.set(None));
+        TEST_TIP_LAG_BACKOFF.with(|c| c.set(None));
+        let pool_after = crate::discovery::peers_for_test().unwrap_or_default();
+        crate::discovery::set_peers_for_test(None);
+
+        assert!(
+            !rt.stale,
+            "retry after tip-lag backoff should succeed: {}",
+            rt.last_status
+        );
+        assert!(a_connects.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            pool_after.len(),
+            2,
+            "all-peer clean tip-lag must not evict healthy peers from the pool"
+        );
+
+        let (_, logs) = crate::diag::since(cursor);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("sync: mweb all 2 peer(s) lagging tip=102; waiting")),
+            "expected tip-lag backoff log, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn tip_header_is_fetched_only_once_per_peer_across_fine_headers_and_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rt = test_runtime(tmp.path());
+        // Seed `tip_height = Some(103)` and `prev_tip_hash = Some(prev_hash)` so
+        // `FixedHeaderProvider` includes height 103 (missing on peer -> `notfound`)
+        // and height 105 (`tip_hash`), exercising `sample_fine_headers` (`FineWindow`)
+        // before `run_once` verifies `tip_hash`.
+        let prev_hash = BlockHash::from_byte_array([0x33; 32]);
+        rt.sync_state.tip_height = Some(103);
+        rt.sync_state.tip_hash = Some(prev_hash);
+        let (tip_hash, hdr_bytes, leaf_bytes) = anchored_empty_block(105, 4);
+
+        let (peer_a, _, a_tip_hdr_reqs) = spawn_scripted_peer(
+            vec![PeerScript::Good],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (peer_b, _, _) =
+            spawn_scripted_peer(vec![PeerScript::Good], tip_hash, hdr_bytes, leaf_bytes);
+
+        crate::discovery::set_peers_for_test(Some(vec![peer_a, peer_b]));
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+
+        rt.sync_at_tip(
+            105,
+            tip_hash,
+            Some(prev_hash),
+            &[],
+            WalletNetwork::Testnet,
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("sync_at_tip");
+
+        // Also verify direct `TcpMwebPeer::get_header` memoization on repeated calls.
+        let mut direct_peer = TcpMwebPeer::connect_with_policy(
+            peer_a,
+            WalletNetwork::Testnet.to_bitcoin_network(),
+            fast_test_policy(),
+        )
+        .expect("connect direct_peer");
+        let _ = MwebUtxoSource::get_header(&mut direct_peer, tip_hash).expect("first get_header");
+        let _ = MwebUtxoSource::get_header(&mut direct_peer, tip_hash).expect("second get_header");
+        assert_eq!(direct_peer.header_fetches(), 1);
+
+        TEST_PEER_POLICY.with(|c| c.set(None));
+        crate::discovery::set_peers_for_test(None);
+
+        assert!(
+            !rt.stale,
+            "missing intermediate historical header must not fail sync: {}",
+            rt.last_status
+        );
+        assert_eq!(
+            a_tip_hdr_reqs.load(Ordering::SeqCst),
+            2,
+            "1 wire request during sync_pass + 1 wire request across 2 memoized direct calls"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_broadcast_demotes_sent_peers_so_next_sync_rotates_away() {
+        let p1 = SocketAddr::from(([10, 0, 0, 1], 9333));
+        let p2 = SocketAddr::from(([10, 0, 0, 2], 9333));
+        let p3 = SocketAddr::from(([10, 0, 0, 3], 9333));
+        crate::discovery::set_peers_for_test(Some(vec![p1, p2, p3]));
+
+        // Before demotion, `last_good_peer = Some(p1)` is preferred at index 0.
+        assert_eq!(
+            peers_for_headers(&[], WalletNetwork::Testnet, Some(p1)),
+            vec![p1, p2, p3]
+        );
+
+        // Unconfirmed broadcast (`BroadcastAck::Sent`, `confirmed: None`) on `p1`
+        // demotes `p1` to the back of the discovery pool.
+        crate::discovery::demote_peers(&[p1]);
+        assert!(!crate::discovery::should_prefer_peer(&p1));
+        assert_eq!(
+            peers_for_headers(&[], WalletNetwork::Testnet, Some(p1)),
+            vec![p2, p3, p1],
+            "demoted peer must not be re-promoted to index 0 by peers_for_headers"
+        );
+
+        crate::discovery::set_peers_for_test(None);
     }
 }

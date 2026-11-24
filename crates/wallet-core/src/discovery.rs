@@ -28,15 +28,38 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// longer for slower peers before returning the pool to the syncer.
 const EARLY_RETURN_GRACE: Duration = Duration::from_millis(600);
 const MIN_EARLY_PEERS: usize = 2;
-/// Sync runs every 60s; re-crawling that often would be rude to the seeders.
-const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Sync runs every 60s; re-crawling that often would be rude to the seeders,
+/// while keeping a pool for 15+ minutes lets lagging or dead peers linger.
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PROBES_PER_SEED: usize = 10;
 const WANT_PEERS: usize = 8;
 
 struct Cached {
     network: WalletNetwork,
     at: Instant,
+    /// Wall-clock timestamp (ms since UNIX_EPOCH) so laptop sleep on macOS
+    /// (where `Instant` / `mach_absolute_time` pauses during suspend) still
+    /// expires the peer cache.
+    at_unix_ms: u64,
     addrs: Vec<SocketAddr>,
+    demoted: Vec<SocketAddr>,
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Cached {
+    fn is_fresh(&self, network: WalletNetwork, now_unix_ms: u64) -> bool {
+        let ttl_ms = CACHE_TTL.as_millis() as u64;
+        self.network == network
+            && !self.addrs.is_empty()
+            && self.at.elapsed() < CACHE_TTL
+            && now_unix_ms.saturating_sub(self.at_unix_ms) < ttl_ms
+    }
 }
 
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
@@ -47,6 +70,8 @@ static CRAWL_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static OFFLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_PEERS: std::cell::RefCell<Option<Vec<SocketAddr>>> = const { std::cell::RefCell::new(None) };
+    static TEST_DEMOTED: std::cell::RefCell<Vec<SocketAddr>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Make discovery on this thread find no peers, so a test can run a sync pass
@@ -56,6 +81,19 @@ pub(crate) fn go_offline_for_test() {
     OFFLINE.with(|offline| offline.set(true));
 }
 
+/// Seed discovery on this thread with a fixed peer list for deterministic tests.
+#[cfg(test)]
+pub(crate) fn set_peers_for_test(addrs: Option<Vec<SocketAddr>>) {
+    TEST_PEERS.with(|slot| *slot.borrow_mut() = addrs);
+    TEST_DEMOTED.with(|slot| slot.borrow_mut().clear());
+}
+
+/// Current thread-local test peer pool, if seeded.
+#[cfg(test)]
+pub(crate) fn peers_for_test() -> Option<Vec<SocketAddr>> {
+    TEST_PEERS.with(|slot| slot.borrow().clone())
+}
+
 /// Peers that completed a handshake advertising MWEB light-client support.
 ///
 /// Cached for [`CACHE_TTL`]. Returns an empty vec when the seeds are
@@ -63,8 +101,13 @@ pub(crate) fn go_offline_for_test() {
 /// rather than an error.
 pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
     #[cfg(test)]
-    if OFFLINE.with(std::cell::Cell::get) {
-        return Vec::new();
+    {
+        if let Some(addrs) = TEST_PEERS.with(|slot| slot.borrow().clone()) {
+            return addrs;
+        }
+        if OFFLINE.with(std::cell::Cell::get) {
+            return Vec::new();
+        }
     }
     if let Some(addrs) = cached_peers(network) {
         return addrs;
@@ -73,12 +116,20 @@ pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
     if let Some(addrs) = cached_peers(network) {
         return addrs;
     }
+    let crawl_started = Instant::now();
     let addrs = crawl(network);
+    let crawl_ms = crawl_started.elapsed().as_millis() as u64;
+    crate::diag::log(format!(
+        "discovery: crawled {} mweb peers in {crawl_ms} ms",
+        addrs.len()
+    ));
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some(Cached {
             network,
             at: Instant::now(),
+            at_unix_ms: unix_now_ms(),
             addrs: addrs.clone(),
+            demoted: Vec::new(),
         });
     }
     addrs
@@ -87,18 +138,150 @@ pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
 fn cached_peers(network: WalletNetwork) -> Option<Vec<SocketAddr>> {
     let guard = CACHE.lock().ok()?;
     let cached = guard.as_ref()?;
-    if cached.network == network && cached.at.elapsed() < CACHE_TTL && !cached.addrs.is_empty() {
+    if cached.is_fresh(network, unix_now_ms()) {
         Some(cached.addrs.clone())
     } else {
         None
     }
 }
 
-/// Forget cached peers so the next call re-crawls (used after a settings change).
+/// Forget cached peers so the next call re-crawls (used after a settings change
+/// or when every cached peer in a sync pass failed).
 pub fn clear_cache() {
+    #[cfg(test)]
+    {
+        TEST_PEERS.with(|slot| {
+            if let Some(addrs) = slot.borrow_mut().as_mut() {
+                addrs.clear();
+            }
+        });
+        TEST_DEMOTED.with(|slot| slot.borrow_mut().clear());
+    }
     if let Ok(mut guard) = CACHE.lock() {
         *guard = None;
     }
+}
+
+/// Remove failed/unresponsive peers from the discovery cache.
+///
+/// When eviction leaves fewer than [`MIN_EARLY_PEERS`] addresses, the cache is
+/// cleared outright so the next [`discover_mweb_peers`] call re-crawls rather
+/// than limping along on a single survivor.
+pub fn evict_peers(bad: &[SocketAddr]) {
+    if bad.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    let handled_by_test = TEST_PEERS.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if let Some(addrs) = borrow.as_mut() {
+            if !evict_from_pool(addrs, bad) {
+                addrs.clear();
+            }
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(test)]
+    if handled_by_test {
+        TEST_DEMOTED.with(|slot| slot.borrow_mut().retain(|a| !bad.contains(a)));
+        return;
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some(cached) = guard.as_mut() {
+            cached.demoted.retain(|a| !bad.contains(a));
+            if !evict_from_pool(&mut cached.addrs, bad) {
+                *guard = None;
+            }
+        }
+    }
+}
+
+/// Move slow or unconfirmed peers to the back of the discovery cache so healthy
+/// peers are tried first on the next sync pass.
+pub fn demote_peers(slow: &[SocketAddr]) {
+    if slow.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    let handled_by_test = TEST_PEERS.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if let Some(addrs) = borrow.as_mut() {
+            demote_in_pool(addrs, slow);
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(test)]
+    if handled_by_test {
+        TEST_DEMOTED.with(|slot| {
+            let mut demoted = slot.borrow_mut();
+            for &addr in slow {
+                if !demoted.contains(&addr) {
+                    demoted.push(addr);
+                }
+            }
+        });
+        return;
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some(cached) = guard.as_mut() {
+            demote_in_pool(&mut cached.addrs, slow);
+            for &addr in slow {
+                if cached.addrs.contains(&addr) && !cached.demoted.contains(&addr) {
+                    cached.demoted.push(addr);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `addr` is still in the active discovery pool and has not been
+/// demoted since it last served a sync pass.
+pub fn should_prefer_peer(addr: &SocketAddr) -> bool {
+    #[cfg(test)]
+    if let Some(addrs) = TEST_PEERS.with(|slot| slot.borrow().clone()) {
+        let demoted = TEST_DEMOTED.with(|slot| slot.borrow().contains(addr));
+        return addrs.contains(addr) && !demoted;
+    }
+    let Ok(guard) = CACHE.lock() else {
+        return false;
+    };
+    let Some(cached) = guard.as_ref() else {
+        return false;
+    };
+    cached.addrs.contains(addr) && !cached.demoted.contains(addr)
+}
+
+/// Clear any prior demotion once `addr` completes a verified sync pass.
+pub fn note_good_peer(addr: SocketAddr) {
+    #[cfg(test)]
+    TEST_DEMOTED.with(|slot| slot.borrow_mut().retain(|a| *a != addr));
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some(cached) = guard.as_mut() {
+            cached.demoted.retain(|a| *a != addr);
+        }
+    }
+}
+
+fn evict_from_pool(pool: &mut Vec<SocketAddr>, bad: &[SocketAddr]) -> bool {
+    pool.retain(|addr| !bad.contains(addr));
+    pool.len() >= MIN_EARLY_PEERS
+}
+
+fn demote_in_pool(pool: &mut Vec<SocketAddr>, slow: &[SocketAddr]) {
+    let mut tail = Vec::new();
+    pool.retain(|addr| {
+        if slow.contains(addr) {
+            tail.push(*addr);
+            false
+        } else {
+            true
+        }
+    });
+    pool.extend(tail);
 }
 
 /// Pre-warm the MWEB peer cache on a background thread when it is cold.
@@ -307,5 +490,75 @@ mod tests {
             assert!(!network.dns_seeds().is_empty());
             assert_ne!(network.p2p_port(), 0);
         }
+    }
+
+    #[test]
+    fn cache_ttl_is_five_minutes() {
+        assert_eq!(CACHE_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn evict_removes_bad_peers_and_clears_when_below_threshold() {
+        let a = SocketAddr::from(([10, 0, 0, 1], 9333));
+        let b = SocketAddr::from(([10, 0, 0, 2], 9333));
+        let c = SocketAddr::from(([10, 0, 0, 3], 9333));
+        set_peers_for_test(Some(vec![a, b, c]));
+
+        evict_peers(&[b]);
+        assert_eq!(discover_mweb_peers(WalletNetwork::Mainnet), vec![a, c]);
+
+        // Dropping below MIN_EARLY_PEERS (2) flushes the pool so the next call
+        // does not stay pinned to a single survivor.
+        evict_peers(&[a]);
+        assert!(discover_mweb_peers(WalletNetwork::Mainnet).is_empty());
+        set_peers_for_test(None);
+    }
+
+    #[test]
+    fn demote_moves_slow_peers_to_the_back_preserving_order() {
+        let a = SocketAddr::from(([10, 0, 0, 1], 9333));
+        let b = SocketAddr::from(([10, 0, 0, 2], 9333));
+        let c = SocketAddr::from(([10, 0, 0, 3], 9333));
+        let d = SocketAddr::from(([10, 0, 0, 4], 9333));
+        set_peers_for_test(Some(vec![a, b, c, d]));
+
+        demote_peers(&[a, c]);
+        assert_eq!(
+            discover_mweb_peers(WalletNetwork::Mainnet),
+            vec![b, d, a, c]
+        );
+        assert!(!should_prefer_peer(&a));
+        assert!(should_prefer_peer(&b));
+        note_good_peer(a);
+        assert!(should_prefer_peer(&a));
+        set_peers_for_test(None);
+    }
+
+    /// On macOS, `Instant` (`mach_absolute_time`) pauses while the machine is
+    /// asleep, which previously kept a 15-minute `CACHE_TTL` alive across 2+
+    /// hours of wall-clock lid-closed gaps. `Cached::is_fresh` checks both
+    /// `Instant` and `SystemTime` so wall-clock sleep expires the cache.
+    #[test]
+    fn wall_clock_sleep_expires_cache_even_when_monotonic_clock_paused() {
+        let now_ms = unix_now_ms();
+        let fresh = Cached {
+            network: WalletNetwork::Mainnet,
+            addrs: vec![SocketAddr::from(([10, 0, 0, 1], 9333))],
+            demoted: Vec::new(),
+            at: Instant::now(),
+            at_unix_ms: now_ms,
+        };
+        assert!(fresh.is_fresh(WalletNetwork::Mainnet, now_ms));
+
+        let slept = Cached {
+            at: Instant::now(),
+            at_unix_ms: now_ms
+                .saturating_sub((CACHE_TTL + Duration::from_secs(1)).as_millis() as u64),
+            ..fresh
+        };
+        assert!(
+            !slept.is_fresh(WalletNetwork::Mainnet, now_ms),
+            "wall-clock elapsed past CACHE_TTL must expire cache even when Instant did not advance"
+        );
     }
 }

@@ -285,6 +285,9 @@ pub(crate) const MERKLE_BATCH_SIZE: usize = 100;
 #[derive(Default)]
 pub struct ElectrumProgress {
     pub scripts_scanned: AtomicU32,
+    /// Scripts whose history was non-empty. Gap-limit scanning has no total,
+    /// so the UI shows this beside `scripts_scanned` instead of a percentage.
+    pub scripts_active: AtomicU32,
     pub txs_fetched: AtomicU32,
     pub txs_total: AtomicU32,
     pub anchors_verified: AtomicU32,
@@ -294,6 +297,7 @@ pub struct ElectrumProgress {
 impl ElectrumProgress {
     pub fn reset(&self) {
         self.scripts_scanned.store(0, Ordering::Relaxed);
+        self.scripts_active.store(0, Ordering::Relaxed);
         self.txs_fetched.store(0, Ordering::Relaxed);
         self.txs_total.store(0, Ordering::Relaxed);
         self.anchors_verified.store(0, Ordering::Relaxed);
@@ -1350,6 +1354,9 @@ fn scan_spks<E: ElectrumApi>(
             if !history.is_empty() {
                 last_active = Some(index);
                 unused = 0;
+                if let Some(p) = progress {
+                    p.scripts_active.fetch_add(1, Ordering::Relaxed);
+                }
             } else if beyond_revealed {
                 unused = unused.saturating_add(1);
                 if unused >= stop_gap {

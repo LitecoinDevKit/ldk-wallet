@@ -12,6 +12,8 @@
  * waiting for cover so the live card can be checked without a node. `cover=solo`
  * marks a quiet block. `cover=sending` shows one private and one public coin held by a
  * broadcast in flight. `rpc=1` pretends a Litecoin RPC URL is saved.
+ * `sync=addresses|transactions|proofs|mweb|connecting` keeps the header strip on that
+ * step. `mweb=peer` shows the MWEB failure card.
  */
 
 type Scene = "balance" | "coins" | "self-spend" | "recovery";
@@ -94,7 +96,10 @@ function combined() {
     mweb_receive_address: PRIVATE_ADDRESS,
     mweb_synced_height: TIP,
     mweb_stale: false,
-    mweb_status: "synced",
+    mweb_status:
+      new URLSearchParams(window.location.search).get("mweb") === "peer"
+        ? "MWEB peer unreachable: connection timed out"
+        : "synced",
   };
 }
 
@@ -570,25 +575,64 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
   fetch_network_pulse: () => pulse(),
   diag_log_since: (args) => diagLogSince(args),
   fetch_insight_charts: () => charts(),
-  sync_wallet: () => ({
-    summary: combined().transparent,
-    new_txs: 0,
-    electrum_ms: 180,
-    mweb_ms: 240,
-    electrum_server: "electrum.example.com:50002",
-    warnings: [],
-  }),
-  mweb_sync_progress: () => ({
-    phase: "idle",
-    active: false,
-    fetched: 0,
-    total: 0,
-    scripts_scanned: 0,
-    txs_fetched: 0,
-    txs_total: 0,
-    anchors_verified: 0,
-    anchors_total: 0,
-  }),
+  sync_wallet: async () => {
+    const preview = new URLSearchParams(window.location.search).get("sync");
+    if (preview) await new Promise((resolve) => setTimeout(resolve, 60_000));
+    return {
+      summary: combined().transparent,
+      new_txs: 0,
+      electrum_ms: 180,
+      mweb_ms: 240,
+      electrum_server: "electrum.example.com:50002",
+      warnings: [],
+    };
+  },
+  mweb_sync_progress: () => {
+    const preview = new URLSearchParams(window.location.search).get("sync");
+    const base = {
+      phase: "idle",
+      active: false,
+      fetched: 0,
+      total: 0,
+      scripts_scanned: 0,
+      scripts_active: 0,
+      transparent_ready: false,
+      txs_fetched: 0,
+      txs_total: 0,
+      anchors_verified: 0,
+      anchors_total: 0,
+    };
+    if (preview === "addresses") {
+      return { ...base, phase: "electrum-full-scan", scripts_scanned: 140, scripts_active: 14 };
+    }
+    if (preview === "transactions") {
+      return { ...base, phase: "electrum-sync", txs_fetched: 40, txs_total: 193 };
+    }
+    if (preview === "proofs") {
+      return {
+        ...base,
+        phase: "electrum-full-scan",
+        txs_fetched: 193,
+        txs_total: 193,
+        anchors_verified: 40,
+        anchors_total: 193,
+      };
+    }
+    if (preview === "mweb") {
+      return {
+        ...base,
+        phase: "mweb-download",
+        active: true,
+        fetched: 12_288,
+        total: 63_062,
+        transparent_ready: true,
+      };
+    }
+    if (preview === "connecting") {
+      return { ...base, phase: "mweb-download", active: true, transparent_ready: true };
+    }
+    return base;
+  },
   get_diagnostics: () => ({
     app_version: "0.4.11",
     os: "macos",

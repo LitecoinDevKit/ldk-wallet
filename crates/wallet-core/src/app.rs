@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_mweb::mweb_sync::SyncProgress;
 
-use bdk_wallet::bitcoin::{Amount, OutPoint, Psbt, Script, ScriptBuf, Transaction, Txid};
+use bdk_wallet::bitcoin::{
+    Amount, BlockHash, OutPoint, Psbt, Script, ScriptBuf, Transaction, Txid,
+};
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::rusqlite::Connection;
@@ -435,6 +437,7 @@ struct FreshPrefetch {
 struct SyncPass<'a> {
     phase: &'a AtomicU8,
     electrum_progress: &'a spv::ElectrumProgress,
+    transparent_ready: &'a AtomicBool,
     finished: bool,
 }
 
@@ -456,6 +459,7 @@ impl SyncPass<'_> {
     /// Done stays visible until the next pass starts.
     fn finish(mut self) {
         self.electrum_progress.reset();
+        self.transparent_ready.store(false, Ordering::Release);
         self.set(SyncPhase::Done, "pass finished");
         self.finished = true;
     }
@@ -464,6 +468,7 @@ impl SyncPass<'_> {
     /// instead of logging an aborted pass on drop.
     fn finish_prefetch(mut self) {
         self.electrum_progress.reset();
+        self.transparent_ready.store(false, Ordering::Release);
         self.set(SyncPhase::Idle, "prefetch finished");
         self.finished = true;
     }
@@ -480,9 +485,83 @@ impl Drop for SyncPass<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.electrum_progress.reset();
+            self.transparent_ready.store(false, Ordering::Release);
             self.set(SyncPhase::Idle, "pass exited before finish");
         }
     }
+}
+
+/// Private balance shown while the MWEB runtime is off the wallet mutex.
+///
+/// Taken from the last combined summary before the download starts, so a
+/// refresh during the download does not flash "MWEB unavailable".
+#[derive(Clone)]
+struct DetachedMwebView {
+    confirmed_sats: u64,
+    unconfirmed_sats: u64,
+    immature_sats: u64,
+    maturity_blocks: u32,
+    total_sats: u64,
+    receive_address: Option<String>,
+    synced_height: Option<u32>,
+    stale: bool,
+    status: String,
+}
+
+impl DetachedMwebView {
+    fn from_combined(summary: &CombinedSummary) -> Self {
+        Self {
+            confirmed_sats: summary.mweb_confirmed_sats,
+            unconfirmed_sats: summary.mweb_unconfirmed_sats,
+            immature_sats: summary.mweb_immature_sats,
+            maturity_blocks: summary.mweb_maturity_blocks,
+            total_sats: summary.mweb_total_sats,
+            receive_address: summary.mweb_receive_address.clone(),
+            synced_height: summary.mweb_synced_height,
+            stale: summary.mweb_stale,
+            status: summary.mweb_status.clone(),
+        }
+    }
+
+    fn into_combined(self, transparent: WalletSummary) -> CombinedSummary {
+        CombinedSummary {
+            transparent,
+            mweb_confirmed_sats: self.confirmed_sats,
+            mweb_unconfirmed_sats: self.unconfirmed_sats,
+            mweb_immature_sats: self.immature_sats,
+            mweb_maturity_blocks: self.maturity_blocks,
+            mweb_total_sats: self.total_sats,
+            mweb_receive_address: self.receive_address,
+            mweb_synced_height: self.synced_height,
+            mweb_stale: self.stale,
+            mweb_status: self.status,
+        }
+    }
+}
+
+/// MWEB runtime plus the tip it is syncing, held off the wallet mutex.
+struct ParkedMweb {
+    runtime: Option<MwebRuntime>,
+    tip_height: u32,
+    tip_hash: BlockHash,
+    prev_tip_hash: Option<BlockHash>,
+    peers: Vec<String>,
+    network: WalletNetwork,
+    hold_spent: BTreeSet<[u8; 32]>,
+    alt_electrum: Option<String>,
+    validate_domain: bool,
+    local_chain_hashes: HashMap<u32, BlockHash>,
+    used_server: String,
+    cached_warning: Option<String>,
+    run_cross_check: bool,
+}
+
+struct DetachedMwebDone {
+    parked: ParkedMweb,
+    warnings: Vec<String>,
+    mweb_ms: u64,
+    cross_ms: u64,
+    mweb_wall_ms: u64,
 }
 
 /// Application-facing wallet handle. BDK types stay private.
@@ -502,6 +581,13 @@ pub struct WalletApp {
     electrum_progress: spv::ElectrumProgress,
     /// Coarse sync phase for UI polling (see [`SyncPhase`]).
     sync_phase: AtomicU8,
+    /// Set once Electrum is persisted and the state mutex is about to be released
+    /// for the MWEB download. Cleared when the pass finishes or is dropped.
+    transparent_ready: AtomicBool,
+    /// True while [`ParkedMweb`] owns the runtime. Private spends refuse.
+    mweb_detached: AtomicBool,
+    /// Last private balance, served by [`Self::combined_summary`] during detach.
+    detached_mweb: Mutex<Option<DetachedMwebView>>,
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
@@ -538,6 +624,9 @@ impl WalletApp {
             mweb_sync_active: AtomicBool::new(false),
             electrum_progress: spv::ElectrumProgress::default(),
             sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
+            transparent_ready: AtomicBool::new(false),
+            mweb_detached: AtomicBool::new(false),
+            detached_mweb: Mutex::new(None),
             pending_lock: AtomicBool::new(false),
             session: hex::encode(rand::random::<[u8; 16]>()),
             last_good_electrum: Mutex::new(None),
@@ -662,8 +751,88 @@ impl WalletApp {
         SyncPass {
             phase: &self.sync_phase,
             electrum_progress: &self.electrum_progress,
+            transparent_ready: &self.transparent_ready,
             finished: false,
         }
+    }
+
+    fn clear_detached_mweb(&self) {
+        self.mweb_detached.store(false, Ordering::Release);
+        if let Ok(mut slot) = self.detached_mweb.lock() {
+            *slot = None;
+        }
+    }
+
+    fn detached_mweb_view(&self) -> Option<DetachedMwebView> {
+        self.detached_mweb.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Private coins are not in the wallet mutex. Refuse rather than reporting
+    /// that MWEB was never created.
+    fn refuse_if_mweb_detached(&self) -> Result<(), WalletError> {
+        if self.mweb_detached.load(Ordering::Acquire) {
+            Err(WalletError::Mweb(
+                "Confidential sync is still running. Public coins can move now; private coins wait until it finishes."
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Lift the MWEB runtime off the wallet so the download can run without the
+    /// state mutex. `None` when this wallet has no MWEB runtime.
+    fn park_mweb(&self, guard: &mut StateGuard<'_>) -> Result<Option<MwebRuntime>, WalletError> {
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        if state.mweb.is_none() {
+            return Ok(None);
+        }
+        let transparent = build_summary(state)?;
+        let combined = state
+            .mweb
+            .as_mut()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?
+            .combined_summary(&state.wallet, transparent)?;
+        let runtime = state
+            .mweb
+            .take()
+            .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+        if let Ok(mut slot) = self.detached_mweb.lock() {
+            *slot = Some(DetachedMwebView::from_combined(&combined));
+        }
+        self.mweb_detached.store(true, Ordering::Release);
+        Ok(Some(runtime))
+    }
+
+    /// Put a parked runtime back on the same account. A lock that landed while
+    /// it was out wins: the runtime is dropped (and wiped) instead of being
+    /// installed into a wallet the user already locked or switched away from.
+    fn restore_parked_mweb(
+        &self,
+        account_dir: &Path,
+        runtime: MwebRuntime,
+    ) -> Result<(), WalletError> {
+        let mut guard = match self.lock_state() {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.clear_detached_mweb();
+                drop(runtime);
+                return Err(err);
+            }
+        };
+        let Some(state) = guard.as_mut() else {
+            self.clear_detached_mweb();
+            drop(runtime);
+            return Err(WalletError::NotLoaded);
+        };
+        if state.data_dir != account_dir {
+            self.clear_detached_mweb();
+            drop(runtime);
+            return Err(WalletError::NotLoaded);
+        }
+        state.mweb = Some(runtime);
+        self.clear_detached_mweb();
+        Ok(())
     }
 
     fn publish_insights(&self, state: &WalletState) {
@@ -694,6 +863,11 @@ impl WalletApp {
                 .electrum_progress
                 .scripts_scanned
                 .load(Ordering::Relaxed),
+            scripts_active: self
+                .electrum_progress
+                .scripts_active
+                .load(Ordering::Relaxed),
+            transparent_ready: self.transparent_ready.load(Ordering::Acquire),
             txs_fetched: self.electrum_progress.txs_fetched.load(Ordering::Relaxed),
             txs_total: self.electrum_progress.txs_total.load(Ordering::Relaxed),
             anchors_verified: self
@@ -1332,6 +1506,8 @@ impl WalletApp {
         let transparent = build_summary(state)?;
         if let Some(ref mut mweb) = state.mweb {
             mweb.combined_summary(&state.wallet, transparent)
+        } else if let Some(view) = self.detached_mweb_view() {
+            Ok(view.into_combined(transparent))
         } else {
             Ok(CombinedSummary {
                 transparent,
@@ -1865,6 +2041,99 @@ impl WalletApp {
         err
     }
 
+    /// Cross-check and MWEB download without the wallet mutex, so public sends
+    /// can use the transparent wallet Electrum just persisted.
+    fn run_detached_stage(&self, mut parked: ParkedMweb) -> DetachedMwebDone {
+        let stage_started = std::time::Instant::now();
+        let mut warnings = Vec::new();
+        if let Some(warning) = parked.cached_warning.clone() {
+            warnings.push(warning);
+        }
+        let mut cross_ms = 0u64;
+        let mut mweb_ms = 0u64;
+        std::thread::scope(|scope| {
+            let cross_handle = if parked.run_cross_check {
+                parked.alt_electrum.clone().map(|alt| {
+                    let hashes = parked.local_chain_hashes.clone();
+                    let validate_domain = parked.validate_domain;
+                    let tip_height = parked.tip_height;
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let local_hash_at = |height: u32| hashes.get(&height).copied();
+                        let outcome = electrum::cross_check_tip(
+                            &alt,
+                            validate_domain,
+                            tip_height,
+                            &local_hash_at,
+                        );
+                        (outcome, started.elapsed().as_millis() as u64)
+                    })
+                })
+            } else {
+                None
+            };
+
+            if parked.runtime.is_some() {
+                diag::log("sync: mweb download starting");
+                let mweb_started = std::time::Instant::now();
+                let tip_height = parked.tip_height;
+                let tip_hash = parked.tip_hash;
+                let prev_tip_hash = parked.prev_tip_hash;
+                let peers = parked.peers.clone();
+                let network = parked.network;
+                let hold_spent = parked.hold_spent.clone();
+                self.with_mweb_progress(|progress| {
+                    if let Some(mweb) = parked.runtime.as_mut() {
+                        let _ = mweb.sync_at_tip(
+                            tip_height,
+                            tip_hash,
+                            prev_tip_hash,
+                            &peers,
+                            network,
+                            Some(progress),
+                            &hold_spent,
+                        );
+                    }
+                });
+                if let Some(warning) = parked
+                    .runtime
+                    .as_ref()
+                    .and_then(|mweb| mweb.cross_check_warning.clone())
+                {
+                    warnings.push(warning);
+                }
+                mweb_ms = mweb_started.elapsed().as_millis() as u64;
+                diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
+            }
+
+            if let Some(handle) = cross_handle {
+                if let Ok((outcome, elapsed)) = handle.join() {
+                    cross_ms = elapsed;
+                    if let Ok(warning) = outcome {
+                        if let Some(ref found) = warning {
+                            warnings.insert(0, found.clone());
+                        }
+                        self.note_cross_check(
+                            parked.used_server.clone(),
+                            parked.tip_height,
+                            parked.tip_hash,
+                            warning,
+                        );
+                    }
+                }
+            }
+        });
+        let mweb_wall_ms = stage_started.elapsed().as_millis() as u64;
+        diag::log(format!("sync: cross-check tip ms={cross_ms}"));
+        DetachedMwebDone {
+            parked,
+            warnings,
+            mweb_ms,
+            cross_ms,
+            mweb_wall_ms,
+        }
+    }
+
     pub fn sync(&self) -> Result<SyncResult, WalletError> {
         self.ensure_unlocked()?;
         let mut guard = self.lock_state()?;
@@ -1994,34 +2263,47 @@ impl WalletApp {
 
         // Skip the long MWEB pass if the user locked during Electrum sync.
         guard.check_lock().map_err(Self::log_sync_failure)?;
-        let state = guard
-            .as_mut()
-            .ok_or(WalletError::NotLoaded)
-            .map_err(Self::log_sync_failure)?;
 
         // Privacy-preserving second opinion: compare the served chain against
         // an independent server (headers only, never our scripts), overlapped
         // with MWEB download when MWEB is active and skipped when this exact
         // (server, tip_height, tip_hash) was already audited.
-        let mut warnings: Vec<String> = Vec::new();
-        let used_server = state
-            .active_electrum_url
-            .clone()
-            .unwrap_or_else(|| state.electrum_url.clone());
-        let cached_cross = self.cached_cross_check(&used_server, tip_height, tip_hash);
-        if let Some(Some(ref w)) = cached_cross {
-            warnings.push(w.clone());
-        }
-        let alt_electrum = if cached_cross.is_some() {
-            None
-        } else {
-            electrum_candidates(state)
-                .into_iter()
-                .find(|url| *url != used_server)
-        };
-        let validate_domain = state.electrum_validate_domain;
-        let local_chain_hashes: HashMap<u32, bdk_wallet::bitcoin::BlockHash> =
-            if alt_electrum.is_some() {
+        //
+        // The download runs without this mutex. Electrum is already persisted,
+        // so public balance and public send proceed while confidential sync
+        // continues. The runtime is parked, not dropped, until it is restored.
+        let (
+            used_server,
+            cached_cross_hit,
+            cached_warning,
+            alt_electrum,
+            validate_domain,
+            local_chain_hashes,
+            prev_tip_hash,
+            peers,
+            network,
+            account_dir,
+            hold_spent,
+        ) = {
+            let state = guard
+                .as_mut()
+                .ok_or(WalletError::NotLoaded)
+                .map_err(Self::log_sync_failure)?;
+            let used_server = state
+                .active_electrum_url
+                .clone()
+                .unwrap_or_else(|| state.electrum_url.clone());
+            let cached_cross = self.cached_cross_check(&used_server, tip_height, tip_hash);
+            let cached_warning = cached_cross.clone().flatten();
+            let alt_electrum = if cached_cross.is_some() {
+                None
+            } else {
+                electrum_candidates(state)
+                    .into_iter()
+                    .find(|url| *url != used_server)
+            };
+            let validate_domain = state.electrum_validate_domain;
+            let local_chain_hashes: HashMap<u32, BlockHash> = if alt_electrum.is_some() {
                 state
                     .wallet
                     .local_chain()
@@ -2031,77 +2313,79 @@ impl WalletApp {
             } else {
                 HashMap::new()
             };
-
-        let mweb_stage_started = std::time::Instant::now();
-        let mut mweb_ms = 0u64;
-        let mut cross_ms = 0u64;
-        let mut fresh_cross_result: Option<Option<String>> = None;
-        std::thread::scope(|scope| {
-            let cross_handle = alt_electrum.as_ref().map(|alt| {
-                let hashes = &local_chain_hashes;
-                scope.spawn(move || {
-                    let started = std::time::Instant::now();
-                    let local_hash_at = |height: u32| hashes.get(&height).copied();
-                    let outcome =
-                        electrum::cross_check_tip(alt, validate_domain, tip_height, &local_hash_at);
-                    (outcome, started.elapsed().as_millis() as u64)
-                })
-            });
-
-            // MWEB sync (best-effort; peer failure → stale, not hard error).
-            if let Some(ref mut mweb) = state.mweb {
-                pass.mweb();
-                diag::log("sync: mweb download starting");
-                let mweb_started = std::time::Instant::now();
-                let peers = state.mweb_peers.clone();
-                let network = state.network;
-                // Hash on the current chain at the previous MWEB sync height, so the syncer
-                // can detect a pure extension and skip the full UTXO re-download.
-                let prev_tip_hash = mweb
-                    .sync_state
+            let prev_tip_hash = state.mweb.as_ref().and_then(|mweb| {
+                mweb.sync_state
                     .tip_height
                     .and_then(|h| state.wallet.local_chain().get(h))
-                    .map(|cp| cp.hash());
-                let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
-                self.with_mweb_progress(|progress| {
-                    let _ = mweb.sync_at_tip(
-                        tip_height,
-                        tip_hash,
-                        prev_tip_hash,
-                        &peers,
-                        network,
-                        Some(progress),
-                        &hold_spent,
-                    );
-                });
-                if state.needs_mweb_scan {
-                    state.needs_mweb_scan = false;
-                }
-                if let Some(warning) = mweb.cross_check_warning.clone() {
-                    warnings.push(warning);
-                }
-                let _ = mweb.persist(&state.data_dir);
-                mweb_ms = mweb_started.elapsed().as_millis() as u64;
-                diag::log(format!("sync: mweb finished in {mweb_ms} ms"));
-            }
-
-            if let Some(handle) = cross_handle {
-                if let Ok((outcome, elapsed)) = handle.join() {
-                    cross_ms = elapsed;
-                    if let Ok(warning) = outcome {
-                        if let Some(ref w) = warning {
-                            warnings.insert(0, w.clone());
-                        }
-                        fresh_cross_result = Some(warning);
-                    }
-                }
-            }
-        });
-        if let Some(warning) = fresh_cross_result {
-            self.note_cross_check(used_server.clone(), tip_height, tip_hash, warning);
+                    .map(|cp| cp.hash())
+            });
+            let peers = state.mweb_peers.clone();
+            let network = state.network;
+            let account_dir = state.data_dir.clone();
+            let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
+            (
+                used_server,
+                cached_cross.is_some(),
+                cached_warning,
+                alt_electrum,
+                validate_domain,
+                local_chain_hashes,
+                prev_tip_hash,
+                peers,
+                network,
+                account_dir,
+                hold_spent,
+            )
+        };
+        let runtime = self.park_mweb(&mut guard).map_err(Self::log_sync_failure)?;
+        if runtime.is_some() {
+            pass.mweb();
         }
-        let mweb_wall_ms = mweb_stage_started.elapsed().as_millis() as u64;
-        diag::log(format!("sync: cross-check tip ms={cross_ms}"));
+        // Public commands block on this mutex. Release it before the download.
+        self.transparent_ready.store(true, Ordering::Release);
+        drop(guard);
+        let done = self.run_detached_stage(ParkedMweb {
+            runtime,
+            tip_height,
+            tip_hash,
+            prev_tip_hash,
+            peers,
+            network,
+            hold_spent,
+            alt_electrum,
+            validate_domain,
+            local_chain_hashes,
+            used_server: used_server.clone(),
+            cached_warning,
+            run_cross_check: !cached_cross_hit,
+        });
+        let DetachedMwebDone {
+            parked,
+            warnings,
+            mweb_ms,
+            cross_ms,
+            mweb_wall_ms,
+        } = done;
+        let mut warnings = warnings;
+        if let Some(runtime) = parked.runtime {
+            self.restore_parked_mweb(&account_dir, runtime)
+                .map_err(Self::log_sync_failure)?;
+        }
+        guard = self.lock_state().map_err(Self::log_sync_failure)?;
+        {
+            let state = guard
+                .as_mut()
+                .ok_or(WalletError::NotLoaded)
+                .map_err(Self::log_sync_failure)?;
+            let had_mweb = state.mweb.is_some();
+            if had_mweb && state.needs_mweb_scan {
+                state.needs_mweb_scan = false;
+            }
+            if let Some(mweb) = state.mweb.as_mut() {
+                let dir = state.data_dir.clone();
+                let _ = mweb.persist(&dir);
+            }
+        }
 
         guard.check_lock().map_err(Self::log_sync_failure)?;
         let state = guard
@@ -2204,6 +2488,7 @@ impl WalletApp {
 
     fn resync_mweb_inner(&self, new_scheme: Option<MwebScheme>) -> Result<(), WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         let mut guard = self.lock_state()?;
         let pass = self.sync_pass();
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
@@ -2367,6 +2652,7 @@ impl WalletApp {
 
     pub fn preview_pegin(&self, req: PeginRequest) -> Result<PeginPreview, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let resolved = resolve_pegin_request(state, req)?;
@@ -2390,6 +2676,7 @@ impl WalletApp {
 
     pub fn pegin(&self, req: PeginRequest) -> Result<PeginResult, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let req = resolve_pegin_request(state, req)?;
@@ -2409,6 +2696,7 @@ impl WalletApp {
 
     pub fn preview_mweb_send(&self, req: MwebSendRequest) -> Result<MwebSendPreview, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let resolved = resolve_mweb_send_request(state, req)?;
@@ -2421,6 +2709,7 @@ impl WalletApp {
 
     pub fn mweb_send(&self, req: MwebSendRequest) -> Result<MwebBroadcastResult, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         // Sign under the lock, then broadcast without it so a transfer or split
         // of a different coin can start while peers are still being tried.
         let (data_dir, signed, route, hold) = {
@@ -2448,6 +2737,7 @@ impl WalletApp {
 
     pub fn preview_pegout(&self, req: PegoutRequest) -> Result<PegoutPreview, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         let mut guard = self.lock_state()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let (resolved, dust_sats) = resolve_pegout_request(state, req)?;
@@ -2456,6 +2746,7 @@ impl WalletApp {
 
     pub fn pegout(&self, req: PegoutRequest) -> Result<MwebBroadcastResult, WalletError> {
         self.ensure_unlocked()?;
+        self.refuse_if_mweb_detached()?;
         // Sign under the lock, then broadcast without it: the peer loop can take
         // minutes, and sync, coin lists and other spends must not wait on it.
         let (data_dir, signed, route, hold) = self.sign_pegout(req)?;
@@ -8931,6 +9222,82 @@ mod lock_lifecycle_tests {
         assert!(matches!(guard.check_lock(), Err(WalletError::Locked)));
         assert!(guard.is_none());
         assert!(!app.pending_lock.load(Ordering::Acquire));
+    }
+
+    /// Electrum has been persisted and the MWEB runtime is parked off the mutex.
+    /// Public balance stays readable, private spend waits, and Lock still wins.
+    #[test]
+    fn public_summary_is_readable_while_mweb_is_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app(dir.path());
+        let before = app.combined_summary().expect("combined");
+        assert_ne!(before.mweb_status, "MWEB unavailable");
+
+        let mut guard = app.lock_state().unwrap();
+        let runtime = app
+            .park_mweb(&mut guard)
+            .unwrap()
+            .expect("wallet has an MWEB runtime");
+        drop(guard);
+
+        let during = app
+            .summary()
+            .expect("public summary while confidential sync holds the runtime");
+        assert_eq!(
+            during.confirmed_sats, before.transparent.confirmed_sats,
+            "transparent balance is the persisted one"
+        );
+        let combined = app.combined_summary().expect("snapshot while detached");
+        assert_eq!(combined.mweb_total_sats, before.mweb_total_sats);
+        assert_ne!(combined.mweb_status, "MWEB unavailable");
+        let account_dir = {
+            let guard = app.lock_state().unwrap();
+            guard.as_ref().unwrap().data_dir.clone()
+        };
+        let rejected = app
+            .mweb_send(crate::dto::MwebSendRequest {
+                address: "ltcmweb1qqnotarealaddress".into(),
+                amount_sats: 1,
+                fee_sats: 0,
+                drain: false,
+                selected_output_ids: None,
+            })
+            .expect_err("private send waits for confidential sync");
+        assert!(
+            rejected
+                .to_string()
+                .contains("Confidential sync is still running"),
+            "{rejected}"
+        );
+
+        app.restore_parked_mweb(&account_dir, runtime)
+            .expect("reattach");
+        let after = app
+            .mweb_send(crate::dto::MwebSendRequest {
+                address: "ltcmweb1qqnotarealaddress".into(),
+                amount_sats: 1,
+                fee_sats: 0,
+                drain: false,
+                selected_output_ids: None,
+            })
+            .expect_err("bad address, not the detach refusal");
+        assert!(
+            !after
+                .to_string()
+                .contains("Confidential sync is still running"),
+            "{after}"
+        );
+
+        let mut guard = app.lock_state().unwrap();
+        let runtime = app.park_mweb(&mut guard).unwrap().expect("park again");
+        drop(guard);
+        app.lock();
+        let err = app
+            .restore_parked_mweb(&account_dir, runtime)
+            .expect_err("lock wins over reattach");
+        assert!(matches!(err, WalletError::Locked), "{err}");
+        assert!(app.is_locked());
+        assert!(!state_loaded(&app));
     }
 
     /// A resync that fails after the download step must not leave pollers

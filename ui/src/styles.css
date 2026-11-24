@@ -568,6 +568,69 @@ code {
   line-height: 1.35;
 }
 
+.status-strip-rest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.status-strip-rest[hidden],
+.status-strip-sync[hidden] {
+  display: none;
+}
+
+.status-strip-sync {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.status-sync-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.status-sync-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-glass-1, var(--text));
+}
+
+.status-sync-count {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-sync-track {
+  width: 100%;
+  background: color-mix(in srgb, var(--text-glass-1, var(--text)) 18%, transparent);
+}
+
+.status-sync-track.is-indeterminate .progress-fill {
+  width: 32%;
+  transition: none;
+  animation: status-sync-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes status-sync-slide {
+  0% {
+    transform: translateX(-130%);
+  }
+  100% {
+    transform: translateX(380%);
+  }
+}
+
 .status-strip-item {
   min-width: 0;
   overflow: hidden;

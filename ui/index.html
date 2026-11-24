@@ -424,10 +424,28 @@
             </button>
           </div>
         </header>
-        <div class="status-strip" id="status-strip" aria-live="polite">
-          <button type="button" class="status-strip-link" id="status-block" disabled>Not synced</button>
-          <span class="status-strip-sep" id="status-sep" aria-hidden="true" hidden>·</span>
-          <span class="status-strip-item" id="status-mweb" hidden>MWEB synced</span>
+        <div class="status-strip" id="status-strip">
+          <div class="status-strip-rest" id="status-rest">
+            <button type="button" class="status-strip-link" id="status-block" disabled>Not synced</button>
+            <span class="status-strip-sep" id="status-sep" aria-hidden="true" hidden>·</span>
+            <span class="status-strip-item" id="status-mweb" hidden>MWEB synced</span>
+          </div>
+          <div class="status-strip-sync" id="status-sync" hidden>
+            <div class="status-sync-line">
+              <span class="status-sync-label" id="status-sync-label" aria-live="polite">Checking your addresses…</span>
+              <span class="status-sync-count" id="status-sync-count" hidden></span>
+            </div>
+            <div
+              class="progress-track status-sync-track"
+              id="status-sync-track"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-label="Sync progress"
+            >
+              <div class="progress-fill" id="status-sync-fill"></div>
+            </div>
+          </div>
         </div>
 
         <div class="views" id="views">
@@ -986,16 +1004,10 @@
                   </div>
                 </div>
 
-                <!-- Outside the swapped cards: MWEB sync stays visible whichever card is open. -->
+                <!-- Long MWEB failure text. Live progress stays in the header strip. -->
                 <div class="card sheet-card" id="mweb-status-card" hidden>
                   <h3>MWEB sync</h3>
                   <p class="hint" id="mweb-status" hidden></p>
-                  <div class="progress" id="mweb-progress" hidden>
-                    <div class="progress-track">
-                      <div class="progress-fill" id="mweb-progress-fill"></div>
-                    </div>
-                    <p class="hint progress-text" id="mweb-progress-text"></p>
-                  </div>
                 </div>
               </div>
             </div>

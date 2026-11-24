@@ -53,10 +53,20 @@ struct MockChainState {
     broadcast_txs: Vec<Transaction>,
     /// Heights passed to `blockchain.block.header` (one entry per call).
     header_calls: Vec<u32>,
+    /// Number of round-trips containing `blockchain.block.header`.
+    header_batches: usize,
     /// Number of `blockchain.block.headers` batch calls.
     headers_batch_calls: usize,
     /// Number of `blockchain.scripthash.get_history` calls.
     script_history_calls: usize,
+    /// Number of `blockchain.transaction.get` calls.
+    tx_get_calls: usize,
+    /// Number of round-trips containing `blockchain.transaction.get`.
+    tx_get_batches: usize,
+    /// Number of `blockchain.transaction.get_merkle` calls.
+    merkle_calls: usize,
+    /// Number of round-trips containing `blockchain.transaction.get_merkle`.
+    merkle_batches: usize,
 }
 
 struct MockElectrumServer {
@@ -76,22 +86,50 @@ impl MockElectrumServer {
             for stream in listener.incoming().flatten() {
                 let st = Arc::clone(&state_clone);
                 std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let read_stream = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(read_stream.try_clone().unwrap());
                     let mut writer = stream;
                     let mut line = String::new();
                     while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                        let mut batch_reqs = Vec::new();
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
                             if let Ok(req) = serde_json::from_str::<Value>(trimmed) {
-                                let resp = handle_rpc(&st, &req);
-                                let mut encoded = serde_json::to_vec(&resp).unwrap();
-                                encoded.push(b'\n');
-                                if writer.write_all(&encoded).is_err() || writer.flush().is_err() {
-                                    break;
-                                }
+                                batch_reqs.push(req);
                             }
                         }
                         line.clear();
+
+                        let _ =
+                            read_stream.set_read_timeout(Some(std::time::Duration::from_millis(2)));
+                        while reader.fill_buf().map(|b| !b.is_empty()).unwrap_or(false) {
+                            if reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                                let t = line.trim();
+                                if !t.is_empty() {
+                                    if let Ok(req) = serde_json::from_str::<Value>(t) {
+                                        batch_reqs.push(req);
+                                    }
+                                }
+                                line.clear();
+                            } else {
+                                break;
+                            }
+                        }
+                        let _ = read_stream.set_read_timeout(None);
+
+                        if batch_reqs.is_empty() {
+                            continue;
+                        }
+                        note_round_trip(&st, &batch_reqs);
+                        let mut encoded = Vec::new();
+                        for req in &batch_reqs {
+                            let resp = handle_rpc(&st, req);
+                            encoded.extend_from_slice(&serde_json::to_vec(&resp).unwrap());
+                            encoded.push(b'\n');
+                        }
+                        if writer.write_all(&encoded).is_err() || writer.flush().is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -103,6 +141,36 @@ impl MockElectrumServer {
     fn update<F: FnOnce(&mut MockChainState)>(&self, f: F) {
         let mut guard = self.state.lock().unwrap();
         f(&mut guard);
+    }
+}
+
+fn note_round_trip(state: &Arc<Mutex<MockChainState>>, batch_reqs: &[Value]) {
+    let mut has_header = false;
+    let mut has_tx_get = false;
+    let mut has_merkle = false;
+    for req in batch_reqs {
+        let items: Vec<&Value> = match req.as_array() {
+            Some(arr) => arr.iter().collect(),
+            None => vec![req],
+        };
+        for item in items {
+            match item.get("method").and_then(Value::as_str).unwrap_or("") {
+                "blockchain.block.header" => has_header = true,
+                "blockchain.transaction.get" => has_tx_get = true,
+                "blockchain.transaction.get_merkle" => has_merkle = true,
+                _ => {}
+            }
+        }
+    }
+    let mut st = state.lock().unwrap();
+    if has_header {
+        st.header_batches += 1;
+    }
+    if has_tx_get {
+        st.tx_get_batches += 1;
+    }
+    if has_merkle {
+        st.merkle_batches += 1;
     }
 }
 
@@ -212,6 +280,7 @@ fn handle_single_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
             })
         }
         "blockchain.transaction.get" => {
+            st.tx_get_calls += 1;
             let txid = params.first().and_then(Value::as_str).unwrap_or("");
             match st.txs.get(txid) {
                 Some(raw) => json!({
@@ -227,6 +296,7 @@ fn handle_single_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
             }
         }
         "blockchain.transaction.get_merkle" => {
+            st.merkle_calls += 1;
             let txid = params
                 .first()
                 .and_then(Value::as_str)
@@ -1212,4 +1282,159 @@ fn unchanged_tip_skips_redundant_header_window_fetch_and_fresh_prefetch_skips_du
             "sync right after fresh prefetch must not re-download headers"
         );
     }
+}
+
+#[test]
+fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_merkle_fallback() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let _window = crate::spv::narrow_header_window_for_test(4);
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_spk = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap()
+        .script_pubkey();
+    let sh = electrum_scripthash_hex(&recv_spk);
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let app2 = app_with_job(dir2.path(), ChurnPhase::Cancelled, false);
+    let recv_spk2 = Address::from_str(&app2.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap()
+        .script_pubkey();
+    let sh2 = electrum_scripthash_hex(&recv_spk2);
+
+    let gen = genesis_block(Network::Testnet4).header;
+    let mut state = MockChainState::default();
+    state.headers.insert(0, gen);
+
+    let mut prev = gen;
+    let mut history = Vec::new();
+    let mut missing_merkle_txid = String::new();
+    for height in 1..=60u32 {
+        let cb = make_coinbase_tx(height);
+        let cb_id = cb.compute_txid().to_byte_array();
+        let mut tx = make_funding_tx(recv_spk.clone(), 100_000 + u64::from(height), height as u8);
+        tx.output.push(TxOut {
+            value: Amount::from_sat(100_000 + u64::from(height)),
+            script_pubkey: recv_spk2.clone(),
+        });
+        let txid = tx.compute_txid();
+        let root = sha256d_pair(&cb_id, &txid.to_byte_array());
+        let hdr = mine_testnet_header(Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: prev.block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array(root),
+            time: prev.time + 600,
+            bits: easy_bits(),
+            nonce: 0,
+        });
+        prev = hdr;
+        state.headers.insert(height, hdr);
+        state.tip_height = height;
+        history.push(MockHistoryEntry {
+            tx_hash: txid.to_string(),
+            height: height as i32,
+        });
+        state.txs.insert(txid.to_string(), serialize(&tx));
+        if height == 30 {
+            missing_merkle_txid = txid.to_string();
+            state.proofs.insert(
+                (txid.to_string(), height as usize),
+                Err("merkle branch not indexed yet".into()),
+            );
+        } else {
+            state.proofs.insert(
+                (txid.to_string(), height as usize),
+                Ok(MockMerkleProof {
+                    block_height: height as usize,
+                    pos: 1,
+                    merkle: vec![display_hex_from_internal(cb_id)],
+                }),
+            );
+        }
+    }
+    state.histories.insert(sh, history.clone());
+    state.histories.insert(sh2, history);
+    // Extend to 65 so heights 1..=60 sit below the 4-block tip window (62..=65).
+    extend_chain(&mut state, 65);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+
+    app.sync()
+        .expect("cold restore sync with 1 missing merkle proof succeeds");
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.tx_get_calls, 60);
+        assert_eq!(
+            st.tx_get_batches, 2,
+            "60 raw txs must be fetched in 2 chunks of 50, got {} round-trips",
+            st.tx_get_batches
+        );
+        assert!(
+            st.header_calls.len() >= 60,
+            "expected >= 60 isolated header fetches below window, got {}",
+            st.header_calls.len()
+        );
+        assert!(
+            st.header_batches <= 2,
+            "isolated headers must be batched in <= 2 round-trips, got {}",
+            st.header_batches
+        );
+    }
+
+    let utxos = app.list_unspent().unwrap();
+    assert_eq!(utxos.len(), 60);
+    let confirmed_count = utxos.iter().filter(|u| u.confirmations > 0).count();
+    let pending: Vec<_> = utxos.iter().filter(|u| u.confirmations == 0).collect();
+    assert_eq!(
+        confirmed_count, 59,
+        "59 valid proofs must confirm despite 1 protocol error in the same batch"
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].txid, missing_merkle_txid);
+    assert_eq!(pending[0].status, CoinStatus::Pending);
+
+    // Now test a clean cold sync where all 60 merkle proofs are available:
+    // merkle proofs must take 1 batch round-trip (chunk of 100), not 60.
+    let cb30_id = make_coinbase_tx(30).compute_txid().to_byte_array();
+    server.update(|st| {
+        st.tx_get_calls = 0;
+        st.tx_get_batches = 0;
+        st.header_calls.clear();
+        st.header_batches = 0;
+        st.merkle_calls = 0;
+        st.merkle_batches = 0;
+        st.proofs.insert(
+            (missing_merkle_txid.clone(), 30),
+            Ok(MockMerkleProof {
+                block_height: 30,
+                pos: 1,
+                merkle: vec![display_hex_from_internal(cb30_id)],
+            }),
+        );
+    });
+    configure_electrum(&app2, &server.url, false);
+    app2.sync().expect("clean cold sync");
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.tx_get_calls, 60);
+        assert_eq!(st.tx_get_batches, 2);
+        assert!(st.header_batches <= 2);
+        assert_eq!(st.merkle_calls, 60);
+        assert_eq!(
+            st.merkle_batches, 1,
+            "60 merkle proofs must be fetched in 1 batch round-trip, got {}",
+            st.merkle_batches
+        );
+    }
+    let utxos2 = app2.list_unspent().unwrap();
+    assert_eq!(utxos2.len(), 60);
+    assert!(utxos2
+        .iter()
+        .all(|u| u.confirmations > 0 && u.status == CoinStatus::Ready));
 }

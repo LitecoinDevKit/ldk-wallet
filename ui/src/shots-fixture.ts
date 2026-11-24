@@ -583,6 +583,11 @@ const COMMANDS: Record<string, (args?: Args) => unknown> = {
     active: false,
     fetched: 0,
     total: 0,
+    scripts_scanned: 0,
+    txs_fetched: 0,
+    txs_total: 0,
+    anchors_verified: 0,
+    anchors_total: 0,
   }),
   get_diagnostics: () => ({
     app_version: "0.4.11",

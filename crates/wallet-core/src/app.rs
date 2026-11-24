@@ -212,6 +212,7 @@ fn connect_from_meta(
 
 /// One SPV-verified Electrum full scan or incremental sync applied to
 /// `wallet`. Does not persist: persist the wallet, then the outcome's state.
+#[allow(clippy::too_many_arguments)]
 fn apply_electrum_chain_update(
     wallet: &mut PersistedWallet<Connection>,
     client: &crate::electrum::ElectrumClient,
@@ -220,6 +221,7 @@ fn apply_electrum_chain_update(
     server_url: &str,
     full_scan: bool,
     protected: &HashSet<Txid>,
+    progress: Option<&spv::ElectrumProgress>,
 ) -> Result<spv::SpvSyncOutcome, WalletError> {
     spv::sync_electrum_spv(
         wallet,
@@ -229,6 +231,7 @@ fn apply_electrum_chain_update(
         server_url,
         full_scan,
         protected,
+        progress,
     )
 }
 
@@ -431,11 +434,13 @@ struct FreshPrefetch {
 /// leave pollers reading a step that has stopped.
 struct SyncPass<'a> {
     phase: &'a AtomicU8,
+    electrum_progress: &'a spv::ElectrumProgress,
     finished: bool,
 }
 
 impl SyncPass<'_> {
     fn electrum(&self, full_scan: bool) {
+        self.electrum_progress.reset();
         if full_scan {
             self.set(SyncPhase::ElectrumFullScan, "electrum full_scan");
         } else {
@@ -444,11 +449,13 @@ impl SyncPass<'_> {
     }
 
     fn mweb(&self) {
+        self.electrum_progress.reset();
         self.set(SyncPhase::MwebDownload, "mweb download");
     }
 
     /// Done stays visible until the next pass starts.
     fn finish(mut self) {
+        self.electrum_progress.reset();
         self.set(SyncPhase::Done, "pass finished");
         self.finished = true;
     }
@@ -456,6 +463,7 @@ impl SyncPass<'_> {
     /// Locked prefetch only warms the transparent chain; return to Idle cleanly
     /// instead of logging an aborted pass on drop.
     fn finish_prefetch(mut self) {
+        self.electrum_progress.reset();
         self.set(SyncPhase::Idle, "prefetch finished");
         self.finished = true;
     }
@@ -471,6 +479,7 @@ impl SyncPass<'_> {
 impl Drop for SyncPass<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            self.electrum_progress.reset();
             self.set(SyncPhase::Idle, "pass exited before finish");
         }
     }
@@ -489,6 +498,8 @@ pub struct WalletApp {
     /// polled while a sync (which holds that mutex) is in flight.
     mweb_progress: Arc<SyncProgress>,
     mweb_sync_active: AtomicBool,
+    /// Shared Electrum SPV scan/fetch/verify counters for UI polling.
+    electrum_progress: spv::ElectrumProgress,
     /// Coarse sync phase for UI polling (see [`SyncPhase`]).
     sync_phase: AtomicU8,
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
@@ -525,6 +536,7 @@ impl WalletApp {
             )),
             mweb_progress: Arc::new(SyncProgress::default()),
             mweb_sync_active: AtomicBool::new(false),
+            electrum_progress: spv::ElectrumProgress::default(),
             sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
             pending_lock: AtomicBool::new(false),
             session: hex::encode(rand::random::<[u8; 16]>()),
@@ -649,6 +661,7 @@ impl WalletApp {
     fn sync_pass(&self) -> SyncPass<'_> {
         SyncPass {
             phase: &self.sync_phase,
+            electrum_progress: &self.electrum_progress,
             finished: false,
         }
     }
@@ -677,6 +690,17 @@ impl WalletApp {
             active: self.mweb_sync_active.load(Ordering::Relaxed),
             fetched,
             total,
+            scripts_scanned: self
+                .electrum_progress
+                .scripts_scanned
+                .load(Ordering::Relaxed),
+            txs_fetched: self.electrum_progress.txs_fetched.load(Ordering::Relaxed),
+            txs_total: self.electrum_progress.txs_total.load(Ordering::Relaxed),
+            anchors_verified: self
+                .electrum_progress
+                .anchors_verified
+                .load(Ordering::Relaxed),
+            anchors_total: self.electrum_progress.anchors_total.load(Ordering::Relaxed),
         }
     }
 
@@ -1781,6 +1805,7 @@ impl WalletApp {
             &used,
             full_scan,
             &HashSet::new(),
+            Some(&self.electrum_progress),
         ) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -1909,6 +1934,7 @@ impl WalletApp {
                 &used,
                 did_full_scan,
                 &protected,
+                Some(&self.electrum_progress),
             ) {
                 Ok(outcome) => outcome,
                 Err(e) => {

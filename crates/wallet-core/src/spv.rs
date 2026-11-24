@@ -275,11 +275,11 @@ const MAX_FORK_DEPTH: u32 = 2160;
 /// Verified headers kept in `electrum_spv.json`.
 const KEEP_VERIFIED_HEADERS: usize = 2200;
 /// Raw transactions requested per `blockchain.transaction.get` batch.
-const RAW_TX_BATCH_SIZE: usize = 200;
+pub(crate) const RAW_TX_BATCH_SIZE: usize = 200;
 /// Block headers requested per `blockchain.block.header` batch.
-const HEADER_BATCH_SIZE: usize = 100;
+pub(crate) const HEADER_BATCH_SIZE: usize = 100;
 /// Merkle branches requested per `blockchain.transaction.get_merkle` batch.
-const MERKLE_BATCH_SIZE: usize = 100;
+pub(crate) const MERKLE_BATCH_SIZE: usize = 100;
 
 /// Lock-free progress counters updated during an Electrum SPV pass.
 #[derive(Default)]

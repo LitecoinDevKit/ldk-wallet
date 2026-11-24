@@ -1365,14 +1365,19 @@ fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_m
     let server = MockElectrumServer::start(state);
     configure_electrum(&app, &server.url, false);
 
+    let expected_tx_batches = 60usize.div_ceil(crate::spv::RAW_TX_BATCH_SIZE);
+    let expected_merkle_batches = 60usize.div_ceil(crate::spv::MERKLE_BATCH_SIZE);
+    let max_header_batches = 1 + 60usize.div_ceil(crate::spv::HEADER_BATCH_SIZE);
+
     app.sync()
         .expect("cold restore sync with 1 missing merkle proof succeeds");
     {
         let st = server.state.lock().unwrap();
         assert_eq!(st.tx_get_calls, 60);
         assert_eq!(
-            st.tx_get_batches, 2,
-            "60 raw txs must be fetched in 2 chunks of 50, got {} round-trips",
+            st.tx_get_batches, expected_tx_batches,
+            "60 raw txs must be fetched in {expected_tx_batches} chunk(s) of {}, got {} round-trips",
+            crate::spv::RAW_TX_BATCH_SIZE,
             st.tx_get_batches
         );
         assert!(
@@ -1381,8 +1386,8 @@ fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_m
             st.header_calls.len()
         );
         assert!(
-            st.header_batches <= 2,
-            "isolated headers must be batched in <= 2 round-trips, got {}",
+            st.header_batches <= max_header_batches,
+            "isolated headers must be batched in <= {max_header_batches} round-trips, got {}",
             st.header_batches
         );
     }
@@ -1400,7 +1405,7 @@ fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_m
     assert_eq!(pending[0].status, CoinStatus::Pending);
 
     // Now test a clean cold sync where all 60 merkle proofs are available:
-    // merkle proofs must take 1 batch round-trip (chunk of 100), not 60.
+    // merkle proofs must take ceil(60 / MERKLE_BATCH_SIZE) batch round-trip(s), not 60.
     let cb30_id = make_coinbase_tx(30).compute_txid().to_byte_array();
     server.update(|st| {
         st.tx_get_calls = 0;
@@ -1423,12 +1428,12 @@ fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_m
     {
         let st = server.state.lock().unwrap();
         assert_eq!(st.tx_get_calls, 60);
-        assert_eq!(st.tx_get_batches, 2);
-        assert!(st.header_batches <= 2);
+        assert_eq!(st.tx_get_batches, expected_tx_batches);
+        assert!(st.header_batches <= max_header_batches);
         assert_eq!(st.merkle_calls, 60);
         assert_eq!(
-            st.merkle_batches, 1,
-            "60 merkle proofs must be fetched in 1 batch round-trip, got {}",
+            st.merkle_batches, expected_merkle_batches,
+            "60 merkle proofs must be fetched in {expected_merkle_batches} batch round-trip(s), got {}",
             st.merkle_batches
         );
     }

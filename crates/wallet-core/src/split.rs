@@ -29,7 +29,7 @@ pub fn estimate_public_fee(n_split_outputs: usize, with_change: bool, fee_rate_s
 }
 
 fn min_private_split_fee(total_outputs: usize) -> u64 {
-    bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(total_outputs, []))
+    crate::tx_invariants::min_kernel_fee(total_outputs, std::iter::empty())
 }
 
 #[derive(Debug, Clone)]
@@ -446,13 +446,14 @@ mod tests {
             fee_sats: 0,
             fee_rate_sat_vb: 1,
             public: false,
-            mweb_fee: 50_000,
+            mweb_fee: 0,
         })
         .unwrap();
-        assert_eq!(preview.fee_sats, 50_000);
+        assert_eq!(preview.fee_sats, min_private_split_fee(4));
+        assert_eq!(preview.fee_sats, 7_500);
         assert_eq!(preview.fee_rate_sat_vb, 0);
         let sum: u64 = preview.outputs.iter().map(|o| o.amount_sats).sum();
-        assert_eq!(sum + 50_000, 1_000_000);
+        assert_eq!(sum + 7_500, 1_000_000);
     }
 
     #[test]

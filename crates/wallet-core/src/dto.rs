@@ -737,20 +737,18 @@ pub struct DiagLogPage {
     pub lines: Vec<String>,
 }
 
-/// Default MWEB kernel fee (0.0005 LTC). Used when the request leaves fee as 0.
-pub const DEFAULT_MWEB_FEE_SATS: u64 = 50_000;
-
 /// Request to peg transparent LTC into MWEB.
 ///
 /// `amount_sats` is the peg-in output value (HogEx). The private coin credited is
 /// `amount_sats - mweb_fee_sats`. Transparent inputs also pay `transparent_fee_sats`.
-/// Fee fields of `0` mean “pick automatically”.
+/// A fee of `0` means the relay minimum for that side: one MWEB output, or an
+/// Electrum estimate for the transparent miner fee.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeginRequest {
     /// Ignored when [`Self::drain`] is true.
     #[serde(default)]
     pub amount_sats: u64,
-    /// MWEB kernel fee; `0` = [`DEFAULT_MWEB_FEE_SATS`].
+    /// MWEB kernel fee. `0` means the one-output relay minimum.
     #[serde(default)]
     pub mweb_fee_sats: u64,
     /// Transparent miner fee; `0` = estimate from Electrum.
@@ -801,7 +799,7 @@ pub struct PeginResult {
     pub maturity_blocks: u32,
 }
 
-/// Request to send MWEB → MWEB. `fee_sats` of `0` means auto.
+/// Request to send MWEB → MWEB. `fee_sats` of `0` means this spend's relay minimum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MwebSendRequest {
     pub address: String,
@@ -829,7 +827,7 @@ pub struct MwebSendPreview {
     pub creates_change: bool,
 }
 
-/// Request to peg MWEB out to a transparent address. `fee_sats` of `0` means auto.
+/// Request to peg MWEB out to a transparent address. `fee_sats` of `0` means this peg-out's relay minimum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PegoutRequest {
     /// Destination for a typed-amount (single HogEx) peg-out. Ignored when
@@ -915,7 +913,7 @@ pub struct TransferCoinRequest {
     /// Transparent fee rate (sat/vB). When omitted or zero, estimated from Electrum.
     #[serde(default)]
     pub fee_rate_sat_vb: Option<u64>,
-    /// MWEB kernel fee. `0` means auto ([`DEFAULT_MWEB_FEE_SATS`]).
+    /// MWEB kernel fee. `0` means this transfer's relay minimum. A private transfer empties one coin, so that is the one-output floor.
     #[serde(default)]
     pub fee_sats: u64,
 }
@@ -987,6 +985,10 @@ pub struct MwebUtxoRecord {
     /// Non-solo blocks this job has already counted.
     #[serde(default)]
     pub churn_counted: Option<u32>,
+    /// Kernel fee of the live self-spend, in litoshis. Set only while the job holds this coin.
+    /// A job already on disk keeps the fee it was signed with.
+    #[serde(default)]
+    pub churn_fee_sats: Option<u64>,
     /// Set while the live hop is signed and waiting to broadcast.
     #[serde(default)]
     pub churn_cover_hold: Option<CoverHold>,
@@ -1128,18 +1130,38 @@ pub const CHURN_MAX_TARGET: u32 = 10;
 /// Confirm-sheet sentence: depth does not hide the implied amount.
 pub const CHURN_AMOUNT_NOTE: &str = "This subtracts the public fee. The resulting amount is still determined by where this coin started.";
 
-/// Confirm-sheet sentence for one hop: a quiet block pauses, and retrying signs a new hop.
-pub const CHURN_QUIET_NOTE: &str = "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.0005 LTC.";
+/// Confirm-sheet sentence for one hop at the one-output relay minimum (2,100 litoshis).
+pub const CHURN_QUIET_NOTE: &str = "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another 0.000021 LTC.";
 
 /// Confirm-sheet sentence when more than one hop is prepared.
 pub const CHURN_QUIET_CHAIN_NOTE: &str = "A block that only contains this spend does not count. The next prepared spend waits until other private transactions are available.";
 
+/// `2100` → `"0.000021 LTC"`, `50000` → `"0.0005 LTC"`. Trailing zeros are dropped.
+pub fn format_ltc_trimmed(sats: u64) -> String {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    if frac == 0 {
+        return format!("{whole} LTC");
+    }
+    let mut digits = format!("{frac:08}");
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    format!("{whole}.{digits} LTC")
+}
+
 /// One hop pauses for a click. A longer run keeps the next prepared spend armed.
-pub fn quiet_block_note(target_depth: u32) -> &'static str {
+///
+/// The one-hop sentence names `hop_fee_sats`, so a job signed at an older fee still
+/// tells the truth about what Try again will spend.
+pub fn quiet_block_note(target_depth: u32, hop_fee_sats: u64) -> String {
     if target_depth <= 1 {
-        CHURN_QUIET_NOTE
+        format!(
+            "A block that only contains this spend does not count, and this wallet will not try again by itself. Pressing Try again later signs a new hop and spends another {}.",
+            format_ltc_trimmed(hop_fee_sats)
+        )
     } else {
-        CHURN_QUIET_CHAIN_NOTE
+        CHURN_QUIET_CHAIN_NOTE.to_string()
     }
 }
 
@@ -1218,6 +1240,15 @@ fn churn_phase_all_is_exhaustive(phase: ChurnPhase) {
         | ChurnPhase::Done
         | ChurnPhase::Cancelled => {}
     }
+}
+
+#[test]
+fn quiet_note_names_the_hop_fee_without_trailing_zeros() {
+    assert_eq!(format_ltc_trimmed(2_100), "0.000021 LTC");
+    assert_eq!(format_ltc_trimmed(50_000), "0.0005 LTC");
+    assert_eq!(quiet_block_note(1, 2_100), CHURN_QUIET_NOTE);
+    assert!(quiet_block_note(1, 50_000).contains("0.0005 LTC"));
+    assert_eq!(quiet_block_note(2, 2_100), CHURN_QUIET_CHAIN_NOTE);
 }
 
 /// Start or preview a self-spend. `target_depth` of 0 means one hop.

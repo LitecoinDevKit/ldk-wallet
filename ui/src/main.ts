@@ -18,6 +18,7 @@ import {
   formatLitoshis,
   formatLitoshisPlain,
   formatLtc,
+  formatLtcTrimmed,
   parseLitoshisToSats,
   parseLtcToSats,
   satsToBip21Amount,
@@ -253,6 +254,7 @@ type MwebUtxoRecord = {
   churn_error?: string | null;
   churn_target?: number | null;
   churn_counted?: number | null;
+  churn_fee_sats?: number | null;
   churn_cover_hold?: "no-rpc" | "waiting" | null;
   churn_cover_min?: number | null;
   churn_cover_seen?: number | null;
@@ -491,6 +493,10 @@ const MAX_SPLIT_OUTPUTS = 50;
 const MIN_EQUAL_SPLIT = 2;
 const SPLIT_PREFS_KEY = "ltc-split-prefs";
 const SPLIT_DENOMS_LTC = [0.1, 0.25, 0.5, 1, 5, 10, 20, 50, 100];
+/** Stealth kernel weight, standard-output weight, and litoshis per weight (`bdk_mweb::policy`). */
+const MWEB_KERNEL_WEIGHT = 3;
+const MWEB_OUTPUT_WEIGHT = 18;
+const MWEB_FEE_PER_WEIGHT = 100;
 const SPLIT_DENOMS_SATS = SPLIT_DENOMS_LTC.map((ltc) => Math.round(ltc * 100_000_000));
 const PEGOUT_PREP_SATS = new Set([5, 10, 20, 50].map((ltc) => ltc * 100_000_000));
 const AUTO_SYNC_MS = 180_000;
@@ -5990,7 +5996,8 @@ function churnCompanySentence(coin: MwebUtxoRecord): string | null {
     return "Already on the network — waiting for the next block. This hop cannot be cancelled.";
   }
   if (phase === "paused-solo") {
-    return "This block only contained your spend. Signing a new hop spends another 0.0005 LTC.";
+    const hopFee = coin.churn_fee_sats ?? 2_100;
+    return `This block only contained your spend. Signing a new hop spends another ${formatLtcTrimmed(hopFee)}.`;
   }
   if (phase === "paused-unscored") return "Couldn't read that block yet.";
   if (coin.from_pegin && coin.non_solo_blocks === 0) {
@@ -7363,6 +7370,28 @@ function denomAmountsFromQtys(qtys: number[]): number[] {
   return amounts;
 }
 
+function privateKernelFee(outputs: number): number {
+  return (MWEB_KERNEL_WEIGHT + MWEB_OUTPUT_WEIGHT * Math.max(outputs, 1)) * MWEB_FEE_PER_WEIGHT;
+}
+
+function fillPrivateDenoms(amountSats: number): number[] {
+  const shapeFee = (qtys: number[], budget: number) => {
+    const count = qtys.reduce((n, qty) => n + qty, 0);
+    const spent = qtys.reduce((sum, qty, i) => sum + qty * SPLIT_DENOMS_SATS[i]!, 0);
+    const leftover = budget - spent;
+    const outputs = count + (leftover > 0 ? 1 : 0);
+    return privateKernelFee(outputs);
+  };
+  let filled = greedyFillQtys(amountSats);
+  const fee = shapeFee(filled, amountSats);
+  filled = greedyFillQtys(Math.max(0, amountSats - fee));
+  const fee2 = shapeFee(filled, amountSats - fee);
+  if (fee2 !== fee) {
+    filled = greedyFillQtys(Math.max(0, amountSats - fee2));
+  }
+  return filled;
+}
+
 function greedyFillQtys(available: number): number[] {
   const qtys = SPLIT_DENOMS_SATS.map(() => 0);
   let remaining = available;
@@ -7775,11 +7804,10 @@ async function openSplitModal(coin: {
         });
         fillBtn.addEventListener("click", () => {
           const feeRate = Math.max(1, Math.floor(Number(feeInput?.value) || feeRateDefault));
-          const roughFee =
+          const filled =
             coin.chain === "private"
-              ? 50_000
-              : (11 + 68 + 31 * 8) * feeRate;
-          const filled = greedyFillQtys(Math.max(0, coin.amount_sats - roughFee));
+              ? fillPrivateDenoms(coin.amount_sats)
+              : greedyFillQtys(Math.max(0, coin.amount_sats - (11 + 68 + 31 * 8) * feeRate));
           for (let i = 0; i < qtyInputs.length; i++) {
             qtyInputs[i]!.value = String(filled[i] ?? 0);
           }

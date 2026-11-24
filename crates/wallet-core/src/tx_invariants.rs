@@ -112,6 +112,22 @@ pub fn ltc_dust_threshold(script: &Script) -> u64 {
     bdk_mweb::policy::dust_threshold(script)
 }
 
+/// Relay minimum for an MWEB kernel this wallet builds.
+///
+/// `standard_outputs` counts every MWEB output, including change. Peg-out scripts
+/// add `ceil(len / 42)` each and are not standard outputs. Inputs add nothing.
+/// The result is that weight times `BASE_MWEB_FEE` (100 litoshis). Paying more
+/// does not get a faster block: this is a relay floor, not a mempool feerate.
+pub fn min_kernel_fee<'a>(
+    standard_outputs: usize,
+    pegout_scripts: impl IntoIterator<Item = &'a Script>,
+) -> u64 {
+    bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(
+        standard_outputs,
+        pegout_scripts,
+    ))
+}
+
 /// True when `script` is a standard spendable public wallet script (P2PKH, P2SH, P2WPKH, P2WSH, P2TR).
 ///
 /// Rejects empty scripts (such as `Address::script_pubkey()` on an MWEB stealth address),
@@ -732,6 +748,7 @@ pub fn verify_mweb_spend_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_wallet::bitcoin::ScriptBuf;
 
     #[test]
     fn money_and_fee_rate_bounds_reject_overflow_and_extremes() {
@@ -784,5 +801,22 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].to_string(), op1);
         assert_eq!(ops[1].to_string(), op2);
+    }
+
+    fn p2wpkh() -> ScriptBuf {
+        ScriptBuf::from_bytes([0x00, 0x14].into_iter().chain([7u8; 20]).collect())
+    }
+
+    #[test]
+    fn kernel_fee_is_weight_times_100() {
+        assert_eq!(min_kernel_fee(1, std::iter::empty()), 2_100);
+        assert_eq!(min_kernel_fee(2, std::iter::empty()), 3_900);
+        assert_eq!(
+            min_kernel_fee(3, std::iter::empty()) - min_kernel_fee(2, std::iter::empty()),
+            1_800
+        );
+        let script = p2wpkh();
+        assert_eq!(min_kernel_fee(0, [script.as_script()]), 400);
+        assert_eq!(min_kernel_fee(1, [script.as_script()]), 2_200);
     }
 }

@@ -1612,14 +1612,27 @@ fn audit_f3_post_broadcast_commit_succeeds_during_detached_mweb_sync_and_after_l
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream);
+            let mut content_len: usize = 0;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
                     break;
                 }
+                if let Some((name, val)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_len = val.trim().parse().unwrap_or(0);
+                    }
+                }
                 if line == "\r\n" || line == "\n" {
                     break;
                 }
+            }
+            // Drain the HTTP POST body before replying/closing; on Windows,
+            // closing a socket with unread data in the receive buffer triggers
+            // a TCP RST (WSAECONNRESET / os error 10054) on the client.
+            if content_len > 0 {
+                let mut body = vec![0u8; content_len];
+                let _ = reader.read_exact(&mut body);
             }
             entered.wait();
             release.wait();
@@ -1631,6 +1644,10 @@ fn audit_f3_post_broadcast_commit_succeeds_during_detached_mweb_sync_and_after_l
             let mut stream = reader.into_inner();
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(payload);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut drain = [0u8; 64];
+            let _ = stream.read(&mut drain);
         });
         (url, handle)
     };
@@ -1647,7 +1664,10 @@ fn audit_f3_post_broadcast_commit_succeeds_during_detached_mweb_sync_and_after_l
     configure(&app_a, "tcp://127.0.0.1:9", Some(&rpc_url_a), &[], true);
 
     let send_res_a = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| app_a.mweb_send(mweb_send_req(&dest_a, &ids_a[0], 100_000)));
+        let worker = scope.spawn(|| {
+            crate::discovery::go_offline_for_test();
+            app_a.mweb_send(mweb_send_req(&dest_a, &ids_a[0], 100_000))
+        });
         entered_a.wait();
         let mut guard = app_a.lock_state().unwrap();
         let _parked = app_a.park_mweb(&mut guard).unwrap().expect("mweb parked");
@@ -1669,7 +1689,10 @@ fn audit_f3_post_broadcast_commit_succeeds_during_detached_mweb_sync_and_after_l
     configure(&app_b, "tcp://127.0.0.1:9", Some(&rpc_url_b), &[], true);
 
     let send_res_b = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| app_b.mweb_send(mweb_send_req(&dest_b, &ids_b[0], 100_000)));
+        let worker = scope.spawn(|| {
+            crate::discovery::go_offline_for_test();
+            app_b.mweb_send(mweb_send_req(&dest_b, &ids_b[0], 100_000))
+        });
         entered_b.wait();
         app_b.lock();
         release_b.wait();

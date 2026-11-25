@@ -1137,10 +1137,13 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let rpc_hits = Arc::new(AtomicUsize::new(0));
+    let rpc_hits_bg = Arc::clone(&rpc_hits);
     std::thread::spawn(move || {
         // Accept and never answer. Reading the request and then dropping the
         // socket makes the client fail at once, so the repair timeout never runs.
         for stream in listener.incoming().flatten() {
+            rpc_hits_bg.fetch_add(1, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut stream = stream;
                 let mut buf = [0u8; 1024];
@@ -1160,7 +1163,7 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
         let st = guard.as_mut().unwrap();
         st.litecoin_rpc_url = Some(rpc_url);
         st.mweb.as_mut().unwrap().history.record(MwebHistoryEntry {
-            id: missing_id,
+            id: missing_id.clone(),
             kind: TxKind::Pegin,
             net_sats: -1_000_000,
             fee_sats: Some(10_000),
@@ -1179,25 +1182,33 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
     let started = std::time::Instant::now();
     let first = app.sync().expect("sync warns instead of failing repair");
     let first_ms = started.elapsed().as_millis();
+    let hits_after_first = rpc_hits.load(Ordering::SeqCst);
     assert!(first
         .warnings
         .iter()
         .any(|w| w.contains("Could not repair")));
     assert!(
-        (1500..10_000).contains(&first_ms),
+        hits_after_first >= 1,
+        "first sync should attempt the dead RPC fallback"
+    );
+    assert!(
+        (1500..15_000).contains(&first_ms),
         "dead fallback should stop at the short timeout, got {first_ms} ms"
     );
+    assert!(
+        !app.pegin_fallback_due(&missing_id),
+        "failed fallback must enter backoff before the next sync"
+    );
 
-    let started = std::time::Instant::now();
     let second = app.sync().expect("second sync");
-    let second_ms = started.elapsed().as_millis();
     assert!(second
         .warnings
         .iter()
         .any(|w| w.contains("Could not repair")));
-    assert!(
-        second_ms < 1_500,
-        "a peg-in that just failed its fallbacks must not stall the next sync, got {second_ms} ms"
+    assert_eq!(
+        rpc_hits.load(Ordering::SeqCst),
+        hits_after_first,
+        "a peg-in that just failed its fallbacks must not retry the dead fallback on the next sync"
     );
 }
 

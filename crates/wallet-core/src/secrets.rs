@@ -364,27 +364,25 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             ));
         }
         let blob = fs::read(&self.path).map_err(|e| WalletError::SecretStore(e.to_string()))?;
-        let mut opened = Self::open(passphrase, &blob)?;
+        let opened = Self::open(passphrase, &blob)?;
         if opened.legacy {
-            // Transparent v1 → v2 upgrade: fresh random sealing key, stronger KDF.
-            // Only adopt the new key once the rewritten file verifies; on any
-            // failure keep the legacy key so the on-disk v1 file stays usable.
-            let mut new_key = Zeroizing::new([0u8; KEY_LEN]);
-            rand::thread_rng().fill_bytes(&mut *new_key);
-            let upgraded = Self::seal(passphrase, &opened.mnemonic, &new_key).and_then(|blob2| {
-                let check = Self::open(passphrase, &blob2)?;
-                if check.mnemonic.trim() != opened.mnemonic.trim() {
-                    return Err(WalletError::SecretStore("upgrade verify failed".into()));
-                }
-                write_bytes(&self.path, &blob2)
-            });
+            // Transparent v1 → v2 upgrade: stronger KDF, preserving the existing
+            // sealing key so already-sealed MWEB files continue to open.
+            let upgraded =
+                Self::seal(passphrase, &opened.mnemonic, &opened.sealing_key).and_then(|blob2| {
+                    let check = Self::open(passphrase, &blob2)?;
+                    if check.mnemonic.trim() != opened.mnemonic.trim()
+                        || *check.sealing_key != *opened.sealing_key
+                    {
+                        return Err(WalletError::SecretStore("upgrade verify failed".into()));
+                    }
+                    write_bytes(&self.path, &blob2)
+                });
             match upgraded {
                 Ok(()) => {
-                    opened.sealing_key = new_key;
                     eprintln!("secret store: upgraded mnemonic file to v2 format");
                 }
                 Err(e) => {
-                    drop(new_key);
                     eprintln!("secret store: v2 upgrade failed, staying on v1 ({e})");
                 }
             }

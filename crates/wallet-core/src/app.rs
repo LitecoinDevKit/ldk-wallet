@@ -5095,7 +5095,6 @@ fn prepare_transfer(
         req.to_account_index,
         req.chain,
         state.network,
-        state.mweb_scheme,
         mode,
         park,
     )?;
@@ -5199,7 +5198,6 @@ fn reveal_dest_address(
     to_account: u32,
     chain: SplitChain,
     network: WalletNetwork,
-    mweb_scheme: MwebScheme,
     mode: DestAddressMode,
     park: &mut AccountPark,
 ) -> Result<String, WalletError> {
@@ -5240,11 +5238,12 @@ fn reveal_dest_address(
             Ok(address)
         }
         SplitChain::Private => {
+            let dest_meta = meta::read_meta(&account_dir)?;
             let mut mweb = MwebRuntime::open(
                 &account_dir,
                 secret,
                 network,
-                mweb_scheme.to_master_scheme(),
+                dest_meta.mweb_scheme.to_master_scheme(),
                 to_account,
                 sealing_key,
             )?;
@@ -5370,7 +5369,6 @@ fn prepare_transfer_broadcast(
                 req.to_account_index,
                 req.chain,
                 state.network,
-                state.mweb_scheme,
                 DestAddressMode::CommitNext,
                 park,
             )?;
@@ -5409,7 +5407,6 @@ fn prepare_transfer_broadcast(
                 req.to_account_index,
                 req.chain,
                 state.network,
-                state.mweb_scheme,
                 DestAddressMode::CommitNext,
                 park,
             )?;
@@ -6877,7 +6874,6 @@ fn hop_from_prepared(hop: &mweb::PreparedHop, local_applied: bool) -> churn::Arm
         fee_sats: hop.fee_sats,
         local_applied,
         broadcast: false,
-        created_coin: serde_json::to_value(&hop.created).ok(),
     }
 }
 
@@ -7247,22 +7243,24 @@ fn apply_pending_local(state: &mut WalletState) -> Result<(), WalletError> {
     if !hop.broadcast || hop.local_applied {
         return Ok(());
     }
-    let Some(coin_json) = hop.created_coin.clone() else {
+    if hop.raw_hex.is_empty() {
         return Ok(());
-    };
+    }
+    let raw_hex = hop.raw_hex.clone();
     let wtxid = hop.wtxid.clone();
     let spent = hop.spent_output_id.clone();
     let created_id = hop.created_output_id.clone();
+    let receive_index = hop.receive_index;
     let fee = hop.fee_sats;
     let from_pegin = churn::read_job(&state.data_dir)?
         .map(|job| job.from_pegin)
         .unwrap_or(false);
-    let created = mweb::coin_from_value(&coin_json)?;
     let data_dir = state.data_dir.clone();
     let mweb = state
         .mweb
         .as_mut()
         .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+    let created = mweb::recover_hop_output_coin(mweb, &raw_hex, &created_id, receive_index)?;
     mweb::apply_prepared_output(mweb, &wtxid, &spent, created, fee)?;
     mweb.persist(&data_dir)?;
     mweb_frozen::set_locked(&data_dir, &spent, false)?;
@@ -7827,7 +7825,6 @@ mod tests {
                 fee_sats: 50_000,
                 local_applied: false,
                 broadcast: false,
-                created_coin: None,
             }],
             armed_index: 0,
             armed_at_unix: churn::unix_now(),
@@ -7893,7 +7890,6 @@ mod tests {
                     fee_sats: 50_000,
                     local_applied: true,
                     broadcast: false,
-                    created_coin: None,
                 }],
                 armed_index: 0,
                 armed_at_unix: churn::unix_now(),

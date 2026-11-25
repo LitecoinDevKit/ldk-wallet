@@ -765,8 +765,6 @@ impl MwebRuntime {
         let master = secret.master_xprv_guarded(bdk_net)?;
         let keys = master_keys_for_account(&master, scheme, account, &secp)?;
         drop(master);
-        let book = AddressBook::from_keys(&keys, MWEB_GAP_LIMIT, &secp)
-            .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
         let key_ref = sealing_key.as_deref();
         let saved_counter = if key_ref.is_some() {
@@ -779,10 +777,13 @@ impl MwebRuntime {
         let (receive_index, index_counter) = load_receive_index(data_dir, key_ref, saved_counter)?;
         let (history, history_counter) = load_history(data_dir, key_ref, saved_counter)?;
 
-        let v2_counters: Vec<u64> = [coins_counter, sync_counter, index_counter, history_counter]
-            .into_iter()
-            .flatten()
-            .collect();
+        let all_counters = [coins_counter, sync_counter, index_counter, history_counter];
+        if key_ref.is_some() && saved_counter > 0 && all_counters.iter().any(Option::is_none) {
+            return Err(WalletError::Mweb(format!(
+                "sealed MWEB files missing v2 persist counter (seal counter {saved_counter})"
+            )));
+        }
+        let v2_counters: Vec<u64> = all_counters.into_iter().flatten().collect();
         if let (Some(&min_c), Some(&max_c)) = (v2_counters.iter().min(), v2_counters.iter().max()) {
             // A kill mid-persist leaves at most a 1-step split ({C, C+1}) across the
             // four blobs. A wider gap means an individual file was rolled back.
@@ -793,6 +794,21 @@ impl MwebRuntime {
             }
         }
         let loaded_seal_counter = v2_counters.into_iter().fold(saved_counter, u64::max);
+
+        let max_coin_index = store
+            .db()
+            .unspent()
+            .chain(store.db().spent_coins())
+            .filter(|c| c.address_index != CHANGE_ADDRESS_INDEX)
+            .map(|c| c.address_index)
+            .max()
+            .unwrap_or(0);
+        let initial_gap = receive_index
+            .max(max_coin_index)
+            .saturating_add(MWEB_GAP_LIMIT)
+            .saturating_add(1);
+        let book = AddressBook::from_keys(&keys, initial_gap, &secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
         Ok(Self {
             store,
@@ -812,6 +828,15 @@ impl MwebRuntime {
             sealing_key,
             secp,
         })
+    }
+
+    pub fn ensure_address_book_covers(&mut self, max_index: u32) -> Result<(), WalletError> {
+        let needed = max_index.saturating_add(MWEB_GAP_LIMIT).saturating_add(1);
+        if self.book.gap_limit() < needed {
+            self.book = AddressBook::from_keys(&self.keys, needed, &self.secp)
+                .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn persist(&mut self, data_dir: &Path) -> Result<(), WalletError> {
@@ -890,6 +915,7 @@ impl MwebRuntime {
 
     pub fn advance_receive_index(&mut self) {
         self.receive_index = self.receive_index.saturating_add(1);
+        let _ = self.ensure_address_book_covers(self.receive_index);
     }
 
     /// Tip-only LIP sync. On peer failure, mark stale and keep transparent usable.
@@ -1550,6 +1576,17 @@ impl MwebRuntime {
         for id in hold_spent {
             let _ = self.store.db_mut().mark_spent(id);
         }
+        if let Some(max_coin_idx) = self
+            .store
+            .db()
+            .unspent()
+            .filter(|c| c.address_index != CHANGE_ADDRESS_INDEX)
+            .map(|c| c.address_index)
+            .max()
+        {
+            self.receive_index = self.receive_index.max(max_coin_idx.saturating_add(1));
+        }
+        let _ = self.ensure_address_book_covers(self.receive_index);
         self.absorb_received_coins();
         let leafset = self.sync_state.leafset.clone();
         update_outgoing_confirmations_after_scan(
@@ -3971,6 +4008,7 @@ pub fn wipe_mweb_files(data_dir: &Path) -> Result<(), WalletError> {
         meta::mweb_coins_enc_path(data_dir),
         meta::mweb_sync_enc_path(data_dir),
         meta::mweb_index_enc_path(data_dir),
+        meta::mweb_seal_counter_path(data_dir),
         crate::broadcast_peers::path(data_dir),
     ] {
         match fs::remove_file(&path) {
@@ -4119,6 +4157,11 @@ fn load_store(
             }
             .map_err(|e| WalletError::Mweb(format!("sealed MWEB store: {e}")))?;
             return Ok((MwebStore::from_changeset(cs.clone()), cs, counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB store {} (seal counter {min_counter})",
+                path.display()
+            )));
         }
     }
     let path = meta::mweb_db_path(data_dir);
@@ -4154,15 +4197,16 @@ fn load_sync_state(
     min_counter: u64,
 ) -> Result<(SyncState, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_sync_enc_path(data_dir),
-            key,
-            SealContext::SyncState,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_sync_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::SyncState, min_counter)? {
             let state = serde_json::from_slice(&opened.plain)
                 .map_err(|e| WalletError::Mweb(e.to_string()))?;
             return Ok((state, opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB sync state {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     let path = meta::mweb_sync_path(data_dir);
@@ -4188,14 +4232,15 @@ fn load_receive_index(
     min_counter: u64,
 ) -> Result<(u32, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_index_enc_path(data_dir),
-            key,
-            SealContext::Index,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_index_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::Index, min_counter)? {
             let s = String::from_utf8_lossy(&opened.plain);
             return Ok((s.trim().parse().unwrap_or(0), opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB receive index {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     let path = meta::mweb_index_path(data_dir);
@@ -4220,15 +4265,16 @@ fn load_history(
     min_counter: u64,
 ) -> Result<(MwebHistory, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_history_enc_path(data_dir),
-            key,
-            SealContext::History,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_history_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::History, min_counter)? {
             let history = serde_json::from_slice(&opened.plain)
                 .map_err(|e| WalletError::Mweb(e.to_string()))?;
             return Ok((history, opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB history {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     Ok((MwebHistory::load(&meta::mweb_history_path(data_dir))?, None))
@@ -5726,6 +5772,7 @@ pub fn sign_mweb_split(
     // Advance and persist receive_index only after building & signing succeed,
     // still before returning to the caller for broadcast.
     runtime.receive_index = start.saturating_add(recipient_amounts.len() as u32);
+    let _ = runtime.ensure_address_book_covers(runtime.receive_index);
     if let Err(e) = runtime.persist(data_dir) {
         runtime.receive_index = start;
         return Err(e);
@@ -5875,6 +5922,7 @@ pub fn sign_self_spend_hops(
     }
 
     runtime.receive_index = start.saturating_add(hops);
+    let _ = runtime.ensure_address_book_covers(runtime.receive_index);
     if let Err(e) = runtime.persist(data_dir) {
         runtime.receive_index = start;
         return Err(e);
@@ -6135,8 +6183,57 @@ pub fn drop_unbroadcast_output(runtime: &mut MwebRuntime, wtxid: &str, created_o
     runtime.history.forget_ids(&[wtxid.to_string()]);
 }
 
-pub fn coin_from_value(value: &serde_json::Value) -> Result<bdk_mweb::MwebCoin, WalletError> {
-    serde_json::from_value(value.clone()).map_err(|e| WalletError::Mweb(e.to_string()))
+/// Recover the owned `MwebCoin` for a prepared self-spend hop from its consensus
+/// transaction hex while the wallet is unlocked.
+pub fn recover_hop_output_coin(
+    runtime: &mut MwebRuntime,
+    raw_hex: &str,
+    created_output_id: &str,
+    receive_index: u32,
+) -> Result<bdk_mweb::MwebCoin, WalletError> {
+    if raw_hex.is_empty() {
+        return Err(WalletError::Mweb(
+            "armed hop raw transaction is empty".into(),
+        ));
+    }
+    let expected_id = decode_output_id(created_output_id).ok_or_else(|| {
+        WalletError::BuildTx(format!(
+            "invalid MWEB output id '{created_output_id}' (expected 32-byte hex)"
+        ))
+    })?;
+    let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let mw = tx
+        .mw_tx
+        .as_ref()
+        .ok_or_else(|| WalletError::Mweb("armed hop transaction has no MWEB payload".into()))?;
+    let output = mw
+        .body
+        .outputs
+        .iter()
+        .find(|out| bdk_mweb::output_id(out) == expected_id)
+        .ok_or_else(|| {
+            WalletError::Mweb(format!(
+                "armed hop transaction does not contain output {created_output_id}"
+            ))
+        })?;
+    runtime.ensure_address_book_covers(receive_index)?;
+    let mut coin =
+        bdk_mweb::scan::rewind_output(&runtime.keys, &runtime.book, output, &runtime.secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?
+            .ok_or_else(|| {
+                WalletError::Mweb(format!(
+                    "armed hop output {created_output_id} does not rewind to this wallet"
+                ))
+            })?;
+    if coin.address_index != receive_index {
+        return Err(WalletError::Mweb(format!(
+            "armed hop output address_index {} does not match expected {receive_index}",
+            coin.address_index
+        )));
+    }
+    coin.block_height = None;
+    Ok(coin)
 }
 
 /// Signed peg-out, not yet broadcast and not yet applied to the coin set.

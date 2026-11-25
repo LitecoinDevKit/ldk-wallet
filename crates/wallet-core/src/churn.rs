@@ -1254,9 +1254,6 @@ pub struct ArmedHop {
     pub local_applied: bool,
     #[serde(default)]
     pub broadcast: bool,
-    /// Spend secrets for the created output, inserted into the coin db at broadcast.
-    #[serde(default)]
-    pub created_coin: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for ArmedHop {
@@ -1278,10 +1275,6 @@ impl std::fmt::Debug for ArmedHop {
             .field("fee_sats", &self.fee_sats)
             .field("local_applied", &self.local_applied)
             .field("broadcast", &self.broadcast)
-            .field(
-                "created_coin",
-                &self.created_coin.as_ref().map(|_| "<redacted>"),
-            )
             .finish()
     }
 }
@@ -1324,7 +1317,7 @@ impl ArmedRecord {
     }
 }
 
-/// Drop the raw transaction and the created-coin secrets from this hop onward.
+/// Drop the raw transaction from this hop onward.
 pub fn wipe_raw_tail(record: &mut ArmedRecord) {
     use zeroize::Zeroize;
     let start = record.armed_index as usize;
@@ -1333,10 +1326,6 @@ pub fn wipe_raw_tail(record: &mut ArmedRecord) {
             continue;
         }
         hop.raw_hex.zeroize();
-        if let Some(ref mut coin_val) = hop.created_coin {
-            crate::redact::zeroize_json_value(coin_val);
-        }
-        hop.created_coin = None;
     }
     record.expired = true;
     record.send_after = None;
@@ -2556,7 +2545,6 @@ mod tests {
             fee_sats: 50_000,
             local_applied: false,
             broadcast: false,
-            created_coin: None,
         };
         let mut record = ArmedRecord {
             version: 1,
@@ -2589,7 +2577,6 @@ mod tests {
             fee_sats: 50_000,
             local_applied: false,
             broadcast: false,
-            created_coin: None,
         });
         assert!(record.hops_remaining());
         assert!(arm_next(&mut record, 99, 30));
@@ -2652,12 +2639,6 @@ mod tests {
                 fee_sats: 50_000,
                 local_applied: true,
                 broadcast: false,
-                created_coin: Some(serde_json::json!({
-                    "output_id": "22".repeat(32),
-                    "blind": "aa".repeat(32),
-                    "shared_secret": "bb".repeat(32),
-                    "spend_key": "cc".repeat(32),
-                })),
             }],
             armed_index: 0,
             armed_at_unix: 1,
@@ -2669,15 +2650,11 @@ mod tests {
         };
         let dbg = format!("{record:?}");
         assert!(
-            !dbg.contains("deadbeefcafebabe")
-                && !dbg.contains(&"aa".repeat(32))
-                && !dbg.contains(&"bb".repeat(32))
-                && !dbg.contains(&"cc".repeat(32)),
-            "ArmedHop Debug leaked raw_hex or created_coin spend secrets: {dbg}"
+            !dbg.contains("deadbeefcafebabe"),
+            "ArmedHop Debug leaked raw_hex: {dbg}"
         );
         wipe_raw_tail(&mut record);
         assert!(record.hops[0].raw_hex.is_empty());
-        assert!(record.hops[0].created_coin.is_none());
     }
 
     fn hop(spent_output_id: &str, local_applied: bool, broadcast: bool) -> ArmedHop {
@@ -2691,7 +2668,6 @@ mod tests {
             fee_sats: 50_000,
             local_applied,
             broadcast,
-            created_coin: None,
         }
     }
 

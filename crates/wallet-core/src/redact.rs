@@ -9,7 +9,6 @@
 //! - Runs of 12+ BIP39/aezeed wordlist words -> `[redacted-mnemonic]`
 
 use bdk_wallet::keys::bip39::Language;
-use zeroize::Zeroize;
 
 const XPRV_PREFIXES: &[&str] = &[
     "xprv", "yprv", "zprv", "Yprv", "Zprv", "tprv", "uprv", "vprv", "Uprv", "Vprv", "Ltpv", "Mtpv",
@@ -265,26 +264,6 @@ fn scrub_mnemonic_runs(input: &str) -> String {
     }
     out.push_str(&input[cursor..]);
     out
-}
-
-/// Recursively zeroize string buffers inside a `serde_json::Value` before dropping it.
-pub(crate) fn zeroize_json_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(s) => s.zeroize(),
-        serde_json::Value::Array(items) => {
-            for item in items.iter_mut() {
-                zeroize_json_value(item);
-            }
-            items.clear();
-        }
-        serde_json::Value::Object(map) => {
-            for (_, v) in map.iter_mut() {
-                zeroize_json_value(v);
-            }
-            map.clear();
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
 }
 
 #[cfg(test)]

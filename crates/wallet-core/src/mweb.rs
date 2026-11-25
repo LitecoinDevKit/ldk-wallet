@@ -265,9 +265,11 @@ struct CrossProbeSpec<'scope, 'env> {
     policy: PeerPolicy,
     cancel: Option<&'env std::sync::atomic::AtomicBool>,
     pending_lock: Option<&'env std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&'env std::sync::atomic::AtomicU64, u64)>,
     pass_aborted: &'env std::sync::atomic::AtomicBool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn probe_cross_check_peers(
     backup_addrs: Vec<std::net::SocketAddr>,
     tip_hash: bdk_wallet::bitcoin::BlockHash,
@@ -275,11 +277,12 @@ fn probe_cross_check_peers(
     policy: PeerPolicy,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     pending_lock: Option<&std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     pass_aborted: &std::sync::atomic::AtomicBool,
 ) -> PreProbedCrossCheck {
     let mut probed = Vec::new();
     for addr in backup_addrs {
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock)
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
             || pass_aborted.load(std::sync::atomic::Ordering::Acquire)
         {
             break;
@@ -301,7 +304,7 @@ fn probe_cross_check_peers(
                 continue;
             }
         };
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock)
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
             || pass_aborted.load(std::sync::atomic::Ordering::Acquire)
         {
             break;
@@ -352,6 +355,7 @@ struct CancellableMwebPeer<'scope, 'env> {
     inner: TcpMwebPeer,
     cancel: Option<&'env std::sync::atomic::AtomicBool>,
     pending_lock: Option<&'env std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&'env std::sync::atomic::AtomicU64, u64)>,
     probe_spec: Option<CrossProbeSpec<'scope, 'env>>,
     probe_handle: Option<std::thread::ScopedJoinHandle<'scope, PreProbedCrossCheck>>,
     last_progress_at: std::time::Instant,
@@ -363,14 +367,16 @@ impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
     fn is_cancelled(
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> bool {
         use std::sync::atomic::Ordering;
         cancel.is_some_and(|c| c.load(Ordering::Acquire))
             || pending_lock.is_some_and(|p| p.load(Ordering::Acquire))
+            || epoch_check.is_some_and(|(cur, start)| cur.load(Ordering::Acquire) != start)
     }
 
     fn check_cancel(&self) -> Result<(), bdk_mweb::Error> {
-        if Self::is_cancelled(self.cancel, self.pending_lock) {
+        if Self::is_cancelled(self.cancel, self.pending_lock, self.epoch_check) {
             Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()))
         } else {
             Ok(())
@@ -391,6 +397,7 @@ impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
                     spec.policy,
                     spec.cancel,
                     spec.pending_lock,
+                    spec.epoch_check,
                     spec.pass_aborted,
                 )
             }));
@@ -463,12 +470,13 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
         self.check_cancel()?;
         let cancel = self.cancel;
         let pending_lock = self.pending_lock;
+        let epoch_check = self.epoch_check;
         for chunk in reqs.chunks(PIPELINE_WINDOW_BATCHES.max(1)) {
             self.check_cancel()?;
             let last_progress_at = &mut self.last_progress_at;
             let mut callback_err = false;
             let res = self.inner.get_utxos_pipelined(chunk, &mut |batch| {
-                if Self::is_cancelled(cancel, pending_lock) {
+                if Self::is_cancelled(cancel, pending_lock, epoch_check) {
                     return Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
                 }
                 if !batch.utxos.is_empty() {
@@ -946,6 +954,7 @@ impl MwebRuntime {
             hold_spent,
             None,
             None,
+            None,
         )
     }
 
@@ -961,6 +970,7 @@ impl MwebRuntime {
         hold_spent: &BTreeSet<[u8; 32]>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> Result<(), WalletError> {
         let configured = resolve_reachable_peers(peers)?;
         let mut configured_failure = None;
@@ -975,6 +985,7 @@ impl MwebRuntime {
                 hold_spent,
                 cancel,
                 pending_lock,
+                epoch_check,
             ) {
                 Ok(pre_probed) => {
                     let mut candidates = configured;
@@ -988,11 +999,12 @@ impl MwebRuntime {
                         pre_probed,
                         cancel,
                         pending_lock,
+                        epoch_check,
                     );
                     return Ok(());
                 }
                 Err(outcome) => {
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         return Ok(());
                     }
                     let failure = classify_pass_failure(&outcome.err);
@@ -1007,7 +1019,7 @@ impl MwebRuntime {
                 }
             }
         }
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
             return Ok(());
         }
         // Their own node is absent or down, so fall back to public MWEB peers
@@ -1045,6 +1057,7 @@ impl MwebRuntime {
             hold_spent,
             cancel,
             pending_lock,
+            epoch_check,
         ) {
             Ok(pre_probed) => {
                 self.last_status.push_str(" via public peer");
@@ -1055,11 +1068,12 @@ impl MwebRuntime {
                     pre_probed,
                     cancel,
                     pending_lock,
+                    epoch_check,
                 );
                 Ok(())
             }
             Err(first) => {
-                if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                     return Ok(());
                 }
                 // When Electrum sees a brand-new block 1–2s before P2P gossip,
@@ -1076,7 +1090,7 @@ impl MwebRuntime {
                     if !backoff.is_zero() {
                         std::thread::sleep(backoff);
                     }
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         return Ok(());
                     }
                     if let Ok(pre_probed) = self.sync_pass(
@@ -1089,6 +1103,7 @@ impl MwebRuntime {
                         hold_spent,
                         cancel,
                         pending_lock,
+                        epoch_check,
                     ) {
                         self.last_status.push_str(" via public peer");
                         self.cross_check_leafset(
@@ -1098,6 +1113,7 @@ impl MwebRuntime {
                             pre_probed,
                             cancel,
                             pending_lock,
+                            epoch_check,
                         );
                         return Ok(());
                     }
@@ -1124,6 +1140,7 @@ impl MwebRuntime {
                             hold_spent,
                             cancel,
                             pending_lock,
+                            epoch_check,
                         ) {
                             self.last_status.push_str(" via public peer");
                             self.cross_check_leafset(
@@ -1133,6 +1150,7 @@ impl MwebRuntime {
                                 pre_probed,
                                 cancel,
                                 pending_lock,
+                                epoch_check,
                             );
                             return Ok(());
                         }
@@ -1152,6 +1170,7 @@ impl MwebRuntime {
     /// internally consistent but stale/forged header + leafset; agreement from
     /// a second peer means omission now requires collusion. Only headers are
     /// requested, so the peers learn nothing about the wallet.
+    #[allow(clippy::too_many_arguments)]
     fn cross_check_leafset(
         &mut self,
         tip_hash: bdk_wallet::bitcoin::BlockHash,
@@ -1160,6 +1179,7 @@ impl MwebRuntime {
         pre_probed: Option<PreProbedCrossCheck>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) {
         self.cross_check_warning = None;
         if self.sync_state.leafset.is_empty() {
@@ -1225,7 +1245,9 @@ impl MwebRuntime {
         }
 
         for addr in distinct {
-            if confirmed >= 2 || CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+            if confirmed >= 2
+                || CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
+            {
                 break;
             }
             if already_probed.contains(&addr) {
@@ -1318,6 +1340,7 @@ impl MwebRuntime {
         hold_spent: &BTreeSet<[u8; 32]>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> Result<Option<PreProbedCrossCheck>, SyncPassFailure> {
         let pass_started = std::time::Instant::now();
         // Heal before this pass so a stuck split/send is included in the
@@ -1364,7 +1387,7 @@ impl MwebRuntime {
         let mut last_err: Option<bdk_mweb::Error> = None;
 
         for (idx, addr) in addrs.iter().copied().enumerate() {
-            if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+            if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                 last_err = Some(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
                 break;
             }
@@ -1416,6 +1439,7 @@ impl MwebRuntime {
                         inner: tcp_peer,
                         cancel,
                         pending_lock,
+                        epoch_check,
                         probe_spec: (!backup_addrs.is_empty()).then_some(CrossProbeSpec {
                             scope,
                             backup_addrs,
@@ -1424,6 +1448,7 @@ impl MwebRuntime {
                             policy: probe_policy,
                             cancel,
                             pending_lock,
+                            epoch_check,
                             pass_aborted: &pass_aborted,
                         }),
                         probe_handle: None,
@@ -1482,7 +1507,7 @@ impl MwebRuntime {
                     return Ok(pre_probed);
                 }
                 Err(e) => {
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         last_err = Some(e);
                         break;
                     }
@@ -1516,7 +1541,7 @@ impl MwebRuntime {
             }
         }
 
-        if !CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+        if !CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
             crate::discovery::evict_peers(&hard_failed);
             crate::discovery::demote_peers(&lagging);
         }
@@ -4530,7 +4555,7 @@ pub(crate) fn broadcast_mweb_tx(
     let rpc_first = route.rpc_first();
     let mut own_node_err = None;
     if let Some(url) = rpc_first {
-        match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
+        match rpc::send_raw_transaction_for_network(url, &serialize_hex(tx), Some(route.network)) {
             Ok(_) => {
                 crate::diag::log("MWEB broadcast: sent through your own node (Settings opt-in)");
                 return Ok(());
@@ -4606,7 +4631,7 @@ pub(crate) fn broadcast_mweb_tx(
              check your connection, or set a Litecoin RPC URL in Settings"
         )));
     };
-    match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
+    match rpc::send_raw_transaction_for_network(url, &serialize_hex(tx), Some(route.network)) {
         Ok(_) => {
             crate::diag::log(format!(
                 "MWEB broadcast: fell back to litecoind RPC ({p2p_err})"
@@ -5540,10 +5565,35 @@ pub fn find_output_leaf(
     };
     let bdk_net = network.to_bitcoin_network();
     let policy = peer_policy_for_pool(addrs.len().max(2));
+    let verify_mode = bdk_mweb::lip0006::VerifyMode::default();
     for addr in addrs {
         let Ok(mut peer) = TcpMwebPeer::connect_with_policy(*addr, bdk_net, policy) else {
             continue;
         };
+        let Ok(hdr_msg) = MwebUtxoSource::get_header(&mut peer, tip_hash) else {
+            continue;
+        };
+        if verify_mode.is_anchored() && hdr_msg.verify_anchored(tip_hash).is_err() {
+            continue;
+        }
+        let mweb_header = hdr_msg.mweb_header;
+        if mweb_header.output_mmr_size < end_output_mmr {
+            continue;
+        }
+        let Ok(leafset) = MwebUtxoSource::get_leafset(&mut peer, tip_hash) else {
+            continue;
+        };
+        if bdk_mweb::pmmr::verify_leafset_at(
+            &leafset,
+            tip_hash,
+            &mweb_header.leafset_root,
+            mweb_header.output_mmr_size,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
         let mut start = start_index;
         let mut covered = true;
         for _ in 0..4 {
@@ -5557,26 +5607,72 @@ pub fn find_output_leaf(
                 covered = false;
                 break;
             };
-            if batch.output_format != OUTPUT_FORMAT_FULL {
+            if batch.block_hash != tip_hash || batch.output_format != OUTPUT_FORMAT_FULL {
                 covered = false;
                 break;
             }
             if batch.utxos.is_empty() {
+                if (start..end_output_mmr).any(|idx| leafset_has_leaf(&leafset.leafset, idx)) {
+                    covered = false;
+                    break;
+                }
                 return ChainLeaf::Absent;
             }
-            for entry in &batch.utxos {
-                if bdk_mweb::scan::output_id(&entry.output) == want {
-                    return ChainLeaf::Found(entry.leaf_index);
-                }
+            if bdk_mweb::lip0006::check_batch_advances(&batch, start).is_err()
+                || bdk_mweb::pmmr::verify_utxo_batch(&batch, &leafset, &mweb_header).is_err()
+            {
+                covered = false;
+                break;
             }
+            if mweb_header.output_mmr_size == end_output_mmr
+                && batch.utxos.iter().any(|e| e.leaf_index >= end_output_mmr)
+            {
+                covered = false;
+                break;
+            }
+            // Check no unspent leaf in `[start, min(end_output_mmr, last + 1))` was omitted
             let last = batch
                 .utxos
                 .last()
                 .map(|entry| entry.leaf_index)
                 .unwrap_or(start);
+            let checked_end = last.saturating_add(1).min(end_output_mmr);
+            let mut batch_idx = 0usize;
+            let mut omitted = false;
+            for idx in start..checked_end {
+                if leafset_has_leaf(&leafset.leafset, idx) {
+                    if batch.utxos.get(batch_idx).map(|e| e.leaf_index) == Some(idx) {
+                        batch_idx += 1;
+                    } else {
+                        omitted = true;
+                        break;
+                    }
+                }
+            }
+            if omitted {
+                covered = false;
+                break;
+            }
+            for entry in &batch.utxos {
+                if entry.leaf_index < start || entry.leaf_index >= end_output_mmr {
+                    continue;
+                }
+                if bdk_mweb::scan::output_id(&entry.output) == want {
+                    return ChainLeaf::Found(entry.leaf_index);
+                }
+            }
             if (batch.utxos.len() as u16) < MAX_REQUESTED_MWEB_UTXOS
                 || last.saturating_add(1) >= end_output_mmr
             {
+                let remaining_start = last.saturating_add(1);
+                if (batch.utxos.len() as u16) < MAX_REQUESTED_MWEB_UTXOS
+                    && remaining_start < end_output_mmr
+                    && (remaining_start..end_output_mmr)
+                        .any(|idx| leafset_has_leaf(&leafset.leafset, idx))
+                {
+                    covered = false;
+                    break;
+                }
                 return ChainLeaf::Absent;
             }
             start = last.saturating_add(1);
@@ -6124,13 +6220,24 @@ pub fn tally_cover(
 ///
 /// A transaction counts when it carries an MWEB payload or is a HogEx integration.
 /// Ids in `own` (txid or wtxid) are skipped, including this wallet's other spends.
+#[allow(dead_code)]
 pub fn count_foreign_mweb_mempool(
     rpc_url: &str,
     own: &BTreeSet<String>,
 ) -> Result<CoverRead, WalletError> {
-    let ids = crate::rpc::get_raw_mempool(rpc_url)?;
+    count_foreign_mweb_mempool_for_network(rpc_url, own, None)
+}
+
+/// [`count_foreign_mweb_mempool`] scoped to the active [`WalletNetwork`].
+pub fn count_foreign_mweb_mempool_for_network(
+    rpc_url: &str,
+    own: &BTreeSet<String>,
+    network: Option<WalletNetwork>,
+) -> Result<CoverRead, WalletError> {
+    let ids = crate::rpc::get_raw_mempool_for_network(rpc_url, network)?;
     let txs = ids.iter().map(|txid| {
-        let Ok(hex_tx) = crate::rpc::get_raw_transaction_hex(rpc_url, txid) else {
+        let Ok(hex_tx) = crate::rpc::get_raw_transaction_hex_for_network(rpc_url, txid, network)
+        else {
             return CoverTx::Unreadable;
         };
         let Ok(bytes) = hex::decode(&hex_tx) else {
@@ -7552,6 +7659,7 @@ mod sync_failover_tests {
             &BTreeSet::new(),
             Some(&cancel),
             None,
+            None,
         )
         .expect("cancelled sync_at_tip_cancellable returns Ok");
         assert_eq!(a_connects.load(Ordering::SeqCst), a_before);
@@ -7722,5 +7830,179 @@ mod sync_failover_tests {
             ChainLeaf::Found(forged_leaf_index),
             "find_output_leaf accepted unproven out-of-bounds leaf_index={forged_leaf_index} for window [1, 5)"
         );
+        assert_eq!(got, ChainLeaf::Unread);
+    }
+
+    #[test]
+    fn find_output_leaf_fails_over_from_bad_proof_peer_to_honest_anchored_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = test_runtime(tmp.path());
+        let mut pegin =
+            bdk_mweb::fund_mweb_pegin(&rt.keys, 0, 100_000, 2_100, NetworkKind::Test, &rt.secp)
+                .expect("fund pegin output");
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut pegin, &rt.keys, &rt.secp).unwrap();
+        let pegin_tx = extract_prepared_mweb_pegin(&pegin.psbt).unwrap();
+        let sample_output = pegin_tx.mw_tx.unwrap().body.outputs[0].clone();
+        let oid = bdk_mweb::scan::output_id(&sample_output);
+        let want_hex = hex::encode(oid);
+
+        let mut mmr = bdk_mweb::pmmr::MemMmr::new();
+        assert_eq!(mmr.add_output_id(oid), 0);
+        let output_root = mmr.root();
+        let leafset_bytes = vec![0x80u8];
+        let mweb_header = MwebBlockHeader {
+            height: 200,
+            output_root,
+            kernel_root: [0u8; 32],
+            leafset_root: bdk_mweb::hash::blake3_hash(&leafset_bytes),
+            kernel_offset: [0u8; 32],
+            stealth_offset: [0u8; 32],
+            output_mmr_size: 1,
+            kernel_mmr_size: 0,
+        };
+        let mut spk = vec![0x58u8, 0x20];
+        spk.extend_from_slice(&header_hash(&mweb_header));
+        let filler = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            mw_tx: None,
+            is_hog_ex: false,
+        };
+        let hogex = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            mw_tx: None,
+            is_hog_ex: true,
+        };
+        let txids = vec![filler.compute_txid(), hogex.compute_txid()];
+        let txn = PartialMerkleTree::from_txids(&txids, &[false, true]);
+        let merkle_root = bdk_wallet::bitcoin::merkle_tree::calculate_root(txids.into_iter())
+            .map(|h| TxMerkleNode::from_byte_array(h.to_byte_array()))
+            .unwrap();
+        let header = Header {
+            version: BlockVersion::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root,
+            time: 0,
+            bits: CompactTarget::from_consensus(0),
+            nonce: 99,
+        };
+        let tip_hash = header.block_hash();
+        let hdr_payload = serialize(&MwebHeaderMsg {
+            merkle: MerkleBlock { header, txn },
+            hogex,
+            mweb_header,
+        });
+        let leafset_payload = serialize(&MwebLeafset {
+            block_hash: tip_hash,
+            leafset: leafset_bytes,
+        });
+        let bad_utxos_payload = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 0,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![],
+            parent_hashes: vec![],
+        });
+        let good_utxos_payload = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 0,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![bdk_mweb::p2p::MwebUtxoEntry {
+                leaf_index: 0,
+                output: sample_output,
+            }],
+            parent_hashes: vec![],
+        });
+
+        let spawn_leaf_peer = |hdr_bytes: Vec<u8>, ls_bytes: Vec<u8>, utxos_bytes: Vec<u8>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut buf = Vec::new();
+                    let Some(first) = read_msg(&mut stream, &mut buf) else {
+                        return;
+                    };
+                    if !matches!(first.payload(), NetworkMessage::Version(_)) {
+                        return;
+                    }
+                    let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                    let ver = VersionMessage::new(
+                        ServiceFlags::from(NODE_MWEB_LIGHT_CLIENT),
+                        0,
+                        Address::new(&dummy_addr, ServiceFlags::NONE),
+                        Address::new(&dummy_addr, ServiceFlags::NONE),
+                        1,
+                        "/mock-mweb:0.1/".into(),
+                        200,
+                    );
+                    let _ = send_msg(&mut stream, NetworkMessage::Version(ver));
+                    let _ = send_msg(&mut stream, NetworkMessage::Verack);
+                    while let Some(msg) = read_msg(&mut stream, &mut buf) {
+                        match msg.into_payload() {
+                            NetworkMessage::GetData(inv) => {
+                                for item in inv {
+                                    if let Inventory::Unknown { inv_type, .. } = item {
+                                        if inv_type == MSG_MWEB_HEADER {
+                                            let _ =
+                                                send_raw_cmd(&mut stream, "mwebheader", &hdr_bytes);
+                                        } else if inv_type == MSG_MWEB_LEAFSET {
+                                            let _ =
+                                                send_raw_cmd(&mut stream, "mwebleafset", &ls_bytes);
+                                        }
+                                    }
+                                }
+                            }
+                            NetworkMessage::Unknown { command, .. }
+                                if command.as_ref() == "getmwebutxos" =>
+                            {
+                                let _ = send_raw_cmd(&mut stream, "mwebutxos", &utxos_bytes);
+                            }
+                            NetworkMessage::Ping(nonce)
+                                if !send_msg(&mut stream, NetworkMessage::Pong(nonce)) =>
+                            {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            addr
+        };
+
+        // Bad peer claims empty UTXOs despite leaf 0 being set in leafset; good peer proves leaf 0.
+        let bad_peer = spawn_leaf_peer(
+            hdr_payload.clone(),
+            leafset_payload.clone(),
+            bad_utxos_payload,
+        );
+        let good_peer = spawn_leaf_peer(hdr_payload, leafset_payload, good_utxos_payload);
+
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let got = find_output_leaf(
+            &[bad_peer, good_peer],
+            WalletNetwork::Testnet,
+            tip_hash,
+            0,
+            1,
+            &want_hex,
+        );
+        TEST_PEER_POLICY.with(|c| c.set(None));
+
+        assert_eq!(got, ChainLeaf::Found(0));
     }
 }

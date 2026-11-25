@@ -6,6 +6,9 @@ pub enum WalletError {
     #[error("wallet already exists at data directory")]
     AlreadyExists,
 
+    #[error("wallet directory is already open in another process")]
+    AlreadyOpen,
+
     #[error("wallet not found at data directory")]
     NotFound,
 

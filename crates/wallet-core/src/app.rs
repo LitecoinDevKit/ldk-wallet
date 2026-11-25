@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bdk_electrum::electrum_client::ElectrumApi;
@@ -558,6 +558,34 @@ struct DetachedMwebDone {
     mweb_wall_ms: u64,
 }
 
+struct BroadcastFlightGuard<'a> {
+    app: &'a WalletApp,
+}
+
+impl<'a> BroadcastFlightGuard<'a> {
+    fn new(app: &'a WalletApp) -> Self {
+        app.in_flight_broadcasts.fetch_add(1, Ordering::AcqRel);
+        Self { app }
+    }
+}
+
+impl Drop for BroadcastFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.app.in_flight_broadcasts.fetch_sub(1, Ordering::AcqRel);
+        self.app.mweb_detached_cv.notify_all();
+    }
+}
+
+/// Ephemeral commit credentials captured under `lock_state()` before network
+/// broadcast, so a transaction that already went out on the wire can still
+/// commit its local state change if `lock()` or `park_mweb()` runs mid-broadcast.
+/// Zeroized on drop.
+struct AccountCommitHandle<'a> {
+    secret: MasterSecret,
+    sealing_key: Option<Zeroizing<[u8; 32]>>,
+    _flight: BroadcastFlightGuard<'a>,
+}
+
 /// Application-facing wallet handle. BDK types stay private.
 pub struct WalletApp {
     state: Mutex<Option<WalletState>>,
@@ -585,6 +613,17 @@ pub struct WalletApp {
     mweb_detached: AtomicBool,
     /// Last private balance, served by [`Self::combined_summary`] during detach.
     detached_mweb: Mutex<Option<DetachedMwebView>>,
+    /// Monotonic counter incremented on lock/unlock/wipe so a detached MWEB sync
+    /// from an earlier unlocked session can never reattach into a new session.
+    session_epoch: AtomicU64,
+    /// [`Self::session_epoch`] captured when [`Self::park_mweb`] detached the runtime.
+    detached_mweb_epoch: AtomicU64,
+    /// Account directory whose MWEB runtime is currently detached.
+    detached_mweb_dir: Mutex<Option<PathBuf>>,
+    /// Notified when [`Self::mweb_detached`] clears or [`Self::lock`] runs.
+    mweb_detached_cv: Condvar,
+    /// Number of broadcast-then-commit operations in flight between signing and commit.
+    in_flight_broadcasts: AtomicUsize,
     /// Set when [`Self::lock`] cannot take the state mutex (e.g. sync in flight).
     /// The holder must drop in-memory wallet state before returning.
     pending_lock: AtomicBool,
@@ -604,6 +643,9 @@ pub struct WalletApp {
     /// server, a public explorer) last failed. The sync server is still asked
     /// every pass. Not a secret.
     pegin_repair_fallback_at: Mutex<HashMap<String, std::time::Instant>>,
+    /// Exclusive non-blocking OS directory lock held on `<data_dir>/.wallet.lock`
+    /// while this handle has loaded or parked wallet state.
+    dir_lock: Mutex<Option<mweb_frozen::DirLock>>,
 }
 
 impl WalletApp {
@@ -625,6 +667,11 @@ impl WalletApp {
             transparent_ready: AtomicBool::new(false),
             mweb_detached: AtomicBool::new(false),
             detached_mweb: Mutex::new(None),
+            session_epoch: AtomicU64::new(1),
+            detached_mweb_epoch: AtomicU64::new(0),
+            detached_mweb_dir: Mutex::new(None),
+            mweb_detached_cv: Condvar::new(),
+            in_flight_broadcasts: AtomicUsize::new(0),
             pending_lock: AtomicBool::new(false),
             session: hex::encode(rand::random::<[u8; 16]>()),
             last_good_electrum: Mutex::new(None),
@@ -632,6 +679,26 @@ impl WalletApp {
             last_cross_check: Mutex::new(None),
             insights_endpoint: Mutex::new(None),
             pegin_repair_fallback_at: Mutex::new(HashMap::new()),
+            dir_lock: Mutex::new(None),
+        }
+    }
+
+    fn acquire_dir_lock(&self, data_dir: &Path) -> Result<(), WalletError> {
+        let mut slot = self
+            .dir_lock
+            .lock()
+            .map_err(|_| WalletError::Persist("wallet dir lock poisoned".into()))?;
+        if slot.as_ref().is_some_and(|l| l.matches_dir(data_dir)) {
+            return Ok(());
+        }
+        let lock = mweb_frozen::try_lock_dir(data_dir)?;
+        *slot = Some(lock);
+        Ok(())
+    }
+
+    fn release_dir_lock(&self) {
+        if let Ok(mut slot) = self.dir_lock.lock() {
+            *slot = None;
         }
     }
 
@@ -757,14 +824,36 @@ impl WalletApp {
         }
     }
 
+    fn capture_commit_handle(&self) -> Result<AccountCommitHandle<'_>, WalletError> {
+        let stored = self
+            .secrets
+            .get_mnemonic()?
+            .ok_or(WalletError::MissingMnemonic)?;
+        let secret = MasterSecret::from_stored(&stored)?;
+        let sealing_key = self.secrets.sealing_key();
+        Ok(AccountCommitHandle {
+            secret,
+            sealing_key,
+            _flight: BroadcastFlightGuard::new(self),
+        })
+    }
+
     fn clear_detached_mweb(&self) {
         self.mweb_detached.store(false, Ordering::Release);
+        self.detached_mweb_epoch.store(0, Ordering::Release);
+        if let Ok(mut dir) = self.detached_mweb_dir.lock() {
+            *dir = None;
+        }
         if let Ok(mut slot) = self.detached_mweb.lock() {
             *slot = None;
         }
+        self.mweb_detached_cv.notify_all();
     }
 
     fn detached_mweb_view(&self) -> Option<DetachedMwebView> {
+        if self.secrets.is_locked() || self.pending_lock.load(Ordering::Acquire) {
+            return None;
+        }
         self.detached_mweb.lock().ok().and_then(|slot| slot.clone())
     }
 
@@ -788,6 +877,7 @@ impl WalletApp {
         if state.mweb.is_none() {
             return Ok(None);
         }
+        let account_dir = state.data_dir.clone();
         let transparent = build_summary(state)?;
         let combined = state
             .mweb
@@ -798,6 +888,11 @@ impl WalletApp {
             .mweb
             .take()
             .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
+        let cur_epoch = self.session_epoch.load(Ordering::Acquire);
+        self.detached_mweb_epoch.store(cur_epoch, Ordering::Release);
+        if let Ok(mut dir) = self.detached_mweb_dir.lock() {
+            *dir = Some(account_dir);
+        }
         if let Ok(mut slot) = self.detached_mweb.lock() {
             *slot = Some(DetachedMwebView::from_combined(&combined));
         }
@@ -807,33 +902,67 @@ impl WalletApp {
 
     /// Put a parked runtime back on the same account. A lock that landed while
     /// it was out wins: the runtime is dropped (and wiped) instead of being
-    /// installed into a wallet the user already locked or switched away from.
+    /// installed into a wallet the user already locked or into a later session.
+    /// If the user switched accounts during the same unlocked session, the
+    /// runtime is reattached into [`AccountPark`].
     fn restore_parked_mweb(
         &self,
         account_dir: &Path,
-        runtime: MwebRuntime,
+        mut runtime: MwebRuntime,
     ) -> Result<(), WalletError> {
         let mut guard = match self.lock_state() {
             Ok(guard) => guard,
             Err(err) => {
+                runtime.wipe();
                 self.clear_detached_mweb();
                 drop(runtime);
                 return Err(err);
             }
         };
+        let cur_epoch = self.session_epoch.load(Ordering::Acquire);
+        let detached_epoch = self.detached_mweb_epoch.load(Ordering::Acquire);
+        let dir_matches = self
+            .detached_mweb_dir
+            .lock()
+            .ok()
+            .and_then(|d| d.clone())
+            .is_some_and(|d| d == account_dir);
+        if detached_epoch == 0 || cur_epoch != detached_epoch || !dir_matches {
+            runtime.wipe();
+            self.clear_detached_mweb();
+            drop(runtime);
+            return Err(WalletError::Locked);
+        }
         let Some(state) = guard.as_mut() else {
+            runtime.wipe();
             self.clear_detached_mweb();
             drop(runtime);
             return Err(WalletError::NotLoaded);
         };
-        if state.data_dir != account_dir {
+        if state.data_dir == account_dir {
+            if state.mweb.is_some() {
+                runtime.wipe();
+                self.clear_detached_mweb();
+                drop(runtime);
+                return Err(WalletError::Locked);
+            }
+            state.mweb = Some(runtime);
             self.clear_detached_mweb();
-            drop(runtime);
-            return Err(WalletError::NotLoaded);
+            return Ok(());
         }
-        state.mweb = Some(runtime);
+        if let Ok(mut park) = self.lock_park() {
+            if let Some(parked_state) = park.get_mut_by_dir(account_dir) {
+                if parked_state.mweb.is_none() {
+                    parked_state.mweb = Some(runtime);
+                    self.clear_detached_mweb();
+                    return Ok(());
+                }
+            }
+        }
+        runtime.wipe();
         self.clear_detached_mweb();
-        Ok(())
+        drop(runtime);
+        Err(WalletError::NotLoaded)
     }
 
     fn publish_insights(&self, state: &WalletState) {
@@ -1052,7 +1181,17 @@ impl WalletApp {
         let mut guard = self.lock_state()?;
         let activated = {
             let mut park = self.lock_park()?;
-            activate_parked(&mut guard, &mut park, req.index)?
+            if park.get_mut(req.index).is_some_and(|s| s.mweb.is_none()) {
+                park.drop_index(req.index);
+                None
+            } else if guard
+                .as_ref()
+                .is_some_and(|s| s.account_index == req.index && s.mweb.is_none())
+            {
+                None
+            } else {
+                activate_parked(&mut guard, &mut park, req.index)?
+            }
         };
         if let Some(summary) = activated {
             if let Some(state) = guard.as_ref() {
@@ -1179,25 +1318,21 @@ impl WalletApp {
         req: TransferCoinRequest,
     ) -> Result<TransferCoinResult, WalletError> {
         self.ensure_unlocked()?;
-        let stored = self
-            .secrets
-            .get_mnemonic()?
-            .ok_or(WalletError::MissingMnemonic)?;
-        let secret = MasterSecret::from_stored(&stored)?;
-        let sealing = self.secrets.sealing_key();
-        let prepared = {
+        let (commit_handle, prepared) = {
             let mut guard = self.lock_state()?;
+            let commit_handle = self.capture_commit_handle()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let mut park = self.lock_park()?;
-            prepare_transfer_broadcast(
+            let prepared = prepare_transfer_broadcast(
                 root,
                 state,
-                &secret,
-                sealing,
+                &commit_handle.secret,
+                commit_handle.sealing_key.clone(),
                 &req,
                 &mut park,
                 &self.session,
-            )?
+            )?;
+            (commit_handle, prepared)
         };
         match prepared {
             PreparedTransferBroadcast::Public {
@@ -1217,12 +1352,17 @@ impl WalletApp {
                 })?;
                 let result = self.commit_public_transfer(
                     &source_dir,
+                    &commit_handle,
                     tx,
                     fee_sats,
                     address,
                     to_account_index,
                 );
-                drop(hold);
+                if result.is_err() {
+                    hold.defuse();
+                } else {
+                    drop(hold);
+                }
                 result
             }
             PreparedTransferBroadcast::Private {
@@ -1234,9 +1374,18 @@ impl WalletApp {
                 hold,
             } => {
                 mweb::broadcast_mweb_tx(&signed.tx, &route)?;
-                let result =
-                    self.commit_private_transfer(&source_dir, &signed, address, to_account_index);
-                drop(hold);
+                let result = self.commit_private_transfer(
+                    &source_dir,
+                    &commit_handle,
+                    &signed,
+                    address,
+                    to_account_index,
+                );
+                if result.is_err() {
+                    hold.defuse();
+                } else {
+                    drop(hold);
+                }
                 result
             }
         }
@@ -1249,6 +1398,7 @@ impl WalletApp {
     pub fn unlock(&self, req: UnlockRequest) -> Result<(), WalletError> {
         match self.secrets.unlock(&req.passphrase) {
             Ok(()) => {
+                self.session_epoch.fetch_add(1, Ordering::AcqRel);
                 diag::log(
                     "lock-state: Locked -> UnlockedEmpty event=Unlock reason=passphrase verified",
                 );
@@ -1298,8 +1448,13 @@ impl WalletApp {
     pub fn lock(&self) {
         let was_unlocked = !self.secrets.is_locked();
         let had_pending = self.pending_lock.load(Ordering::Acquire);
+        self.session_epoch.fetch_add(1, Ordering::AcqRel);
         self.secrets.lock();
         self.clear_insights();
+        if let Ok(mut slot) = self.detached_mweb.lock() {
+            *slot = None;
+        }
+        self.mweb_detached_cv.notify_all();
         self.pending_lock.store(true, Ordering::Release);
         // Parked accounts hold signing keys too. Drop them even when sync still
         // has the active wallet; its StateGuard drops that one on the way out.
@@ -1307,6 +1462,7 @@ impl WalletApp {
         match self.state.try_lock() {
             Ok(mut guard) => {
                 let had_loaded = guard.take().is_some();
+                self.release_dir_lock();
                 self.pending_lock.store(false, Ordering::Release);
                 if had_loaded {
                     let from = if had_pending { "LockPending" } else { "Loaded" };
@@ -1328,6 +1484,7 @@ impl WalletApp {
             Err(TryLockError::Poisoned(poisoned)) => {
                 let mut guard = poisoned.into_inner();
                 let had_loaded = guard.take().is_some();
+                self.release_dir_lock();
                 self.pending_lock.store(false, Ordering::Release);
                 if had_loaded {
                     diag::log("lock-state: Loaded -> Locked event=Lock reason=lock requested");
@@ -1347,8 +1504,14 @@ impl WalletApp {
 
     /// Finish a lock after the state holder has dropped the active wallet.
     fn finish_lock(&self) {
+        self.session_epoch.fetch_add(1, Ordering::AcqRel);
         self.clear_park();
+        self.release_dir_lock();
         self.clear_insights();
+        if let Ok(mut slot) = self.detached_mweb.lock() {
+            *slot = None;
+        }
+        self.mweb_detached_cv.notify_all();
         self.secrets.lock();
         self.pending_lock.store(false, Ordering::Release);
     }
@@ -1360,13 +1523,20 @@ impl WalletApp {
     /// Delete all accounts, registry, and mnemonic secret. Safe if already absent.
     pub fn wipe(&self, data_dir: &Path) -> Result<(), WalletError> {
         let _gate = self.lock_account_load()?;
+        if data_dir.exists() {
+            self.acquire_dir_lock(data_dir)?;
+        }
+        self.session_epoch.fetch_add(1, Ordering::AcqRel);
         *self.lock_state_raw()? = None;
         self.clear_park();
         self.clear_insights();
+        self.clear_detached_mweb();
         self.forget_electrum();
         self.secrets.delete_mnemonic()?;
         accounts::remove_all_accounts(data_dir)?;
         crate::fs_atomic::sweep_temp_files(data_dir);
+        self.release_dir_lock();
+        let _ = std::fs::remove_file(data_dir.join(mweb_frozen::WALLET_LOCK_FILE));
         Ok(())
     }
 
@@ -1425,6 +1595,7 @@ impl WalletApp {
         if !self.exists(data_dir) {
             return Err(WalletError::NotFound);
         }
+        self.acquire_dir_lock(data_dir)?;
         crate::fs_atomic::sweep_temp_files(data_dir);
         accounts::ensure_layout(data_dir)?;
         if let Ok(reg) = accounts::read_registry(data_dir) {
@@ -1456,6 +1627,7 @@ impl WalletApp {
     /// then uses the parked state instead of a second sqlite connection.
     pub fn warm_other_accounts(&self, root: &Path) -> Result<(), WalletError> {
         self.ensure_unlocked()?;
+        self.acquire_dir_lock(root)?;
         accounts::ensure_layout(root)?;
         let reg = accounts::read_registry(root)?;
         for entry in &reg.accounts {
@@ -2172,6 +2344,9 @@ impl WalletApp {
                 let network = parked.network;
                 let hold_spent = parked.hold_spent.clone();
                 let pending_lock = &self.pending_lock;
+                let epoch_ref = &self.session_epoch;
+                let start_epoch = self.detached_mweb_epoch.load(Ordering::Acquire);
+                let epoch_check = (start_epoch != 0).then_some((epoch_ref, start_epoch));
                 self.with_mweb_progress(|progress| {
                     if let Some(mweb) = parked.runtime.as_mut() {
                         let _ = mweb.sync_at_tip_cancellable(
@@ -2184,6 +2359,7 @@ impl WalletApp {
                             &hold_spent,
                             cancel,
                             Some(pending_lock),
+                            epoch_check,
                         );
                     }
                 });
@@ -2350,7 +2526,11 @@ impl WalletApp {
                     hold_spent,
                 )
             };
-            let runtime = self.park_mweb(&mut guard).map_err(Self::log_sync_failure)?;
+            let runtime = if self.in_flight_broadcasts.load(Ordering::Acquire) == 0 {
+                self.park_mweb(&mut guard).map_err(Self::log_sync_failure)?
+            } else {
+                None
+            };
             if runtime.is_some() {
                 pass.mweb();
             }
@@ -2516,7 +2696,11 @@ impl WalletApp {
                 )
             };
 
-            let runtime = self.park_mweb(&mut guard).map_err(Self::log_sync_failure)?;
+            let runtime = if self.in_flight_broadcasts.load(Ordering::Acquire) == 0 {
+                self.park_mweb(&mut guard).map_err(Self::log_sync_failure)?
+            } else {
+                None
+            };
             let has_mweb = runtime.is_some();
 
             // Overlap MWEB download + tip cross-check with Electrum script/tx/anchor scan.
@@ -2628,23 +2812,25 @@ impl WalletApp {
                         drop(guard);
                         if let Ok(done) = mweb_handle.join() {
                             if let Some(mut runtime) = done.parked.runtime {
-                                if let Ok(mut g) = self.lock_state() {
-                                    if let Some(state) = g.as_mut() {
-                                        if state.data_dir == account_dir {
-                                            reconcile_mweb_chain_with_wallet(
-                                                &state.wallet,
-                                                &mut runtime,
-                                            );
-                                            if let Some((stale, status, warn)) = prev_mweb_snap {
-                                                runtime.stale = stale;
-                                                runtime.last_status = status;
-                                                runtime.cross_check_warning = warn;
+                                if let Some((stale, status, warn)) = prev_mweb_snap {
+                                    runtime.stale = stale;
+                                    runtime.last_status = status;
+                                    runtime.cross_check_warning = warn;
+                                }
+                                if self.restore_parked_mweb(&account_dir, runtime).is_ok() {
+                                    if let Ok(mut g) = self.lock_state() {
+                                        if let Some(state) = g.as_mut() {
+                                            if state.data_dir == account_dir {
+                                                if let Some(mweb) = state.mweb.as_mut() {
+                                                    reconcile_mweb_chain_with_wallet(
+                                                        &state.wallet,
+                                                        mweb,
+                                                    );
+                                                }
                                             }
-                                            state.mweb = Some(runtime);
                                         }
                                     }
                                 }
-                                self.clear_detached_mweb();
                             } else {
                                 self.clear_detached_mweb();
                             }
@@ -2837,6 +3023,8 @@ impl WalletApp {
             let hold_spent = churn::held_unbroadcast_spends(&state.data_dir);
             // Fresh runtime after wipe: no previous sync state, so no extension hint.
             let pending_lock = &self.pending_lock;
+            let epoch_ref = &self.session_epoch;
+            let start_epoch = self.session_epoch.load(Ordering::Acquire);
             self.with_mweb_progress(|progress| {
                 let _ = mweb.sync_at_tip_cancellable(
                     tip_height,
@@ -2848,6 +3036,7 @@ impl WalletApp {
                     &hold_spent,
                     None,
                     Some(pending_lock),
+                    Some((epoch_ref, start_epoch)),
                 );
             });
             mweb.persist(&state.data_dir)?;
@@ -2911,8 +3100,17 @@ impl WalletApp {
         self.ensure_unlocked()?;
         // Sign under the lock, then broadcast without it. Electrum connect and
         // broadcast can take long enough that sync and other spends must not wait.
-        let (data_dir, electrum_candidates, electrum_validate_domain, tx, fee_sats, hold) = {
+        let (
+            data_dir,
+            electrum_candidates,
+            electrum_validate_domain,
+            tx,
+            fee_sats,
+            hold,
+            commit_handle,
+        ) = {
             let mut guard = self.lock_state()?;
+            let commit_handle = self.capture_commit_handle()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
 
             let (_fee_rate_sat_vb, mut psbt, _recipient_script) = build_send_psbt(state, &req)?;
@@ -2934,6 +3132,7 @@ impl WalletApp {
                 tx,
                 fee_sats,
                 hold,
+                commit_handle,
             )
         };
 
@@ -2942,20 +3141,25 @@ impl WalletApp {
             WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
         })?;
 
-        let result = self.commit_public_send(&data_dir, tx, fee_sats);
-        drop(hold);
+        let result = self.commit_public_send(&data_dir, &commit_handle, tx, fee_sats);
+        if result.is_err() {
+            hold.defuse();
+        } else {
+            drop(hold);
+        }
         result
     }
 
     fn commit_public_send(
         &self,
         source_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         tx: Transaction,
         fee_sats: u64,
     ) -> Result<SendResult, WalletError> {
         let txid = tx.compute_txid().to_string();
         // Keep local balance honest until the next sync sees the broadcast.
-        self.with_account_wallet(source_dir, |wallet, db| {
+        self.with_account_wallet(source_dir, handle, |wallet, db| {
             wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
             wallet
                 .persist(db)
@@ -3027,8 +3231,9 @@ impl WalletApp {
         self.refuse_if_mweb_detached()?;
         // Sign under the lock, then broadcast without it so a transfer or split
         // of a different coin can start while peers are still being tried.
-        let (data_dir, signed, route, hold) = {
+        let (data_dir, signed, route, hold, commit_handle) = {
             let mut guard = self.lock_state()?;
+            let commit_handle = self.capture_commit_handle()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
             let req = resolve_mweb_send_request(state, req)?;
             let route = broadcast_route(state);
@@ -3040,13 +3245,17 @@ impl WalletApp {
                 .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
             let signed = mweb::sign_mweb_send(&state.wallet, mweb, &data_dir, &req, network)?;
             let hold = CoinHold::take(&data_dir, signed.input_ids(), &self.session)?;
-            (data_dir, signed, route, hold)
+            (data_dir, signed, route, hold, commit_handle)
         };
         mweb::broadcast_mweb_tx(&signed.tx, &route)?;
-        let result = self.with_account_mweb(&data_dir, |runtime| {
+        let result = self.with_account_mweb(&data_dir, &commit_handle, |runtime| {
             Ok(mweb::apply_signed_mweb_send(runtime, &signed))
         });
-        drop(hold);
+        if result.is_err() {
+            hold.defuse();
+        } else {
+            drop(hold);
+        }
         result
     }
 
@@ -3064,20 +3273,34 @@ impl WalletApp {
         self.refuse_if_mweb_detached()?;
         // Sign under the lock, then broadcast without it: the peer loop can take
         // minutes, and sync, coin lists and other spends must not wait on it.
-        let (data_dir, signed, route, hold) = self.sign_pegout(req)?;
+        let (data_dir, signed, route, hold, commit_handle) = self.sign_pegout(req)?;
         mweb::broadcast_mweb_tx(&signed.tx, &route)?;
-        let result = self.with_account_mweb(&data_dir, |runtime| {
+        let result = self.with_account_mweb(&data_dir, &commit_handle, |runtime| {
             Ok(mweb::apply_signed_pegout(runtime, &signed))
         });
-        drop(hold);
+        if result.is_err() {
+            hold.defuse();
+        } else {
+            drop(hold);
+        }
         result
     }
 
     fn sign_pegout(
         &self,
         req: PegoutRequest,
-    ) -> Result<(PathBuf, mweb::SignedPegout, mweb::BroadcastRoute, CoinHold), WalletError> {
+    ) -> Result<
+        (
+            PathBuf,
+            mweb::SignedPegout,
+            mweb::BroadcastRoute,
+            CoinHold,
+            AccountCommitHandle<'_>,
+        ),
+        WalletError,
+    > {
         let mut guard = self.lock_state()?;
+        let commit_handle = self.capture_commit_handle()?;
         let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
         let (mut req, _) = resolve_pegout_request(state, req)?;
         let mut reveal_up_to = None;
@@ -3130,7 +3353,7 @@ impl WalletApp {
                 .persist(&mut state.db)
                 .map_err(|e| WalletError::Persist(e.to_string()))?;
         }
-        Ok((data_dir, signed, route, hold))
+        Ok((data_dir, signed, route, hold, commit_handle))
     }
 
     pub fn list_mweb_unspent(&self) -> Result<Vec<MwebUtxoRecord>, WalletError> {
@@ -3180,10 +3403,12 @@ impl WalletApp {
         // Sign under the lock, then broadcast without it. Peer and Electrum
         // round-trips take long enough that an account switch must not wait
         // on them. The coin is reserved first so a switch cannot spend it.
-        let prepared = {
+        let (commit_handle, prepared) = {
             let mut guard = self.lock_state()?;
+            let commit_handle = self.capture_commit_handle()?;
             let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-            prepare_split(state, &req, &self.session)?
+            let prepared = prepare_split(state, &req, &self.session)?;
+            (commit_handle, prepared)
         };
         match prepared {
             PreparedSplit::Public {
@@ -3200,8 +3425,18 @@ impl WalletApp {
                 client.transaction_broadcast(&tx).map_err(|e| {
                     WalletError::Electrum(crate::error::humanize_broadcast_error(&e.to_string()))
                 })?;
-                let result = self.commit_public_split(&source_dir, tx, fee_sats, output_count);
-                drop(hold);
+                let result = self.commit_public_split(
+                    &source_dir,
+                    &commit_handle,
+                    tx,
+                    fee_sats,
+                    output_count,
+                );
+                if result.is_err() {
+                    hold.defuse();
+                } else {
+                    drop(hold);
+                }
                 result
             }
             PreparedSplit::Private {
@@ -3211,8 +3446,12 @@ impl WalletApp {
                 hold,
             } => {
                 mweb::broadcast_mweb_tx(&signed.tx, &route)?;
-                let result = self.commit_private_split(&source_dir, &signed);
-                drop(hold);
+                let result = self.commit_private_split(&source_dir, &commit_handle, &signed);
+                if result.is_err() {
+                    hold.defuse();
+                } else {
+                    drop(hold);
+                }
                 result
             }
         }
@@ -3221,12 +3460,13 @@ impl WalletApp {
     fn commit_public_split(
         &self,
         source_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         tx: Transaction,
         fee_sats: u64,
         output_count: u32,
     ) -> Result<SplitResult, WalletError> {
         let txid = tx.compute_txid().to_string();
-        self.with_account_wallet(source_dir, |wallet, db| {
+        self.with_account_wallet(source_dir, handle, |wallet, db| {
             wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
             wallet
                 .persist(db)
@@ -3244,10 +3484,11 @@ impl WalletApp {
     fn commit_private_split(
         &self,
         source_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         signed: &mweb::SignedMwebSplit,
     ) -> Result<SplitResult, WalletError> {
         let result = signed.result();
-        self.with_account_mweb(source_dir, |runtime| {
+        self.with_account_mweb(source_dir, handle, |runtime| {
             mweb::apply_signed_mweb_split(runtime, signed);
             Ok(())
         })?;
@@ -3257,13 +3498,14 @@ impl WalletApp {
     fn commit_public_transfer(
         &self,
         source_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         tx: Transaction,
         fee_sats: u64,
         address: String,
         to_account_index: u32,
     ) -> Result<TransferCoinResult, WalletError> {
         let txid = tx.compute_txid().to_string();
-        self.with_account_wallet(source_dir, |wallet, db| {
+        self.with_account_wallet(source_dir, handle, |wallet, db| {
             wallet.apply_unconfirmed_txs([(tx.clone(), crate::mweb_history::now_ts())]);
             wallet
                 .persist(db)
@@ -3281,12 +3523,13 @@ impl WalletApp {
     fn commit_private_transfer(
         &self,
         source_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         signed: &mweb::SignedMwebSend,
         address: String,
         to_account_index: u32,
     ) -> Result<TransferCoinResult, WalletError> {
         let result = signed.result();
-        self.with_account_mweb(source_dir, |runtime| {
+        self.with_account_mweb(source_dir, handle, |runtime| {
             Ok(mweb::apply_signed_mweb_send(runtime, signed))
         })?;
         Ok(TransferCoinResult {
@@ -3302,33 +3545,30 @@ impl WalletApp {
     fn with_account_wallet<T>(
         &self,
         data_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         f: impl FnOnce(&mut PersistedWallet<Connection>, &mut Connection) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
         // Gate before the state lock: warm holds the gate, then the state lock.
         let _gate = self.lock_account_load()?;
-        let stored = self
-            .secrets
-            .get_mnemonic()?
-            .ok_or(WalletError::MissingMnemonic)?;
-        let secret = MasterSecret::from_stored(&stored)?;
-        let mut guard = self.lock_state()?;
-        let active = guard
-            .as_ref()
-            .is_some_and(|state| state.data_dir == data_dir);
-        if active {
-            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-            return f(&mut state.wallet, &mut state.db);
-        }
-        {
-            let mut park = self.lock_park()?;
-            if let Some(state) = park.get_mut_by_dir(data_dir) {
+        if let Ok(mut guard) = self.lock_state() {
+            let active = guard
+                .as_ref()
+                .is_some_and(|state| state.data_dir == data_dir);
+            if active {
+                let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
                 return f(&mut state.wallet, &mut state.db);
+            }
+            {
+                let mut park = self.lock_park()?;
+                if let Some(state) = park.get_mut_by_dir(data_dir) {
+                    return f(&mut state.wallet, &mut state.db);
+                }
             }
         }
         let meta = meta::read_meta(data_dir)?;
         let mut db = Connection::open(meta::db_path(data_dir))
             .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = load_params(&secret, meta.network, meta.account_index)?;
+        let params = load_params(&handle.secret, meta.network, meta.account_index)?;
         let mut wallet = PersistedWallet::load(&mut db, params)
             .map_err(|e| WalletError::Persist(e.to_string()))?
             .ok_or(WalletError::NotFound)?;
@@ -3339,53 +3579,78 @@ impl WalletApp {
     fn with_account_mweb<T>(
         &self,
         data_dir: &Path,
+        handle: &AccountCommitHandle<'_>,
         f: impl FnOnce(&mut MwebRuntime) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
         let _gate = self.lock_account_load()?;
-        let stored = self
-            .secrets
-            .get_mnemonic()?
-            .ok_or(WalletError::MissingMnemonic)?;
-        let secret = MasterSecret::from_stored(&stored)?;
-        let sealing = self.secrets.sealing_key();
-        let mut guard = self.lock_state()?;
-        let active = guard
-            .as_ref()
-            .is_some_and(|state| state.data_dir == data_dir);
-        if active {
-            let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
-            let mweb = state
-                .mweb
-                .as_mut()
-                .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-            let out = f(mweb)?;
-            mweb.persist(data_dir)?;
-            return Ok(out);
-        }
-        {
-            let mut park = self.lock_park()?;
-            if let Some(state) = park.get_mut_by_dir(data_dir) {
-                let dir = state.data_dir.clone();
-                let mweb = state
-                    .mweb
-                    .as_mut()
-                    .ok_or_else(|| WalletError::Mweb("MWEB runtime not initialized".into()))?;
-                let out = f(mweb)?;
-                mweb.persist(&dir)?;
+        if let Ok(mut guard) = self.lock_state() {
+            let active = guard
+                .as_ref()
+                .is_some_and(|state| state.data_dir == data_dir);
+            if active {
+                let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+                if let Some(mweb) = state.mweb.as_mut() {
+                    let out = f(mweb)?;
+                    mweb.persist(data_dir)?;
+                    return Ok(out);
+                }
+                // `state.mweb` was detached by `park_mweb`. Open from disk using
+                // the pre-broadcast commit handle, persist, and re-install into
+                // `state.mweb` while invalidating the detached epoch so a later
+                // stale `restore_parked_mweb` cannot overwrite this spend.
+                let meta = meta::read_meta(data_dir)?;
+                let mut mweb = MwebRuntime::open(
+                    data_dir,
+                    &handle.secret,
+                    meta.network,
+                    meta.mweb_scheme.to_master_scheme(),
+                    meta.account_index,
+                    handle.sealing_key.clone(),
+                )?;
+                let out = f(&mut mweb)?;
+                mweb.persist(data_dir)?;
+                state.mweb = Some(mweb);
+                self.clear_detached_mweb();
                 return Ok(out);
+            }
+            {
+                let mut park = self.lock_park()?;
+                if let Some(state) = park.get_mut_by_dir(data_dir) {
+                    let dir = state.data_dir.clone();
+                    if let Some(mweb) = state.mweb.as_mut() {
+                        let out = f(mweb)?;
+                        mweb.persist(&dir)?;
+                        return Ok(out);
+                    }
+                    let meta = meta::read_meta(&dir)?;
+                    let mut mweb = MwebRuntime::open(
+                        &dir,
+                        &handle.secret,
+                        meta.network,
+                        meta.mweb_scheme.to_master_scheme(),
+                        meta.account_index,
+                        handle.sealing_key.clone(),
+                    )?;
+                    let out = f(&mut mweb)?;
+                    mweb.persist(&dir)?;
+                    state.mweb = Some(mweb);
+                    self.clear_detached_mweb();
+                    return Ok(out);
+                }
             }
         }
         let meta = meta::read_meta(data_dir)?;
         let mut mweb = MwebRuntime::open(
             data_dir,
-            &secret,
+            &handle.secret,
             meta.network,
             meta.mweb_scheme.to_master_scheme(),
             meta.account_index,
-            sealing,
+            handle.sealing_key.clone(),
         )?;
         let out = f(&mut mweb)?;
         mweb.persist(data_dir)?;
+        mweb.wipe();
         Ok(out)
     }
 
@@ -3564,6 +3829,7 @@ impl WalletApp {
             ));
         }
         if self.exists(data_dir) {
+            self.acquire_dir_lock(data_dir)?;
             if self.secrets.get_mnemonic()?.is_none() && !self.secrets.is_locked() {
                 self.wipe(data_dir)?;
             } else if self.secrets.is_locked() || self.secrets.get_mnemonic()?.is_some() {
@@ -3572,6 +3838,7 @@ impl WalletApp {
                 self.wipe(data_dir)?;
             }
         }
+        self.acquire_dir_lock(data_dir)?;
 
         self.secrets
             .set_with_passphrase(passphrase, &secret.to_stored())?;
@@ -3581,6 +3848,7 @@ impl WalletApp {
             let _ = app.secrets.delete_mnemonic();
             app.clear_insights();
             app.clear_park();
+            app.release_dir_lock();
         };
 
         if let Err(e) = std::fs::create_dir_all(data_dir) {
@@ -6171,7 +6439,12 @@ fn fetch_pegin_raw_tx(
             break;
         };
         let safe_url = crate::redact::redact_userinfo(url);
-        match crate::rpc::get_raw_transaction_hex_within(url, txid_hex, timeout) {
+        match crate::rpc::get_raw_transaction_hex_within_for_network(
+            url,
+            txid_hex,
+            timeout,
+            Some(state.network),
+        ) {
             Ok(hex) => match hex::decode(hex.trim()) {
                 Ok(raw) if !raw.is_empty() => {
                     if let Some(tx) = accept(raw, &format!("RPC {safe_url}"), &mut errors) {
@@ -6400,10 +6673,12 @@ fn refuse_churn_unfreeze(
 }
 
 /// A spend's hold on its inputs, from signing until the broadcast is settled.
-/// Released on drop so every exit lets the coins go.
+/// Released on drop unless [`Self::defuse`] is called after a broadcast whose
+/// local post-broadcast commit failed.
 struct CoinHold {
     data_dir: PathBuf,
     inputs: HeldInputs,
+    defused: bool,
 }
 
 enum HeldInputs {
@@ -6417,6 +6692,7 @@ impl CoinHold {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             inputs: HeldInputs::Private(ids),
+            defused: false,
         })
     }
 
@@ -6429,12 +6705,20 @@ impl CoinHold {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             inputs: HeldInputs::Public(outpoints),
+            defused: false,
         })
+    }
+
+    fn defuse(mut self) {
+        self.defused = true;
     }
 }
 
 impl Drop for CoinHold {
     fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
         let released = match &self.inputs {
             HeldInputs::Private(ids) => mweb_frozen::release(&self.data_dir, ids),
             HeldInputs::Public(outpoints) => mweb_frozen::release_public(&self.data_dir, outpoints),
@@ -7466,12 +7750,13 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
         }
     };
     let rpc_url = route.rpc_url.clone();
+    let route_network = route.network;
     let tip = match wallet_tip {
         Some(height) => Some(height),
         None => rpc_url
             .as_deref()
             .filter(|url| !url.trim().is_empty())
-            .and_then(|url| crate::rpc::get_block_count(url).ok()),
+            .and_then(|url| crate::rpc::get_block_count_for_network(url, Some(route_network)).ok()),
     };
     if churn::armed_expired(
         record.armed_at_unix,
@@ -7501,7 +7786,11 @@ fn cover_gate_at(mut state: Option<&mut WalletState>, data_dir: &Path) -> Result
         churn::write_armed(data_dir, &record)?;
         return Ok(());
     };
-    let read = match mweb::count_foreign_mweb_mempool(url, &record.own_ids) {
+    let read = match mweb::count_foreign_mweb_mempool_for_network(
+        url,
+        &record.own_ids,
+        Some(route_network),
+    ) {
         Ok(read) => read,
         Err(e) => {
             let message = e.to_string();

@@ -2,16 +2,33 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::error::WalletError;
+use crate::network::WalletNetwork;
 
 /// Broadcast a raw transaction via litecoind `sendrawtransaction`.
 /// Returns the node response string (txid or wtxid depending on node/tx type).
 ///
 /// Authentication: credentials embedded in the URL (`http://user:pass@host:port`)
 /// take precedence. Without them, falls back to the litecoind `.cookie` file in
-/// the default data directory, so a bare `http://127.0.0.1:9332` works with a
-/// stock local node even though the cookie rotates on every node restart.
+/// the default data directory when the host is loopback (`127.0.0.1`, `::1`, `localhost`)
+/// and the cookie path matches the active network.
+#[allow(dead_code)]
 pub fn send_raw_transaction(rpc_url: &str, tx_hex: &str) -> Result<String, WalletError> {
-    let value = rpc_call(rpc_url, "sendrawtransaction", json!([tx_hex]))?;
+    send_raw_transaction_for_network(rpc_url, tx_hex, None)
+}
+
+/// [`send_raw_transaction`] scoped to the active [`WalletNetwork`] for loopback `.cookie` lookup.
+pub fn send_raw_transaction_for_network(
+    rpc_url: &str,
+    tx_hex: &str,
+    network: Option<WalletNetwork>,
+) -> Result<String, WalletError> {
+    let value = rpc_call_timeout(
+        rpc_url,
+        "sendrawtransaction",
+        json!([tx_hex]),
+        None,
+        network,
+    )?;
     value
         .as_str()
         .map(|s| s.to_string())
@@ -19,26 +36,54 @@ pub fn send_raw_transaction(rpc_url: &str, tx_hex: &str) -> Result<String, Walle
 }
 
 /// Fetch a raw transaction hex via litecoind `getrawtransaction`.
+#[allow(dead_code)]
 pub fn get_raw_transaction_hex(rpc_url: &str, txid: &str) -> Result<String, WalletError> {
-    raw_transaction_hex(rpc_url, txid, None)
+    raw_transaction_hex(rpc_url, txid, None, None)
+}
+
+/// [`get_raw_transaction_hex`] scoped to the active [`WalletNetwork`].
+pub fn get_raw_transaction_hex_for_network(
+    rpc_url: &str,
+    txid: &str,
+    network: Option<WalletNetwork>,
+) -> Result<String, WalletError> {
+    raw_transaction_hex(rpc_url, txid, None, network)
 }
 
 /// [`get_raw_transaction_hex`] with a bound on connect and read. Peg-in repair
 /// uses this so a dead local node cannot stall a sync for ureq's default.
+#[allow(dead_code)]
 pub fn get_raw_transaction_hex_within(
     rpc_url: &str,
     txid: &str,
     timeout: std::time::Duration,
 ) -> Result<String, WalletError> {
-    raw_transaction_hex(rpc_url, txid, Some(timeout))
+    raw_transaction_hex(rpc_url, txid, Some(timeout), None)
+}
+
+/// [`get_raw_transaction_hex_within`] scoped to the active [`WalletNetwork`].
+pub fn get_raw_transaction_hex_within_for_network(
+    rpc_url: &str,
+    txid: &str,
+    timeout: std::time::Duration,
+    network: Option<WalletNetwork>,
+) -> Result<String, WalletError> {
+    raw_transaction_hex(rpc_url, txid, Some(timeout), network)
 }
 
 fn raw_transaction_hex(
     rpc_url: &str,
     txid: &str,
     timeout: Option<std::time::Duration>,
+    network: Option<WalletNetwork>,
 ) -> Result<String, WalletError> {
-    let value = rpc_call_timeout(rpc_url, "getrawtransaction", json!([txid, false]), timeout)?;
+    let value = rpc_call_timeout(
+        rpc_url,
+        "getrawtransaction",
+        json!([txid, false]),
+        timeout,
+        network,
+    )?;
     value
         .as_str()
         .map(|s| s.to_string())
@@ -46,8 +91,17 @@ fn raw_transaction_hex(
 }
 
 /// Transaction ids currently in the node mempool.
+#[allow(dead_code)]
 pub fn get_raw_mempool(rpc_url: &str) -> Result<Vec<String>, WalletError> {
-    let value = rpc_call(rpc_url, "getrawmempool", json!([false]))?;
+    get_raw_mempool_for_network(rpc_url, None)
+}
+
+/// [`get_raw_mempool`] scoped to the active [`WalletNetwork`].
+pub fn get_raw_mempool_for_network(
+    rpc_url: &str,
+    network: Option<WalletNetwork>,
+) -> Result<Vec<String>, WalletError> {
+    let value = rpc_call_timeout(rpc_url, "getrawmempool", json!([false]), None, network)?;
     value
         .as_array()
         .map(|rows| {
@@ -59,20 +113,21 @@ pub fn get_raw_mempool(rpc_url: &str) -> Result<Vec<String>, WalletError> {
 }
 
 /// Current chain tip height from litecoind `getblockcount`.
+#[allow(dead_code)]
 pub fn get_block_count(rpc_url: &str) -> Result<u32, WalletError> {
-    let value = rpc_call(rpc_url, "getblockcount", json!([]))?;
+    get_block_count_for_network(rpc_url, None)
+}
+
+/// [`get_block_count`] scoped to the active [`WalletNetwork`].
+pub fn get_block_count_for_network(
+    rpc_url: &str,
+    network: Option<WalletNetwork>,
+) -> Result<u32, WalletError> {
+    let value = rpc_call_timeout(rpc_url, "getblockcount", json!([]), None, network)?;
     value
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| WalletError::Rpc("missing result from getblockcount".into()))
-}
-
-fn rpc_call(
-    rpc_url: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, WalletError> {
-    rpc_call_timeout(rpc_url, method, params, None)
 }
 
 fn rpc_call_timeout(
@@ -80,6 +135,7 @@ fn rpc_call_timeout(
     method: &str,
     params: serde_json::Value,
     timeout: Option<std::time::Duration>,
+    network: Option<WalletNetwork>,
 ) -> Result<serde_json::Value, WalletError> {
     let rpc_url = &normalize_rpc_url(rpc_url);
     let body = json!({
@@ -92,8 +148,8 @@ fn rpc_call_timeout(
     if let Some(timeout) = timeout {
         request = request.timeout(timeout);
     }
-    if !url_has_credentials(rpc_url) {
-        if let Some(cookie) = read_default_cookie() {
+    if !url_has_credentials(rpc_url) && url_is_loopback(rpc_url) {
+        if let Some(cookie) = read_default_cookie(rpc_url, network) {
             let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
             request = request.set("Authorization", &format!("Basic {encoded}"));
         }
@@ -161,6 +217,125 @@ fn url_has_credentials(url: &str) -> bool {
     authority.contains('@')
 }
 
+/// Extract `(host, port)` from an HTTP/HTTPS RPC URL.
+fn parse_url_host_port(url: &str) -> Option<(&str, Option<u16>)> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rest = match trimmed.split_once("://") {
+        Some((scheme, r))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            r
+        }
+        Some(_) => return None,
+        None => trimmed,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return None;
+    }
+    if let Some(after_open) = host_port.strip_prefix('[') {
+        let (ipv6, rem) = after_open.split_once(']')?;
+        let port = if let Some(port_str) = rem.strip_prefix(':') {
+            Some(port_str.parse::<u16>().ok()?)
+        } else if rem.is_empty() {
+            None
+        } else {
+            return None;
+        };
+        return Some((ipv6, port));
+    }
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        if host.contains(':') {
+            // Unbracketed IPv6 literal without port.
+            return Some((host_port, None));
+        }
+        let port = port_str.parse::<u16>().ok()?;
+        return Some((host, Some(port)));
+    }
+    Some((host_port, None))
+}
+
+/// True only when `url` targets a loopback host (`127.0.0.1` / `127.0.0.0/8`, `::1`, or `localhost`).
+pub(crate) fn url_is_loopback(url: &str) -> bool {
+    let Some((host, _)) = parse_url_host_port(url) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if host == "127.0.0.1" || host == "::1" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Determine which network's `.cookie` path may be used for `url` and `network`.
+/// Never attaches a Mainnet `.cookie` to a Testnet/Regtest endpoint or vice versa.
+fn resolve_cookie_network(url: &str, network: Option<WalletNetwork>) -> Option<WalletNetwork> {
+    let (_, port) = parse_url_host_port(url)?;
+    // Regtest default RPC port (19443): WalletNetwork has no Regtest variant, so never
+    // attach a Mainnet or Testnet cookie to a regtest endpoint.
+    if port == Some(19443) {
+        return None;
+    }
+    match network {
+        Some(WalletNetwork::Mainnet) => {
+            if port == Some(19332) {
+                return None;
+            }
+            Some(WalletNetwork::Mainnet)
+        }
+        Some(WalletNetwork::Testnet) => {
+            if port == Some(9332) {
+                return None;
+            }
+            Some(WalletNetwork::Testnet)
+        }
+        None => match port {
+            Some(19332) => Some(WalletNetwork::Testnet),
+            Some(9332) | None => Some(WalletNetwork::Mainnet),
+            // Unknown custom port without an explicit WalletNetwork: only allow if a single
+            // unambiguous Mainnet cookie is requested on default Mainnet port, so refuse.
+            Some(_) => None,
+        },
+    }
+}
+
+/// Read `__cookie__:<token>` from the default litecoind data directory for the
+/// resolved [`WalletNetwork`] (macOS Application Support, then Linux `~/.litecoin`).
+/// Never attaches a Mainnet `.cookie` to a Testnet/Regtest or remote endpoint.
+fn read_default_cookie(rpc_url: &str, network: Option<WalletNetwork>) -> Option<String> {
+    if !url_is_loopback(rpc_url) {
+        return None;
+    }
+    let net = resolve_cookie_network(rpc_url, network)?;
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::PathBuf::from(home);
+    let candidates = match net {
+        WalletNetwork::Mainnet => [
+            home.join("Library/Application Support/Litecoin/.cookie"),
+            home.join(".litecoin/.cookie"),
+        ],
+        WalletNetwork::Testnet => [
+            home.join("Library/Application Support/Litecoin/testnet4/.cookie"),
+            home.join(".litecoin/testnet4/.cookie"),
+        ],
+    };
+    candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +376,46 @@ mod tests {
         assert!(url_has_credentials("http://user:pass@127.0.0.1:9332"));
         assert!(!url_has_credentials("http://127.0.0.1:9332"));
         assert!(!url_has_credentials("http://127.0.0.1:9332/path?a=b@c"));
+    }
+
+    #[test]
+    fn loopback_host_and_network_cookie_resolution_enforced() {
+        assert!(url_is_loopback("http://127.0.0.1:9332"));
+        assert!(url_is_loopback("127.0.0.1:9332"));
+        assert!(url_is_loopback("http://[::1]:9332"));
+        assert!(url_is_loopback("http://localhost:9332"));
+        assert!(url_is_loopback("https://LOCALHOST:19332/"));
+        assert!(!url_is_loopback("http://192.168.1.50:9332"));
+        assert!(!url_is_loopback("http://10.0.0.5:9332"));
+        assert!(!url_is_loopback("http://0.0.0.0:9332"));
+        assert!(!url_is_loopback("http://node.example.com:9332"));
+
+        // Mainnet cookie only resolves for Mainnet, never Testnet or Regtest (19443).
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:9332", Some(WalletNetwork::Mainnet)),
+            Some(WalletNetwork::Mainnet)
+        );
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:9332", Some(WalletNetwork::Testnet)),
+            None
+        );
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:19332", Some(WalletNetwork::Mainnet)),
+            None
+        );
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:19332", Some(WalletNetwork::Testnet)),
+            Some(WalletNetwork::Testnet)
+        );
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:19443", Some(WalletNetwork::Mainnet)),
+            None
+        );
+        assert_eq!(
+            resolve_cookie_network("http://127.0.0.1:19443", Some(WalletNetwork::Testnet)),
+            None
+        );
+        assert_eq!(resolve_cookie_network("http://127.0.0.1:19443", None), None);
     }
 
     #[test]
@@ -278,20 +493,4 @@ mod tests {
             "local Mainnet .cookie Basic auth leaked to non-loopback RPC host {addr}:\n{captured_headers}"
         );
     }
-}
-
-/// Read `__cookie__:<token>` from the default litecoind mainnet data directory
-/// (macOS Application Support, then Linux `~/.litecoin`).
-fn read_default_cookie() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let home = std::path::PathBuf::from(home);
-    let candidates = [
-        home.join("Library/Application Support/Litecoin/.cookie"),
-        home.join(".litecoin/.cookie"),
-    ];
-    candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }

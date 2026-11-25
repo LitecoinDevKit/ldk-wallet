@@ -336,12 +336,27 @@ fn probe_cross_check_peers(
     PreProbedCrossCheck { probed }
 }
 
+/// Maximum batches sent per `get_utxos_pipelined` round so a 15s round timeout
+/// is never exceeded on a healthy peer serving ~3 MB FULL_UTXO batches, while
+/// updating progress and `utxo_cursor` every few seconds.
+const PIPELINE_WINDOW_BATCHES: usize = 4;
+
+fn is_shrinkable_pmmr_error(err: &bdk_mweb::Error) -> bool {
+    let msg = format!("{err}");
+    msg.contains("output_root mismatch")
+        || msg.contains("parent_hashes len")
+        || msg.contains("missing peak")
+}
+
 struct CancellableMwebPeer<'scope, 'env> {
     inner: TcpMwebPeer,
     cancel: Option<&'env std::sync::atomic::AtomicBool>,
     pending_lock: Option<&'env std::sync::atomic::AtomicBool>,
     probe_spec: Option<CrossProbeSpec<'scope, 'env>>,
     probe_handle: Option<std::thread::ScopedJoinHandle<'scope, PreProbedCrossCheck>>,
+    last_progress_at: std::time::Instant,
+    aborted_pipeline_err: Option<bdk_mweb::Error>,
+    needs_reconnect_before_sequential: bool,
 }
 
 impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
@@ -385,6 +400,10 @@ impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
     fn last_stage(&self) -> &'static str {
         self.inner.last_stage()
     }
+
+    fn unproductive_elapsed(&self) -> std::time::Duration {
+        self.last_progress_at.elapsed()
+    }
 }
 
 impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
@@ -394,6 +413,7 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
     ) -> Result<bdk_mweb::p2p::MwebHeaderMsg, bdk_mweb::Error> {
         self.check_cancel()?;
         let hdr = self.inner.get_header(block_hash)?;
+        self.last_progress_at = std::time::Instant::now();
         if self
             .probe_spec
             .as_ref()
@@ -410,7 +430,9 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
         block_hash: bdk_wallet::bitcoin::BlockHash,
     ) -> Result<MwebLeafset, bdk_mweb::Error> {
         self.check_cancel()?;
-        self.inner.get_leafset(block_hash)
+        let ls = self.inner.get_leafset(block_hash)?;
+        self.last_progress_at = std::time::Instant::now();
+        Ok(ls)
     }
 
     fn get_utxos(
@@ -418,7 +440,19 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
         req: GetMwebUtxos,
     ) -> Result<bdk_mweb::p2p::MwebUtxos, bdk_mweb::Error> {
         self.check_cancel()?;
-        self.inner.get_utxos(req)
+        if let Some(err) = self.aborted_pipeline_err.take() {
+            return Err(err);
+        }
+        if self.needs_reconnect_before_sequential {
+            self.needs_reconnect_before_sequential = false;
+            self.inner.reconnect()?;
+            self.last_progress_at = std::time::Instant::now();
+        }
+        let batch = self.inner.get_utxos(req)?;
+        if !batch.utxos.is_empty() {
+            self.last_progress_at = std::time::Instant::now();
+        }
+        Ok(batch)
     }
 
     fn get_utxos_pipelined(
@@ -429,12 +463,31 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
         self.check_cancel()?;
         let cancel = self.cancel;
         let pending_lock = self.pending_lock;
-        self.inner.get_utxos_pipelined(reqs, &mut |batch| {
-            if Self::is_cancelled(cancel, pending_lock) {
-                return Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
+        for chunk in reqs.chunks(PIPELINE_WINDOW_BATCHES.max(1)) {
+            self.check_cancel()?;
+            let last_progress_at = &mut self.last_progress_at;
+            let mut callback_err = false;
+            let res = self.inner.get_utxos_pipelined(chunk, &mut |batch| {
+                if Self::is_cancelled(cancel, pending_lock) {
+                    return Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
+                }
+                if !batch.utxos.is_empty() {
+                    *last_progress_at = std::time::Instant::now();
+                }
+                on_batch(batch).inspect_err(|_| {
+                    callback_err = true;
+                })
+            });
+            if let Err(e) = res {
+                if callback_err && is_shrinkable_pmmr_error(&e) {
+                    self.needs_reconnect_before_sequential = true;
+                } else {
+                    self.aborted_pipeline_err = Some(e.clone());
+                }
+                return Err(e);
             }
-            on_batch(batch)
-        })
+        }
+        Ok(())
     }
 }
 
@@ -1331,44 +1384,49 @@ impl MwebRuntime {
             let probe_policy = peer_policy_for_pool(backup_addrs.len().max(2));
             let pass_aborted = std::sync::atomic::AtomicBool::new(false);
 
-            let (sync_res, last_stage, pre_probed) = std::thread::scope(|scope| {
-                let mut peer = CancellableMwebPeer {
-                    inner: tcp_peer,
-                    cancel,
-                    pending_lock,
-                    probe_spec: (!backup_addrs.is_empty()).then_some(CrossProbeSpec {
-                        scope,
-                        backup_addrs,
-                        tip_hash,
-                        bdk_net,
-                        policy: probe_policy,
+            let (sync_res, last_stage, stage_unproductive, pre_probed) =
+                std::thread::scope(|scope| {
+                    let mut peer = CancellableMwebPeer {
+                        inner: tcp_peer,
                         cancel,
                         pending_lock,
-                        pass_aborted: &pass_aborted,
-                    }),
-                    probe_handle: None,
-                };
-                let res = self.store.sync_differential(
-                    bdk_wallet::MwebSyncDrivers {
-                        syncer: &syncer,
-                        headers: &headers,
-                        notifier: &mut notifier,
-                        state: &mut self.sync_state,
-                    },
-                    &mut peer,
-                    bdk_wallet::MwebScanContext {
-                        keys: &self.keys,
-                        book: &self.book,
-                        secp: &self.secp,
-                    },
-                );
-                let stage = peer.last_stage();
-                if res.is_err() {
-                    pass_aborted.store(true, std::sync::atomic::Ordering::Release);
-                }
-                let pre = peer.probe_handle.take().and_then(|h| h.join().ok());
-                (res, stage, pre)
-            });
+                        probe_spec: (!backup_addrs.is_empty()).then_some(CrossProbeSpec {
+                            scope,
+                            backup_addrs,
+                            tip_hash,
+                            bdk_net,
+                            policy: probe_policy,
+                            cancel,
+                            pending_lock,
+                            pass_aborted: &pass_aborted,
+                        }),
+                        probe_handle: None,
+                        last_progress_at: std::time::Instant::now(),
+                        aborted_pipeline_err: None,
+                        needs_reconnect_before_sequential: false,
+                    };
+                    let res = self.store.sync_differential(
+                        bdk_wallet::MwebSyncDrivers {
+                            syncer: &syncer,
+                            headers: &headers,
+                            notifier: &mut notifier,
+                            state: &mut self.sync_state,
+                        },
+                        &mut peer,
+                        bdk_wallet::MwebScanContext {
+                            keys: &self.keys,
+                            book: &self.book,
+                            secp: &self.secp,
+                        },
+                    );
+                    let stage = peer.last_stage();
+                    let unproductive = peer.unproductive_elapsed();
+                    if res.is_err() {
+                        pass_aborted.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let pre = peer.probe_handle.take().and_then(|h| h.join().ok());
+                    (res, stage, unproductive, pre)
+                });
 
             match sync_res {
                 Ok(result) => {
@@ -1403,7 +1461,7 @@ impl MwebRuntime {
                         break;
                     }
                     let elapsed = attempt_started.elapsed();
-                    unproductive_elapsed += elapsed;
+                    unproductive_elapsed += stage_unproductive;
                     let stage = last_stage;
                     crate::diag::log(format!(
                         "sync: mweb peer={addr} stage={stage} err={} attempt={tried}/{total_peers} ms={}",
@@ -6672,6 +6730,10 @@ mod sync_failover_tests {
         EmptyPong,
         /// Completes handshake, then stalls silently past `stage_timeout`.
         SilentStall,
+        /// Serves `mwebheader` + `mwebleafset` after productive work, then stalls
+        /// `getmwebutxos` past `pipeline_round_timeout` and writes late `mwebutxos`
+        /// frames onto the same socket.
+        SlowLeafsetThenDirtyStallUtxos,
     }
 
     fn anchored_block_with_leafset(
@@ -6842,7 +6904,7 @@ mod sync_failover_tests {
                                 let _ = send_msg(&mut stream, NetworkMessage::NotFound(invs));
                             }
                             PeerScript::EmptyPong => {}
-                            PeerScript::Good => {
+                            PeerScript::Good | PeerScript::SlowLeafsetThenDirtyStallUtxos => {
                                 for inv in invs {
                                     if let Inventory::Unknown { inv_type, hash } = inv {
                                         let requested = BlockHash::from_byte_array(hash);
@@ -6856,6 +6918,12 @@ mod sync_failover_tests {
                                         } else if inv_type == MSG_MWEB_LEAFSET
                                             && requested == tip_hash
                                         {
+                                            if matches!(
+                                                script,
+                                                PeerScript::SlowLeafsetThenDirtyStallUtxos
+                                            ) {
+                                                std::thread::sleep(Duration::from_millis(160));
+                                            }
                                             let _ = send_raw_cmd(
                                                 &mut stream,
                                                 "mwebleafset",
@@ -6871,6 +6939,42 @@ mod sync_failover_tests {
                                 }
                             }
                         },
+                        NetworkMessage::Unknown { command, .. }
+                            if command.as_ref() == "getmwebutxos" =>
+                        {
+                            if matches!(script, PeerScript::SlowLeafsetThenDirtyStallUtxos) {
+                                // Stall past `stage_timeout` (250ms), then push two late
+                                // `mwebutxos` frames onto the socket that would trigger
+                                // `peer sent more than 1 mwebutxos` if sequential `get_utxos`
+                                // reused the dirty stream.
+                                std::thread::sleep(Duration::from_millis(300));
+                                let dummy = bdk_mweb::p2p::MwebUtxos {
+                                    block_hash: tip_hash,
+                                    start_index: 0,
+                                    output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+                                    utxos: Vec::new(),
+                                    parent_hashes: Vec::new(),
+                                };
+                                let payload = serialize(&dummy);
+                                let _ = send_raw_cmd(&mut stream, "mwebutxos", &payload);
+                                let _ = send_raw_cmd(&mut stream, "mwebutxos", &payload);
+                                std::thread::sleep(Duration::from_millis(100));
+                                break;
+                            } else {
+                                let empty_utxos = bdk_mweb::p2p::MwebUtxos {
+                                    block_hash: tip_hash,
+                                    start_index: 0,
+                                    output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+                                    utxos: Vec::new(),
+                                    parent_hashes: Vec::new(),
+                                };
+                                let _ = send_raw_cmd(
+                                    &mut stream,
+                                    "mwebutxos",
+                                    &serialize(&empty_utxos),
+                                );
+                            }
+                        }
                         NetworkMessage::Ping(nonce) => {
                             if matches!(script, PeerScript::SilentStall) {
                                 std::thread::sleep(Duration::from_millis(350));
@@ -7276,5 +7380,80 @@ mod sync_failover_tests {
 
         TEST_PEER_POLICY.with(|c| c.set(None));
         crate::discovery::set_peers_for_test(None);
+    }
+
+    #[test]
+    fn pipelined_utxo_timeout_does_not_reuse_dirty_socket_or_charge_productive_time_to_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rt = test_runtime(tmp.path());
+        // Leaf 0 is unspent (`0x80`, output_mmr_size = 1) so full scan enters
+        // `get_utxos_pipelined`.
+        let (tip_hash, hdr_bytes, leaf_bytes) = anchored_block_with_leafset(108, 7, vec![0x80], 1);
+
+        let (stalling_peer, _, _) = spawn_scripted_peer(
+            vec![PeerScript::SlowLeafsetThenDirtyStallUtxos],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (good_peer, good_connects, _) = spawn_scripted_peer(
+            vec![PeerScript::Good],
+            tip_hash,
+            hdr_bytes.clone(),
+            leaf_bytes.clone(),
+        );
+        let (backup_peer, _, _) =
+            spawn_scripted_peer(vec![PeerScript::Good], tip_hash, hdr_bytes, leaf_bytes);
+
+        crate::discovery::set_peers_for_test(Some(vec![stalling_peer, good_peer, backup_peer]));
+        // `stage_timeout` = 250ms allows the 160ms leafset to succeed (`~160ms` productive work),
+        // then `get_utxos_pipelined` times out at `pipeline_round_timeout` = 200ms (`~360ms` total
+        // attempt wall time, but only `~200ms` unproductive time).
+        let mut policy = fast_test_policy();
+        policy.stage_timeout = Duration::from_millis(250);
+        policy.pipeline_round_timeout = Duration::from_millis(200);
+        TEST_PEER_POLICY.with(|c| c.set(Some(policy)));
+        // Budget is 340ms: total attempt time (~420ms) exceeds 340ms, but unproductive stage time
+        // (~250ms) is under 340ms, so `sync_pass` must still rotate to `good_peer`.
+        TEST_UNPRODUCTIVE_BUDGET.with(|c| c.set(Some(Duration::from_millis(340))));
+        let (cursor, _) = crate::diag::since(u64::MAX);
+
+        rt.sync_at_tip(
+            108,
+            tip_hash,
+            None,
+            &[],
+            WalletNetwork::Testnet,
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("sync_at_tip");
+
+        TEST_PEER_POLICY.with(|c| c.set(None));
+        TEST_UNPRODUCTIVE_BUDGET.with(|c| c.set(None));
+        crate::discovery::set_peers_for_test(None);
+
+        assert!(
+            !rt.stale,
+            "sync must rotate to good_peer without exhausting unproductive budget on productive leafset time: {}",
+            rt.last_status
+        );
+        assert_eq!(rt.last_good_peer, Some(good_peer));
+        assert!(good_connects.load(Ordering::SeqCst) >= 1);
+
+        let (_, logs) = crate::diag::since(cursor);
+        assert!(
+            logs.iter().any(|l| {
+                l.contains(&format!("sync: mweb peer={stalling_peer} stage=get_utxos"))
+                    && l.contains("err=timeout")
+            }),
+            "pipelined UTXO timeout must report err=timeout rather than dirty-socket protocol violation, got: {logs:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("more than 1 mwebutxos") || l.contains("unproductive budget exhausted")),
+            "must not hit dirty-socket protocol violation or false unproductive budget exhaustion, got: {logs:?}"
+        );
     }
 }

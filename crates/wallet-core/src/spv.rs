@@ -1537,8 +1537,10 @@ fn scan_spks<E: ElectrumApi>(
             }
         }
         if stop_gap < usize::MAX {
-            if unused < stop_gap / 2 {
+            if unused == 0 {
                 batch_size = batch_size.saturating_mul(2).min(max_batch_size);
+            } else if stop_gap.saturating_sub(unused) <= BATCH_SIZE {
+                batch_size = BATCH_SIZE.max(1).min(max_batch_size);
             } else {
                 batch_size = (BATCH_SIZE * 2).max(1).min(max_batch_size);
             }
@@ -1623,6 +1625,35 @@ fn prepare_anchors<E: ElectrumApi>(
     Ok((stats, need_merkle))
 }
 
+/// Minimum combined raw-tx + uncached-merkle fetches before probing shard servers.
+const MIN_SHARD_FETCHES: usize = 20;
+const SHARD_PROBE_TIMEOUT_SECS: u8 = 2;
+const SHARD_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+const SHARD_SECOND_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Count how many mined history claims are not already anchored in `wallet`
+/// at a height consistent with `chain`, without issuing any network requests.
+fn count_unanchored_claims(
+    wallet: &Wallet,
+    chain: &VerifiedChain,
+    pending_anchors: &BTreeSet<(Txid, u32)>,
+) -> usize {
+    pending_anchors
+        .iter()
+        .filter(|&&(txid, height)| {
+            if let Some(known) = anchor_at_height(wallet, txid, height) {
+                if matches!(
+                    header_agrees(chain, height, known.block_id.hash),
+                    Some(true) | None
+                ) {
+                    return false;
+                }
+            }
+            true
+        })
+        .count()
+}
+
 fn connect_verified_shards(
     primary_url: &str,
     shard_urls: &[String],
@@ -1631,29 +1662,83 @@ fn connect_verified_shards(
     tip_hash: BlockHash,
     max_shards: usize,
 ) -> Vec<crate::electrum::ElectrumClient> {
-    let mut shards = Vec::new();
+    if max_shards == 0 {
+        return Vec::new();
+    }
     let mut seen = HashSet::new();
     seen.insert(primary_url.to_string());
+    let mut candidates = Vec::new();
     for url in shard_urls {
-        if shards.len() >= max_shards {
-            break;
-        }
-        if !seen.insert(url.clone()) {
-            continue;
-        }
-        let Ok(client) = crate::electrum::connect_with_timeout(url, validate_domain, 5) else {
-            continue;
-        };
-        if crate::electrum::handshake(&client).is_err() {
-            continue;
-        }
-        let Ok(hdr) = client.inner.block_header(tip_height as usize) else {
-            continue;
-        };
-        if hdr.block_hash() == tip_hash {
-            shards.push(client);
+        if seen.insert(url.clone()) {
+            candidates.push(url.clone());
         }
     }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let probe_started = std::time::Instant::now();
+    let total_candidates = candidates.len();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<crate::electrum::ElectrumClient>)>();
+
+    for (idx, url) in candidates.into_iter().enumerate() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let client = (|| {
+                let c = crate::electrum::connect_with_timeout(
+                    &url,
+                    validate_domain,
+                    SHARD_PROBE_TIMEOUT_SECS,
+                )
+                .ok()?;
+                crate::electrum::handshake(&c).ok()?;
+                let hdr = c.inner.block_header(tip_height as usize).ok()?;
+                (hdr.block_hash() == tip_hash).then_some(c)
+            })();
+            let _ = tx.send((idx, client));
+        });
+    }
+    drop(tx);
+
+    let total_deadline = probe_started + SHARD_TOTAL_BUDGET;
+    let mut grace_deadline: Option<std::time::Instant> = None;
+    let mut received = 0usize;
+    let mut verified: Vec<(usize, crate::electrum::ElectrumClient)> = Vec::new();
+
+    while received < total_candidates && verified.len() < max_shards {
+        let deadline = match grace_deadline {
+            Some(g) => total_deadline.min(g),
+            None => total_deadline,
+        };
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok((idx, maybe_client)) => {
+                received += 1;
+                if let Some(client) = maybe_client {
+                    verified.push((idx, client));
+                    if grace_deadline.is_none() {
+                        grace_deadline = Some(std::time::Instant::now() + SHARD_SECOND_GRACE);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    verified.sort_by_key(|(idx, _)| *idx);
+    let shards: Vec<_> = verified
+        .into_iter()
+        .take(max_shards)
+        .map(|(_, c)| c)
+        .collect();
+    diag::log(format!(
+        "sync: electrum shards connected={} tried={} ms={}",
+        shards.len(),
+        total_candidates,
+        probe_started.elapsed().as_millis() as u64
+    ));
     shards
 }
 
@@ -1881,9 +1966,14 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
         )?;
     }
 
+    let unanchored_count = count_unanchored_claims(wallet, &chain, &out.pending_anchors);
     let raw_chunks_count = out.missing_txids.len().div_ceil(RAW_TX_BATCH_SIZE);
-    let merkle_est_count = out.pending_anchors.len().div_ceil(MERKLE_BATCH_SIZE);
-    let use_shards = !shard_urls.is_empty() && (raw_chunks_count + merkle_est_count >= 2);
+    let merkle_est_count = unanchored_count.div_ceil(MERKLE_BATCH_SIZE);
+    let total_fetches = out.missing_txids.len().saturating_add(unanchored_count);
+    let use_shards = !shard_urls.is_empty()
+        && total_fetches >= MIN_SHARD_FETCHES
+        && (raw_chunks_count + merkle_est_count >= 2);
+    let shard_probe_started = std::time::Instant::now();
     let shards = if use_shards {
         connect_verified_shards(
             &server_url,
@@ -1896,6 +1986,7 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
     } else {
         Vec::new()
     };
+    let shard_probe_elapsed = shard_probe_started.elapsed();
 
     let anchors = if shards.is_empty() {
         out.fetch_missing_txs(api, progress)?;
@@ -1905,7 +1996,10 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
             out.batches,
             out.rows,
             out.raw_fetches,
-            scripts_started.elapsed().as_millis() as u64
+            scripts_started
+                .elapsed()
+                .saturating_sub(shard_probe_elapsed)
+                .as_millis() as u64
         ));
         let anchors_started = std::time::Instant::now();
         let anchors = verify_anchors(
@@ -2051,7 +2145,10 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
             out.rows,
             out.raw_fetches,
             shards.len(),
-            scripts_started.elapsed().as_millis() as u64
+            scripts_started
+                .elapsed()
+                .saturating_sub(shard_probe_elapsed)
+                .as_millis() as u64
         ));
 
         for (i, slot) in merkle_results.into_iter().enumerate() {

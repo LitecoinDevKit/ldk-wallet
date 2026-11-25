@@ -411,13 +411,22 @@ struct FreshPrefetch {
 /// leave pollers reading a step that has stopped.
 struct SyncPass<'a> {
     phase: &'a AtomicU8,
+    generation: &'a std::sync::atomic::AtomicU64,
+    my_gen: u64,
     electrum_progress: &'a spv::ElectrumProgress,
     transparent_ready: &'a AtomicBool,
     finished: bool,
 }
 
 impl SyncPass<'_> {
+    fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.my_gen
+    }
+
     fn electrum(&self, full_scan: bool) {
+        if !self.is_current() {
+            return;
+        }
         self.electrum_progress.reset();
         if full_scan {
             self.set(SyncPhase::ElectrumFullScan, "electrum full_scan");
@@ -427,28 +436,38 @@ impl SyncPass<'_> {
     }
 
     fn mweb(&self) {
+        if !self.is_current() {
+            return;
+        }
         self.electrum_progress.reset();
         self.set(SyncPhase::MwebDownload, "mweb download");
     }
 
     /// Done stays visible until the next pass starts.
     fn finish(mut self) {
-        self.electrum_progress.reset();
-        self.transparent_ready.store(false, Ordering::Release);
-        self.set(SyncPhase::Done, "pass finished");
+        if self.is_current() {
+            self.electrum_progress.reset();
+            self.transparent_ready.store(false, Ordering::Release);
+            self.set(SyncPhase::Done, "pass finished");
+        }
         self.finished = true;
     }
 
     /// Locked prefetch only warms the transparent chain; return to Idle cleanly
     /// instead of logging an aborted pass on drop.
     fn finish_prefetch(mut self) {
-        self.electrum_progress.reset();
-        self.transparent_ready.store(false, Ordering::Release);
-        self.set(SyncPhase::Idle, "prefetch finished");
+        if self.is_current() {
+            self.electrum_progress.reset();
+            self.transparent_ready.store(false, Ordering::Release);
+            self.set(SyncPhase::Idle, "prefetch finished");
+        }
         self.finished = true;
     }
 
     fn set(&self, phase: SyncPhase, reason: &str) {
+        if !self.is_current() {
+            return;
+        }
         let from = SyncPhase::from_u8(self.phase.swap(phase.as_u8(), Ordering::Relaxed));
         if from != phase {
             diag::log(format!("sync-phase: {from:?} -> {phase:?} reason={reason}"));
@@ -458,7 +477,7 @@ impl SyncPass<'_> {
 
 impl Drop for SyncPass<'_> {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.finished && self.is_current() {
             self.electrum_progress.reset();
             self.transparent_ready.store(false, Ordering::Release);
             self.set(SyncPhase::Idle, "pass exited before finish");
@@ -556,6 +575,9 @@ pub struct WalletApp {
     electrum_progress: spv::ElectrumProgress,
     /// Coarse sync phase for UI polling (see [`SyncPhase`]).
     sync_phase: AtomicU8,
+    /// Monotonic counter so an older background prefetch pass cannot overwrite
+    /// the phase or progress of a newer unlocked sync pass.
+    sync_generation: std::sync::atomic::AtomicU64,
     /// Set once Electrum is persisted and the state mutex is about to be released
     /// for the MWEB download. Cleared when the pass finishes or is dropped.
     transparent_ready: AtomicBool,
@@ -599,6 +621,7 @@ impl WalletApp {
             mweb_sync_active: AtomicBool::new(false),
             electrum_progress: spv::ElectrumProgress::default(),
             sync_phase: AtomicU8::new(SyncPhase::Idle.as_u8()),
+            sync_generation: std::sync::atomic::AtomicU64::new(0),
             transparent_ready: AtomicBool::new(false),
             mweb_detached: AtomicBool::new(false),
             detached_mweb: Mutex::new(None),
@@ -723,8 +746,11 @@ impl WalletApp {
     }
 
     fn sync_pass(&self) -> SyncPass<'_> {
+        let my_gen = self.sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
         SyncPass {
             phase: &self.sync_phase,
+            generation: &self.sync_generation,
+            my_gen,
             electrum_progress: &self.electrum_progress,
             transparent_ready: &self.transparent_ready,
             finished: false,
@@ -1904,38 +1930,43 @@ impl WalletApp {
         if !self.secrets.is_locked() || !self.exists(data_dir) {
             return Ok(false);
         }
-        let guard = self.lock_state_gate()?;
-        if !self.secrets.is_locked() || guard.is_some() {
-            return Ok(false);
-        }
-        // Hold `guard` for the whole Electrum pass so unlock's `load` waits,
-        // then drop the watch-only wallet before the guard releases.
-        let synced = self.prefetch_transparent_holding(data_dir);
-        drop(guard);
-        synced
-    }
+        let (account_dir, mut meta, mut wallet, prev_height, prev_hash, tx_count_before) = {
+            let guard = self.lock_state_gate()?;
+            if !self.secrets.is_locked() || guard.is_some() {
+                return Ok(false);
+            }
+            accounts::ensure_layout(data_dir)?;
+            let account_dir = accounts::active_account_dir(data_dir)?;
+            let meta = meta::read_meta(&account_dir)?;
+            let mut db = Connection::open(meta::db_path(&account_dir))
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+            let params =
+                bdk_wallet::Wallet::load().check_network(meta.network.to_bitcoin_network());
+            let wallet = PersistedWallet::load(&mut db, params)
+                .map_err(|e| WalletError::Persist(e.to_string()))?
+                .ok_or(WalletError::NotFound)?;
 
-    fn prefetch_transparent_holding(&self, data_dir: &Path) -> Result<bool, WalletError> {
-        accounts::ensure_layout(data_dir)?;
-        let account_dir = accounts::active_account_dir(data_dir)?;
-        let mut meta = meta::read_meta(&account_dir)?;
-        let mut db = Connection::open(meta::db_path(&account_dir))
-            .map_err(|e| WalletError::Persist(e.to_string()))?;
-        let params = bdk_wallet::Wallet::load().check_network(meta.network.to_bitcoin_network());
-        let mut wallet = PersistedWallet::load(&mut db, params)
-            .map_err(|e| WalletError::Persist(e.to_string()))?
-            .ok_or(WalletError::NotFound)?;
-
-        let prev = wallet.latest_checkpoint();
-        let prev_height = prev.height();
-        let prev_hash = prev.hash();
-        let tx_count_before = wallet.transactions().count();
+            let prev = wallet.latest_checkpoint();
+            let prev_height = prev.height();
+            let prev_hash = prev.hash();
+            let tx_count_before = wallet.transactions().count();
+            (
+                account_dir,
+                meta,
+                wallet,
+                prev_height,
+                prev_hash,
+                tx_count_before,
+            )
+        };
 
         // Warm MWEB peer discovery in the background while the user is on the
         // unlock screen so the subsequent unlocked sync does not wait on DNS crawl.
         crate::discovery::warm_mweb_peers_in_background(meta.network);
 
         // Prefetch only warms the chain; the sync after it reports Done.
+        // The state mutex is released during network I/O so `unlock` + `load`
+        // never blocks waiting for a slow Electrum prefetch.
         let pass = self.sync_pass();
         let prefer = self.remembered_electrum();
         let (client, used) = connect_from_meta(&meta, prefer.as_deref())?;
@@ -1962,6 +1993,10 @@ impl WalletApp {
                 return Err(e);
             }
         };
+        if !self.secrets.is_locked() {
+            pass.finish_prefetch();
+            return Ok(false);
+        }
 
         let prep_tip_height = prepared.tip_height();
         let prep_tip_hash = prepared.tip_hash();
@@ -2017,6 +2052,10 @@ impl WalletApp {
             }
         };
         self.remember_electrum(used.clone());
+        if !self.secrets.is_locked() {
+            pass.finish_prefetch();
+            return Ok(false);
+        }
 
         if !chain_extended_in_place(&wallet, prev_height, prev_hash) {
             diag::log("prefetch: electrum update looked like a reorg; not persisting");
@@ -2024,6 +2063,19 @@ impl WalletApp {
             return Ok(false);
         }
 
+        let guard = self.lock_state_gate()?;
+        if !self.secrets.is_locked() || guard.is_some() {
+            pass.finish_prefetch();
+            return Ok(false);
+        }
+        if accounts::active_account_dir(data_dir).ok().as_ref() != Some(&account_dir)
+            || !meta::db_path(&account_dir).exists()
+        {
+            pass.finish_prefetch();
+            return Ok(false);
+        }
+        let mut db = Connection::open(meta::db_path(&account_dir))
+            .map_err(|e| WalletError::Persist(e.to_string()))?;
         wallet
             .persist(&mut db)
             .map_err(|e| WalletError::Persist(e.to_string()))?;
@@ -2032,6 +2084,9 @@ impl WalletApp {
             meta.needs_full_scan = false;
             meta::write_meta(&account_dir, &meta)?;
         }
+        drop(db);
+        drop(guard);
+
         let tx_count_after = wallet.transactions().count();
         let latest = wallet.latest_checkpoint();
         if let Some(Ok(warning)) = cross_res {

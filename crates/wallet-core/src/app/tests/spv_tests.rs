@@ -71,8 +71,9 @@ struct MockChainState {
     max_history_batch_size: Option<usize>,
     /// Observed `blockchain.scripthash.get_history` counts per round-trip.
     history_batch_sizes: Vec<usize>,
-    /// Optional artificial delay (ms) per script-history round-trip.
-    history_delay_ms: u64,
+    /// Optional barrier pair `(entered, release)` to deterministically pause inside
+    /// the next `blockchain.scripthash.get_history` round-trip.
+    history_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 struct MockElectrumServer {
@@ -146,12 +147,18 @@ impl MockElectrumServer {
                             continue;
                         }
                         let history_count = note_round_trip(&st, &batch_reqs);
-                        let (max_history, history_delay_ms) = {
-                            let guard = st.lock().unwrap();
-                            (guard.max_history_batch_size, guard.history_delay_ms)
+                        let (max_history, history_gate) = {
+                            let mut guard = st.lock().unwrap();
+                            let gate = if history_count > 0 {
+                                guard.history_gate.take()
+                            } else {
+                                None
+                            };
+                            (guard.max_history_batch_size, gate)
                         };
-                        if history_count > 0 && history_delay_ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(history_delay_ms));
+                        if let Some((entered, release)) = history_gate {
+                            entered.wait();
+                            release.wait();
                         }
                         let reject_history = max_history.is_some_and(|max| history_count > max);
                         let mut encoded = Vec::new();
@@ -1940,13 +1947,15 @@ fn unlock_and_load_do_not_wait_for_slow_in_flight_locked_prefetch() {
     configure_electrum(&app, &server.url, false);
     app.sync().expect("initial sync at tip 4");
 
-    // Lock the wallet, advance the server to height 5, and add a 2200ms delay per
-    // script-history round-trip so locked prefetch stays in flight past `unlock()`'s
-    // Argon2id KDF in unoptimized test builds.
+    // Lock the wallet, advance the server to height 5, and install a barrier gate on
+    // the script-history round-trip so locked prefetch is deterministically paused
+    // mid-flight while `unlock()` and `load()` execute on the main thread.
     app.lock();
+    let entered_history = Arc::new(std::sync::Barrier::new(2));
+    let release_history = Arc::new(std::sync::Barrier::new(2));
     server.update(|st| {
         extend_chain(st, 5);
-        st.history_delay_ms = 2200;
+        st.history_gate = Some((Arc::clone(&entered_history), Arc::clone(&release_history)));
     });
 
     let app_bg = Arc::clone(&app);
@@ -1961,17 +1970,14 @@ fn unlock_and_load_do_not_wait_for_slow_in_flight_locked_prefetch() {
         res
     });
 
-    // Wait until `prefetch_transparent` enters `ElectrumSync`.
-    let wait_started = std::time::Instant::now();
-    while app.mweb_sync_progress().phase != crate::dto::SyncPhase::ElectrumSync {
-        assert!(
-            wait_started.elapsed() < std::time::Duration::from_secs(2),
-            "timed out waiting for prefetch to enter ElectrumSync"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Wait until `prefetch_transparent` is inside `scan_spks`.
+    entered_history.wait();
+    assert_eq!(
+        app.mweb_sync_progress().phase,
+        crate::dto::SyncPhase::ElectrumSync
+    );
 
-    // Unlock and load while prefetch is still blocked in `scan_spks` (2200ms delay).
+    // Unlock and load while prefetch is deterministically held in `scan_spks`.
     app.unlock(crate::dto::UnlockRequest {
         passphrase: passphrase.into(),
     })
@@ -1979,11 +1985,12 @@ fn unlock_and_load_do_not_wait_for_slow_in_flight_locked_prefetch() {
     let loaded = app.load(dir.path()).expect("load while prefetch in flight");
     assert!(
         !prefetch_done.load(std::sync::atomic::Ordering::Acquire),
-        "load must complete before the slow in-flight prefetch finishes"
+        "load must complete before the in-flight prefetch finishes"
     );
     assert_eq!(loaded.tip_height, 4, "load renders cached tip immediately");
 
-    // When the background prefetch finishes, it sees the wallet is unlocked and exits cleanly.
+    // Release the server response; background prefetch sees the wallet is unlocked and exits cleanly.
+    release_history.wait();
     let prefetch_res = prefetch_handle
         .join()
         .expect("join prefetch")

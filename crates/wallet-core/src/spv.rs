@@ -980,6 +980,11 @@ struct VerifiedChain {
     /// through proof-of-work again. An anchor below this pass's window uses
     /// these instead of another `blockchain.block.header` round-trip.
     cached_headers: BTreeMap<u32, Header>,
+    sub_ms: u64,
+    range_ms: u64,
+    walk_ms: u64,
+    ancestors_ms: u64,
+    pow_ms: u64,
 }
 
 impl VerifiedChain {
@@ -1135,7 +1140,9 @@ fn verify_server_chain<E: ElectrumApi>(
     let local_tip = local_cp.height();
     let local_hashes: BTreeMap<u32, BlockHash> =
         local_cp.iter().map(|cp| (cp.height(), cp.hash())).collect();
+    let sub_started = std::time::Instant::now();
     let notification = api.block_headers_subscribe().map_err(transport)?;
+    let sub_ms = sub_started.elapsed().as_millis() as u64;
     let server_tip = u32::try_from(notification.height).map_err(|_| {
         SpvError::Transport(format!(
             "Electrum tip height {} overflows u32",
@@ -1158,6 +1165,11 @@ fn verify_server_chain<E: ElectrumApi>(
             headers: BTreeMap::from([(local_tip, notification.header)]),
             local_hashes,
             cached_headers: local_headers.clone(),
+            sub_ms,
+            range_ms: 0,
+            walk_ms: 0,
+            ancestors_ms: 0,
+            pow_ms: 0,
         });
     }
 
@@ -1167,18 +1179,34 @@ fn verify_server_chain<E: ElectrumApi>(
         .saturating_sub(REORG_SUFFIX)
         .max(server_tip.saturating_sub(header_window().saturating_sub(1)))
         .max(1);
+    // On an incremental sync where `start - 1` is not cached locally and fits
+    // within `header_window()`, include `start - 1` in the contiguous range fetch
+    // so `needed_ancestors` does not pay a separate `batch_block_header` round-trip.
+    if local_tip > 0
+        && start > 1
+        && !local_headers.contains_key(&(start - 1))
+        && server_tip - (start - 1) < header_window()
+    {
+        start -= 1;
+    }
+    let range_started = std::time::Instant::now();
     if server_tip > 0 {
         fetch_headers(api, start, server_tip, &mut server)?;
     }
+    let range_ms = range_started.elapsed().as_millis() as u64;
 
+    let mut ancestors_ms = 0u64;
     // On a cold wallet (local_tip == 0), no fork below local_tip is possible,
     // so genesis and the window's ancestor headers can be fetched in one batch.
     if local_tip == 0 {
+        let anc_started = std::time::Instant::now();
         let mut initial = needed_ancestors(start, server_tip);
         initial.push(0);
         fetch_headers_at(api, &initial, &mut server)?;
+        ancestors_ms += anc_started.elapsed().as_millis() as u64;
     }
 
+    let walk_started = std::time::Instant::now();
     let mut agreement = None;
     for (&height, &hash) in local_hashes.range(..=local_tip).rev() {
         if let std::collections::btree_map::Entry::Vacant(slot) = server.entry(height) {
@@ -1200,10 +1228,19 @@ fn verify_server_chain<E: ElectrumApi>(
         fetch_headers(api, fork + 1, start - 1, &mut server)?;
         start = fork + 1;
     }
+    let walk_ms = walk_started.elapsed().as_millis() as u64;
 
-    let ancestors = needed_ancestors(start, server_tip);
+    // Only skip ancestors at or below `agreement` that are already in our
+    // verified `local_headers` cache (`electrum_spv.json`).
+    let anc_started = std::time::Instant::now();
+    let ancestors: Vec<u32> = needed_ancestors(start, server_tip)
+        .into_iter()
+        .filter(|h| !(agreement.is_some_and(|ag| *h <= ag) && local_headers.contains_key(h)))
+        .collect();
     fetch_headers_at(api, &ancestors, &mut server)?;
+    ancestors_ms += anc_started.elapsed().as_millis() as u64;
 
+    let pow_started = std::time::Instant::now();
     let agreement = resolve_chain(
         &local_hashes,
         local_headers,
@@ -1212,12 +1249,18 @@ fn verify_server_chain<E: ElectrumApi>(
         server_tip,
         network,
     )?;
+    let pow_ms = pow_started.elapsed().as_millis() as u64;
     Ok(VerifiedChain {
         tip_height: server_tip,
         agreement,
         headers: server,
         local_hashes,
         cached_headers: local_headers.clone(),
+        sub_ms,
+        range_ms,
+        walk_ms,
+        ancestors_ms,
+        pow_ms,
     })
 }
 
@@ -1306,8 +1349,132 @@ impl ScanOutput {
     }
 }
 
+fn fetch_raw_tx_chunk<E: ElectrumApi>(
+    api: &E,
+    chunk: &[Txid],
+) -> Result<Vec<Arc<Transaction>>, WalletError> {
+    let raws = api.batch_transaction_get_raw(chunk).map_err(electrum_err)?;
+    if raws.len() != chunk.len() {
+        return Err(WalletError::Electrum(format!(
+            "electrum server returned {} transactions for {} txids",
+            raws.len(),
+            chunk.len()
+        )));
+    }
+    let mut txs = Vec::with_capacity(chunk.len());
+    for (txid, raw) in chunk.iter().zip(raws) {
+        txs.push(verify_transaction(&raw, txid)?);
+    }
+    Ok(txs)
+}
+
+type MerkleNeed = (Txid, u32, Header, BlockId);
+
+struct MerkleChunkOutcome {
+    anchored: Vec<(ConfirmationBlockTime, Txid)>,
+    unconfirmed: Vec<Txid>,
+}
+
+fn fetch_merkle_chunk<E: ElectrumApi>(
+    api: &E,
+    chunk: &[MerkleNeed],
+) -> Result<MerkleChunkOutcome, WalletError> {
+    let reqs: Vec<(Txid, usize)> = chunk
+        .iter()
+        .map(|(txid, height, _, _)| (*txid, *height as usize))
+        .collect();
+    let mut anchored = Vec::with_capacity(chunk.len());
+    let mut unconfirmed = Vec::new();
+    match api.batch_transaction_get_merkle(&reqs) {
+        Ok(proofs) => {
+            if proofs.len() != chunk.len() {
+                return Err(WalletError::Electrum(format!(
+                    "electrum server returned {} merkle proofs for {} transactions",
+                    proofs.len(),
+                    chunk.len()
+                )));
+            }
+            for ((txid, height, header, block_id), proof) in chunk.iter().zip(proofs) {
+                verify_merkle_proof(txid, header, *height, &proof)?;
+                let anchor = ConfirmationBlockTime {
+                    block_id: *block_id,
+                    confirmation_time: u64::from(header.time),
+                };
+                anchored.push((anchor, *txid));
+            }
+        }
+        Err(ElectrumError::Protocol(_)) => {
+            for (txid, height, header, block_id) in chunk {
+                match api.transaction_get_merkle(txid, *height as usize) {
+                    Ok(proof) => {
+                        verify_merkle_proof(txid, header, *height, &proof)?;
+                        let anchor = ConfirmationBlockTime {
+                            block_id: *block_id,
+                            confirmation_time: u64::from(header.time),
+                        };
+                        anchored.push((anchor, *txid));
+                    }
+                    Err(ElectrumError::Protocol(e)) => {
+                        diag::log(format!(
+                            "electrum: no merkle branch for {txid} at {height} ({e}); keeping it unconfirmed"
+                        ));
+                        unconfirmed.push(*txid);
+                    }
+                    Err(e) => return Err(electrum_err(e)),
+                }
+            }
+        }
+        Err(e) => return Err(electrum_err(e)),
+    }
+    Ok(MerkleChunkOutcome {
+        anchored,
+        unconfirmed,
+    })
+}
+
+fn fetch_script_histories_resilient<E: ElectrumApi>(
+    api: &E,
+    batch: &[(u32, SpkWithExpectedTxids)],
+    max_batch_size: &mut usize,
+    batches_counter: &mut usize,
+) -> Result<Vec<Vec<bdk_electrum::electrum_client::GetHistoryRes>>, WalletError> {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut cursor = 0;
+    while cursor < batch.len() {
+        let width = (*max_batch_size).max(1).min(batch.len() - cursor);
+        let slice = &batch[cursor..cursor + width];
+        match api.batch_script_get_history(slice.iter().map(|(_, s)| s.spk.as_script())) {
+            Ok(histories) => {
+                if histories.len() != slice.len() {
+                    return Err(WalletError::Electrum(format!(
+                        "electrum server returned {} histories for {} scripts",
+                        histories.len(),
+                        slice.len()
+                    )));
+                }
+                *batches_counter = batches_counter.saturating_add(1);
+                out.extend(histories);
+                cursor += width;
+            }
+            Err(_) if width > BATCH_SIZE.max(1) => {
+                let halved = (width / 2).max(BATCH_SIZE.max(1));
+                diag::log(format!(
+                    "electrum: script history batch of {width} failed; halving max batch to {halved} and retrying"
+                ));
+                *max_batch_size = halved;
+            }
+            Err(e) => return Err(electrum_err(e)),
+        }
+    }
+    Ok(out)
+}
+
 /// `bdk_electrum`'s `populate_with_spks`, with every raw transaction checked
 /// against its txid and mined claims queued for merkle proofs.
+///
+/// Uses adaptive batch sizing (`100 -> 200 -> 400`) during full scans when scripts
+/// are active, with automatic halving down to `BATCH_SIZE` (`50`) if a server
+/// rejects a large batch.
 #[allow(clippy::too_many_arguments)]
 fn scan_spks<E: ElectrumApi>(
     api: &E,
@@ -1322,28 +1489,20 @@ fn scan_spks<E: ElectrumApi>(
 ) -> Result<Option<u32>, WalletError> {
     let mut unused = 0usize;
     let mut last_active = None;
-    let batch_size = if stop_gap == usize::MAX {
+    let mut max_batch_size = if stop_gap == usize::MAX {
         (BATCH_SIZE * 2).max(1)
     } else {
-        BATCH_SIZE.max(1)
+        (BATCH_SIZE * 8).max(1)
     };
+    let mut batch_size = (BATCH_SIZE * 2).max(1).min(max_batch_size);
     loop {
         let batch: Vec<_> = spks.by_ref().take(batch_size).collect();
         if batch.is_empty() {
             return Ok(last_active);
         }
-        out.batches = out.batches.saturating_add(1);
         out.scripts = out.scripts.saturating_add(batch.len());
-        let histories = api
-            .batch_script_get_history(batch.iter().map(|(_, s)| s.spk.as_script()))
-            .map_err(electrum_err)?;
-        if histories.len() != batch.len() {
-            return Err(WalletError::Electrum(format!(
-                "electrum server returned {} histories for {} scripts",
-                histories.len(),
-                batch.len()
-            )));
-        }
+        let histories =
+            fetch_script_histories_resilient(api, &batch, &mut max_batch_size, &mut out.batches)?;
         if let Some(p) = progress {
             p.scripts_scanned
                 .store(out.scripts as u32, Ordering::Relaxed);
@@ -1377,6 +1536,15 @@ fn scan_spks<E: ElectrumApi>(
                 }
             }
         }
+        if stop_gap < usize::MAX {
+            if unused < stop_gap / 2 {
+                batch_size = batch_size.saturating_mul(2).min(max_batch_size);
+            } else {
+                batch_size = (BATCH_SIZE * 2).max(1).min(max_batch_size);
+            }
+        } else {
+            batch_size = max_batch_size;
+        }
     }
 }
 
@@ -1387,18 +1555,16 @@ struct AnchorStats {
     cached: usize,
 }
 
-/// Anchor each mined claim whose merkle branch verifies against a verified
-/// header. A server that cannot produce a branch leaves the transaction
-/// unconfirmed; a branch that fails verification fails the sync.
-fn verify_anchors<E: ElectrumApi>(
+/// Resolve cached anchors and prefetch any missing block headers on the primary
+/// server before merkle proofs are requested.
+fn prepare_anchors<E: ElectrumApi>(
     api: &E,
     wallet: &Wallet,
     chain: &mut VerifiedChain,
     out: &mut ScanOutput,
     network: WalletNetwork,
-    sync_ts: u64,
     progress: Option<&ElectrumProgress>,
-) -> Result<AnchorStats, WalletError> {
+) -> Result<(AnchorStats, Vec<MerkleNeed>), WalletError> {
     let pending_anchors = std::mem::take(&mut out.pending_anchors);
     let mut stats = AnchorStats {
         pending: pending_anchors.len(),
@@ -1454,53 +1620,62 @@ fn verify_anchors<E: ElectrumApi>(
         p.anchors_total
             .store(need_merkle.len() as u32, Ordering::Relaxed);
     }
+    Ok((stats, need_merkle))
+}
 
+fn connect_verified_shards(
+    primary_url: &str,
+    shard_urls: &[String],
+    validate_domain: bool,
+    tip_height: u32,
+    tip_hash: BlockHash,
+    max_shards: usize,
+) -> Vec<crate::electrum::ElectrumClient> {
+    let mut shards = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(primary_url.to_string());
+    for url in shard_urls {
+        if shards.len() >= max_shards {
+            break;
+        }
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        let Ok(client) = crate::electrum::connect_with_timeout(url, validate_domain, 5) else {
+            continue;
+        };
+        if crate::electrum::handshake(&client).is_err() {
+            continue;
+        }
+        let Ok(hdr) = client.inner.block_header(tip_height as usize) else {
+            continue;
+        };
+        if hdr.block_hash() == tip_hash {
+            shards.push(client);
+        }
+    }
+    shards
+}
+
+/// Anchor each mined claim whose merkle branch verifies against a verified
+/// header. A server that cannot produce a branch leaves the transaction
+/// unconfirmed; a branch that fails verification fails the sync.
+fn verify_anchors<E: ElectrumApi>(
+    api: &E,
+    wallet: &Wallet,
+    chain: &mut VerifiedChain,
+    out: &mut ScanOutput,
+    network: WalletNetwork,
+    sync_ts: u64,
+    progress: Option<&ElectrumProgress>,
+) -> Result<AnchorStats, WalletError> {
+    let (mut stats, need_merkle) = prepare_anchors(api, wallet, chain, out, network, progress)?;
     for chunk in need_merkle.chunks(MERKLE_BATCH_SIZE) {
         stats.merkle_fetches = stats.merkle_fetches.saturating_add(chunk.len());
-        let reqs: Vec<(Txid, usize)> = chunk
-            .iter()
-            .map(|(txid, height, _, _)| (*txid, *height as usize))
-            .collect();
-        match api.batch_transaction_get_merkle(&reqs) {
-            Ok(proofs) => {
-                if proofs.len() != chunk.len() {
-                    return Err(WalletError::Electrum(format!(
-                        "electrum server returned {} merkle proofs for {} transactions",
-                        proofs.len(),
-                        chunk.len()
-                    )));
-                }
-                for ((txid, height, header, block_id), proof) in chunk.iter().zip(proofs) {
-                    verify_merkle_proof(txid, header, *height, &proof)?;
-                    let anchor = ConfirmationBlockTime {
-                        block_id: *block_id,
-                        confirmation_time: u64::from(header.time),
-                    };
-                    out.tx_update.anchors.insert((anchor, *txid));
-                }
-            }
-            Err(ElectrumError::Protocol(_)) => {
-                for (txid, height, header, block_id) in chunk {
-                    match api.transaction_get_merkle(txid, *height as usize) {
-                        Ok(proof) => {
-                            verify_merkle_proof(txid, header, *height, &proof)?;
-                            let anchor = ConfirmationBlockTime {
-                                block_id: *block_id,
-                                confirmation_time: u64::from(header.time),
-                            };
-                            out.tx_update.anchors.insert((anchor, *txid));
-                        }
-                        Err(ElectrumError::Protocol(e)) => {
-                            diag::log(format!(
-                                "electrum: no merkle branch for {txid} at {height} ({e}); keeping it unconfirmed"
-                            ));
-                            out.mark_unconfirmed(*txid, sync_ts);
-                        }
-                        Err(e) => return Err(electrum_err(e)),
-                    }
-                }
-            }
-            Err(e) => return Err(electrum_err(e)),
+        let outcome = fetch_merkle_chunk(api, chunk)?;
+        out.tx_update.anchors.extend(outcome.anchored);
+        for txid in outcome.unconfirmed {
+            out.mark_unconfirmed(txid, sync_ts);
         }
         if let Some(p) = progress {
             p.anchors_verified
@@ -1540,22 +1715,65 @@ fn build_chain_update(
     Ok(tip)
 }
 
-/// One Electrum full scan or incremental sync applied to `wallet` only after
-/// every header, merkle branch, and raw transaction it relies on verifies.
-/// Does not persist: the caller persists the wallet, then
-/// [`SpvSyncOutcome::persist_state`]. `protected` transactions (peg-ins) are
-/// never evicted.
-#[allow(clippy::too_many_arguments)]
-pub fn sync_electrum_spv<E: ElectrumApi>(
-    wallet: &mut PersistedWallet<Connection>,
+/// Verified Electrum header chain for an in-progress SPV sync pass.
+///
+/// Created by [`prepare_electrum_spv`] and consumed by [`finish_electrum_spv_with_shards`]
+/// so callers can start MWEB and tip cross-checking as soon as the tip header
+/// is verified, while script scanning and merkle verification run in parallel.
+pub struct PreparedSpvSync {
+    state: ElectrumSpvState,
+    protected: HashSet<Txid>,
+    server_url: String,
+    server: String,
+    sync_ts: u64,
+    chain: VerifiedChain,
+    tip: Header,
+    account_dir: PathBuf,
+    network: WalletNetwork,
+}
+
+impl PreparedSpvSync {
+    pub fn tip_height(&self) -> u32 {
+        self.chain.tip_height
+    }
+
+    pub fn tip_hash(&self) -> BlockHash {
+        self.tip.block_hash()
+    }
+
+    pub fn agreement(&self) -> u32 {
+        self.chain.agreement
+    }
+
+    /// Map of height -> block hash combining local checkpoints up to `agreement`
+    /// and the server's verified headers above `agreement`, for `cross_check_tip`.
+    pub fn verified_chain_hashes(&self) -> std::collections::HashMap<u32, BlockHash> {
+        let mut out: std::collections::HashMap<u32, BlockHash> = self
+            .chain
+            .local_hashes
+            .iter()
+            .filter(|(&h, _)| h <= self.chain.agreement)
+            .map(|(&h, &hash)| (h, hash))
+            .collect();
+        for (&h, hdr) in &self.chain.headers {
+            if h <= self.chain.tip_height {
+                out.insert(h, hdr.block_hash());
+            }
+        }
+        out
+    }
+}
+
+/// Verify the Electrum server's header chain and return a [`PreparedSpvSync`]
+/// pinned to the verified tip before script scanning begins.
+pub fn prepare_electrum_spv<E: ElectrumApi>(
+    wallet: &Wallet,
     api: &E,
     network: WalletNetwork,
     account_dir: &Path,
     server_url: &str,
-    full_scan: bool,
     protected: &HashSet<Txid>,
-    progress: Option<&ElectrumProgress>,
-) -> Result<SpvSyncOutcome, WalletError> {
+) -> Result<PreparedSpvSync, WalletError> {
     let mut state = load_spv_state(account_dir);
     let protected = merge_protected(&mut state, protected);
     let server = crate::redact::redact_userinfo(server_url);
@@ -1563,13 +1781,59 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
     let local_headers = decode_headers(&state.verified_headers);
 
     let headers_started = std::time::Instant::now();
-    let mut chain = verify_server_chain(wallet, api, network, &local_headers)?;
+    let chain = verify_server_chain(wallet, api, network, &local_headers)?;
+    let tip = *chain
+        .headers
+        .get(&chain.tip_height)
+        .ok_or_else(|| WalletError::Electrum("SPV verified chain lost its tip header".into()))?;
     diag::log(format!(
-        "sync: electrum headers tip={} count={} ms={}",
+        "sync: electrum headers tip={} count={} sub_ms={} range_ms={} walk_ms={} ancestors_ms={} pow_ms={} ms={}",
         chain.tip_height,
         chain.headers.len(),
+        chain.sub_ms,
+        chain.range_ms,
+        chain.walk_ms,
+        chain.ancestors_ms,
+        chain.pow_ms,
         headers_started.elapsed().as_millis() as u64
     ));
+    Ok(PreparedSpvSync {
+        state,
+        protected,
+        server_url: server_url.to_string(),
+        server,
+        sync_ts,
+        chain,
+        tip,
+        account_dir: account_dir.to_path_buf(),
+        network,
+    })
+}
+
+/// Complete an Electrum SPV pass prepared by [`prepare_electrum_spv`], optionally
+/// sharding multi-batch raw-tx and merkle-proof fetches across additional
+/// tip-verified Electrum servers.
+pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
+    wallet: &mut PersistedWallet<Connection>,
+    api: &E,
+    prepared: PreparedSpvSync,
+    full_scan: bool,
+    progress: Option<&ElectrumProgress>,
+    shard_urls: &[String],
+    validate_domain: bool,
+) -> Result<SpvSyncOutcome, WalletError> {
+    let PreparedSpvSync {
+        state,
+        protected,
+        server_url,
+        server,
+        sync_ts,
+        mut chain,
+        tip,
+        account_dir,
+        network,
+    } = prepared;
+
     let mut out = ScanOutput::default();
     let mut last_active_indices = BTreeMap::new();
     let scripts_started = std::time::Instant::now();
@@ -1616,26 +1880,209 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
             progress,
         )?;
     }
-    out.fetch_missing_txs(api, progress)?;
-    diag::log(format!(
-        "sync: electrum scripts n={} batches={} rows={} raw_fetches={} ms={}",
-        out.scripts,
-        out.batches,
-        out.rows,
-        out.raw_fetches,
-        scripts_started.elapsed().as_millis() as u64
-    ));
-    let anchors_started = std::time::Instant::now();
-    let anchors = verify_anchors(
-        api, wallet, &mut chain, &mut out, network, sync_ts, progress,
-    )?;
-    diag::log(format!(
-        "sync: electrum anchors pending={} merkle_fetches={} cached={} ms={}",
-        anchors.pending,
-        anchors.merkle_fetches,
-        anchors.cached,
-        anchors_started.elapsed().as_millis() as u64
-    ));
+
+    let raw_chunks_count = out.missing_txids.len().div_ceil(RAW_TX_BATCH_SIZE);
+    let merkle_est_count = out.pending_anchors.len().div_ceil(MERKLE_BATCH_SIZE);
+    let use_shards = !shard_urls.is_empty() && (raw_chunks_count + merkle_est_count >= 2);
+    let shards = if use_shards {
+        connect_verified_shards(
+            &server_url,
+            shard_urls,
+            validate_domain,
+            chain.tip_height,
+            tip.block_hash(),
+            2,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let anchors = if shards.is_empty() {
+        out.fetch_missing_txs(api, progress)?;
+        diag::log(format!(
+            "sync: electrum scripts n={} batches={} rows={} raw_fetches={} ms={}",
+            out.scripts,
+            out.batches,
+            out.rows,
+            out.raw_fetches,
+            scripts_started.elapsed().as_millis() as u64
+        ));
+        let anchors_started = std::time::Instant::now();
+        let anchors = verify_anchors(
+            api, wallet, &mut chain, &mut out, network, sync_ts, progress,
+        )?;
+        diag::log(format!(
+            "sync: electrum anchors pending={} merkle_fetches={} cached={} ms={}",
+            anchors.pending,
+            anchors.merkle_fetches,
+            anchors.cached,
+            anchors_started.elapsed().as_millis() as u64
+        ));
+        anchors
+    } else {
+        // Resolve cached anchors and prefetch any missing headers on the primary
+        // server first, then overlap raw-tx and merkle-proof batches across the
+        // primary server and verified shard servers.
+        let anchors_started = std::time::Instant::now();
+        let (mut stats, need_merkle) =
+            prepare_anchors(api, wallet, &mut chain, &mut out, network, progress)?;
+        let missing = std::mem::take(&mut out.missing_txids);
+        out.raw_fetches = missing.len();
+        stats.merkle_fetches = need_merkle.len();
+        if let Some(p) = progress {
+            p.txs_total.store(missing.len() as u32, Ordering::Relaxed);
+        }
+        let raw_chunks: Vec<&[Txid]> = missing.chunks(RAW_TX_BATCH_SIZE).collect();
+        let merkle_chunks: Vec<&[MerkleNeed]> = need_merkle.chunks(MERKLE_BATCH_SIZE).collect();
+        let total_workers = 1 + shards.len();
+
+        let (raw_results, merkle_results) = std::thread::scope(|scope| {
+            let mut shard_handles = Vec::new();
+            for (worker_idx, shard) in shards.iter().enumerate() {
+                let worker_id = worker_idx + 1;
+                let my_raw: Vec<(usize, &[Txid])> = raw_chunks
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, _)| i % total_workers == worker_id)
+                    .collect();
+                let my_merkle: Vec<(usize, &[MerkleNeed])> = merkle_chunks
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, _)| (i + raw_chunks.len()) % total_workers == worker_id)
+                    .collect();
+                shard_handles.push(scope.spawn(move || {
+                    let mut raw_out = Vec::with_capacity(my_raw.len());
+                    for (idx, chunk) in my_raw {
+                        let res = fetch_raw_tx_chunk(&shard.inner, chunk);
+                        if res.is_ok() {
+                            if let Some(p) = progress {
+                                p.txs_fetched
+                                    .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                            }
+                        }
+                        raw_out.push((idx, res));
+                    }
+                    let mut merkle_out = Vec::with_capacity(my_merkle.len());
+                    for (idx, chunk) in my_merkle {
+                        let res = fetch_merkle_chunk(&shard.inner, chunk);
+                        if res.is_ok() {
+                            if let Some(p) = progress {
+                                p.anchors_verified
+                                    .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                            }
+                        }
+                        merkle_out.push((idx, res));
+                    }
+                    (raw_out, merkle_out)
+                }));
+            }
+
+            let mut raw_slots: Vec<Option<Result<Vec<Arc<Transaction>>, WalletError>>> =
+                (0..raw_chunks.len()).map(|_| None).collect();
+            for (i, chunk) in raw_chunks
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(i, _)| i.is_multiple_of(total_workers))
+            {
+                let res = fetch_raw_tx_chunk(api, chunk);
+                if res.is_ok() {
+                    if let Some(p) = progress {
+                        p.txs_fetched
+                            .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    }
+                }
+                raw_slots[i] = Some(res);
+            }
+
+            let mut merkle_slots: Vec<Option<Result<MerkleChunkOutcome, WalletError>>> =
+                (0..merkle_chunks.len()).map(|_| None).collect();
+            for (i, chunk) in merkle_chunks
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(i, _)| (i + raw_chunks.len()).is_multiple_of(total_workers))
+            {
+                let res = fetch_merkle_chunk(api, chunk);
+                if res.is_ok() {
+                    if let Some(p) = progress {
+                        p.anchors_verified
+                            .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    }
+                }
+                merkle_slots[i] = Some(res);
+            }
+
+            for handle in shard_handles {
+                if let Ok((r_vec, m_vec)) = handle.join() {
+                    for (idx, res) in r_vec {
+                        raw_slots[idx] = Some(res);
+                    }
+                    for (idx, res) in m_vec {
+                        merkle_slots[idx] = Some(res);
+                    }
+                }
+            }
+            (raw_slots, merkle_slots)
+        });
+
+        // Any shard chunk that failed is retried on the primary server before failing the sync.
+        for (i, slot) in raw_results.into_iter().enumerate() {
+            let txs = match slot {
+                Some(Ok(txs)) => txs,
+                _ => {
+                    let chunk = raw_chunks[i];
+                    let txs = fetch_raw_tx_chunk(api, chunk)?;
+                    if let Some(p) = progress {
+                        p.txs_fetched
+                            .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    }
+                    txs
+                }
+            };
+            out.tx_update.txs.extend(txs);
+        }
+        diag::log(format!(
+            "sync: electrum scripts n={} batches={} rows={} raw_fetches={} shards={} ms={}",
+            out.scripts,
+            out.batches,
+            out.rows,
+            out.raw_fetches,
+            shards.len(),
+            scripts_started.elapsed().as_millis() as u64
+        ));
+
+        for (i, slot) in merkle_results.into_iter().enumerate() {
+            let outcome = match slot {
+                Some(Ok(outcome)) => outcome,
+                _ => {
+                    let chunk = merkle_chunks[i];
+                    let outcome = fetch_merkle_chunk(api, chunk)?;
+                    if let Some(p) = progress {
+                        p.anchors_verified
+                            .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    }
+                    outcome
+                }
+            };
+            out.tx_update.anchors.extend(outcome.anchored);
+            for txid in outcome.unconfirmed {
+                out.mark_unconfirmed(txid, sync_ts);
+            }
+        }
+        diag::log(format!(
+            "sync: electrum anchors pending={} merkle_fetches={} cached={} shards={} ms={}",
+            stats.pending,
+            stats.merkle_fetches,
+            stats.cached,
+            shards.len(),
+            anchors_started.elapsed().as_millis() as u64
+        ));
+        stats
+    };
+    let _ = anchors;
 
     let mut evict: BTreeSet<Txid> = std::mem::take(&mut out.expected_missing);
     evict.extend(
@@ -1651,10 +2098,6 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
         .extend(evict.iter().map(|txid| (*txid, sync_ts)));
 
     let chain_update = build_chain_update(wallet, &chain, &out.tx_update.anchors)?;
-    let tip = *chain
-        .headers
-        .get(&chain.tip_height)
-        .ok_or_else(|| WalletError::Electrum("SPV verified chain lost its tip header".into()))?;
     let mut next = state.clone();
     next.last_server_url = Some(server);
     next.server_unconfirmed_txids = out
@@ -1691,7 +2134,7 @@ pub fn sync_electrum_spv<E: ElectrumApi>(
     Ok(SpvSyncOutcome {
         tip_height: chain.tip_height,
         tip_time: u64::from(tip.time),
-        account_dir: account_dir.to_path_buf(),
+        account_dir,
         state: next,
     })
 }

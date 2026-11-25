@@ -67,6 +67,10 @@ struct MockChainState {
     merkle_calls: usize,
     /// Number of round-trips containing `blockchain.transaction.get_merkle`.
     merkle_batches: usize,
+    /// Optional cap on `blockchain.scripthash.get_history` batch size before returning an error.
+    max_history_batch_size: Option<usize>,
+    /// Observed `blockchain.scripthash.get_history` counts per round-trip.
+    history_batch_sizes: Vec<usize>,
 }
 
 struct MockElectrumServer {
@@ -139,10 +143,23 @@ impl MockElectrumServer {
                         if batch_reqs.is_empty() {
                             continue;
                         }
-                        note_round_trip(&st, &batch_reqs);
+                        let history_count = note_round_trip(&st, &batch_reqs);
+                        let max_history = st.lock().unwrap().max_history_batch_size;
+                        let reject_history = max_history.is_some_and(|max| history_count > max);
                         let mut encoded = Vec::new();
                         for req in &batch_reqs {
-                            let resp = handle_rpc(&st, req);
+                            let resp = if reject_history
+                                && req.get("method").and_then(Value::as_str)
+                                    == Some("blockchain.scripthash.get_history")
+                            {
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req.get("id").cloned().unwrap_or(Value::Null),
+                                    "error": {"code": -32600, "message": "batch too large"}
+                                })
+                            } else {
+                                handle_rpc(&st, req)
+                            };
                             encoded.extend_from_slice(&serde_json::to_vec(&resp).unwrap());
                             encoded.push(b'\n');
                         }
@@ -163,10 +180,11 @@ impl MockElectrumServer {
     }
 }
 
-fn note_round_trip(state: &Arc<Mutex<MockChainState>>, batch_reqs: &[Value]) {
+fn note_round_trip(state: &Arc<Mutex<MockChainState>>, batch_reqs: &[Value]) -> usize {
     let mut has_header = false;
     let mut has_tx_get = false;
     let mut has_merkle = false;
+    let mut history_count = 0usize;
     for req in batch_reqs {
         let items: Vec<&Value> = match req.as_array() {
             Some(arr) => arr.iter().collect(),
@@ -177,6 +195,7 @@ fn note_round_trip(state: &Arc<Mutex<MockChainState>>, batch_reqs: &[Value]) {
                 "blockchain.block.header" => has_header = true,
                 "blockchain.transaction.get" => has_tx_get = true,
                 "blockchain.transaction.get_merkle" => has_merkle = true,
+                "blockchain.scripthash.get_history" => history_count += 1,
                 _ => {}
             }
         }
@@ -191,6 +210,10 @@ fn note_round_trip(state: &Arc<Mutex<MockChainState>>, batch_reqs: &[Value]) {
     if has_merkle {
         st.merkle_batches += 1;
     }
+    if history_count > 0 {
+        st.history_batch_sizes.push(history_count);
+    }
+    history_count
 }
 
 fn handle_rpc(state: &Arc<Mutex<MockChainState>>, req: &Value) -> Value {
@@ -1461,4 +1484,289 @@ fn cold_restore_batches_raw_txs_headers_and_merkle_proofs_with_partial_missing_m
     assert!(utxos2
         .iter()
         .all(|u| u.confirmations > 0 && u.status == CoinStatus::Ready));
+}
+
+#[test]
+fn prefetch_populates_cross_check_cache_and_warm_unlock_reuses_it_without_rpc() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x81);
+    let (mut state_primary, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+    extend_chain(&mut state_primary, 5);
+    let state_secondary = state_primary.clone();
+
+    let primary = MockElectrumServer::start(state_primary);
+    let secondary = MockElectrumServer::start(state_secondary);
+
+    // Configure `secondary` as the stored fallback URL in `meta.electrum_url` and
+    // `primary` as the active session/remembered server so `electrum_candidates`
+    // contains `[primary, secondary]`.
+    configure_electrum(&app, &secondary.url, false);
+    {
+        let mut guard = app.lock_state().unwrap();
+        guard.as_mut().unwrap().active_electrum_url = Some(primary.url.clone());
+    }
+    app.remember_electrum(primary.url.clone());
+
+    app.sync().expect("initial sync at tip 5");
+    assert_eq!(app.summary().unwrap().tip_height, 5);
+
+    // Lock the wallet, advance both servers to height 8, and run `prefetch_transparent`.
+    app.lock();
+    primary.update(|st| extend_chain(st, 8));
+    secondary.update(|st| {
+        extend_chain(st, 8);
+        st.header_calls.clear();
+    });
+
+    assert!(
+        app.prefetch_transparent(dir.path()).expect("prefetch"),
+        "locked prefetch should advance chain to 8 and cross-check tip"
+    );
+    {
+        let sec_st = secondary.state.lock().unwrap();
+        assert!(
+            !sec_st.header_calls.is_empty(),
+            "prefetch_transparent must run cross_check_tip against secondary in parallel"
+        );
+    }
+
+    // Clear counters on both servers, unlock + load, and verify `sync()` reuses both
+    // `FreshPrefetch` (`script_history_calls == 0`) and `CrossCheckCache` (`secondary.header_calls` empty).
+    primary.update(|st| {
+        st.header_calls.clear();
+        st.headers_batch_calls = 0;
+        st.script_history_calls = 0;
+    });
+    secondary.update(|st| {
+        st.header_calls.clear();
+        st.headers_batch_calls = 0;
+    });
+
+    app.unlock(crate::dto::UnlockRequest {
+        passphrase: "correct horse battery staple".into(),
+    })
+    .expect("unlock");
+    let summary = app.load(dir.path()).expect("load");
+    assert_eq!(summary.tip_height, 8);
+
+    let res = app.sync().expect("warm unlock sync");
+    assert_eq!(res.summary.tip_height, 8);
+    {
+        let pri_st = primary.state.lock().unwrap();
+        let sec_st = secondary.state.lock().unwrap();
+        assert_eq!(pri_st.script_history_calls, 0);
+        assert_eq!(pri_st.headers_batch_calls, 0);
+        assert!(
+            sec_st.header_calls.is_empty(),
+            "warm unlock sync must reuse CrossCheckCache from prefetch without querying secondary: {:?}",
+            sec_st.header_calls
+        );
+    }
+}
+
+#[test]
+fn incremental_header_sync_fetches_start_minus_1_and_skips_cached_ancestors() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x82);
+    let (mut state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+    extend_chain(&mut state, 5);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+    app.sync().expect("sync at tip 5");
+
+    // Advance by 12 blocks (`count >= 10`) to height 17.
+    server.update(|st| {
+        extend_chain(st, 17);
+        st.header_calls.clear();
+        st.header_batches = 0;
+        st.headers_batch_calls = 0;
+    });
+    app.sync().expect("sync at tip 17");
+    assert_eq!(app.summary().unwrap().tip_height, 17);
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.headers_batch_calls, 1);
+        assert!(
+            st.header_calls.is_empty(),
+            "incremental sync with cached local_headers must not issue ancestor header RPCs: {:?}",
+            st.header_calls
+        );
+    }
+
+    // Even if `start - 1` (height 16) is evicted from `spv_state.verified_headers`,
+    // `verify_server_chain` includes `start - 1` in the single `blockchain.block.headers`
+    // range call rather than issuing a separate `blockchain.block.header` round-trip.
+    let account_dir = app.lock_state().unwrap().as_ref().unwrap().data_dir.clone();
+    let mut spv = crate::spv::load_spv_state(&account_dir);
+    spv.verified_headers.remove(&16);
+    crate::spv::save_spv_state(&account_dir, &spv).unwrap();
+
+    server.update(|st| {
+        extend_chain(st, 28);
+        st.header_calls.clear();
+        st.header_batches = 0;
+        st.headers_batch_calls = 0;
+    });
+    app.sync().expect("sync at tip 28");
+    assert_eq!(app.summary().unwrap().tip_height, 28);
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.headers_batch_calls, 1);
+        assert!(
+            !st.header_calls.contains(&16),
+            "start - 1 must be fetched inside the contiguous range call, not via individual header RPC: {:?}",
+            st.header_calls
+        );
+    }
+}
+
+#[test]
+fn adaptive_script_batch_halves_on_strict_server_and_sharded_cold_restore_splits_fetches() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_spk = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap()
+        .script_pubkey();
+    let sh = electrum_scripthash_hex(&recv_spk);
+
+    let gen = genesis_block(Network::Testnet4).header;
+    let mut state = MockChainState::default();
+    state.headers.insert(0, gen);
+    state.max_history_batch_size = Some(50);
+
+    let mut prev = gen;
+    let mut history = Vec::new();
+    for height in 1..=60u32 {
+        let cb = make_coinbase_tx(height);
+        let cb_id = cb.compute_txid().to_byte_array();
+        let tx = make_funding_tx(recv_spk.clone(), 100_000 + u64::from(height), height as u8);
+        let txid = tx.compute_txid();
+        let root = sha256d_pair(&cb_id, &txid.to_byte_array());
+        let hdr = mine_testnet_header(Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: prev.block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array(root),
+            time: prev.time + 600,
+            bits: easy_bits(),
+            nonce: 0,
+        });
+        prev = hdr;
+        state.headers.insert(height, hdr);
+        state.tip_height = height;
+        history.push(MockHistoryEntry {
+            tx_hash: txid.to_string(),
+            height: height as i32,
+        });
+        state.txs.insert(txid.to_string(), serialize(&tx));
+        state.proofs.insert(
+            (txid.to_string(), height as usize),
+            Ok(MockMerkleProof {
+                block_height: height as usize,
+                pos: 1,
+                merkle: vec![display_hex_from_internal(cb_id)],
+            }),
+        );
+    }
+    state.histories.insert(sh, history);
+
+    let mut shard_state = state.clone();
+    shard_state.max_history_batch_size = None;
+
+    let primary = MockElectrumServer::start(state);
+    let shard = MockElectrumServer::start(shard_state);
+
+    // Configure `shard` in `state.electrum_url` and `primary` as active so both are candidates.
+    configure_electrum(&app, &shard.url, false);
+    {
+        let mut guard = app.lock_state().unwrap();
+        guard.as_mut().unwrap().active_electrum_url = Some(primary.url.clone());
+    }
+    app.remember_electrum(primary.url.clone());
+
+    app.sync()
+        .expect("full_scan halves script batch from 100 to 50 and shards raw/merkle fetches");
+    {
+        let pri_st = primary.state.lock().unwrap();
+        let shd_st = shard.state.lock().unwrap();
+        assert!(
+            pri_st.history_batch_sizes.contains(&50),
+            "strict server rejecting >50 must fall back to 50-script batches: {:?}",
+            pri_st.history_batch_sizes
+        );
+        assert_eq!(
+            pri_st.tx_get_calls + shd_st.tx_get_calls,
+            60,
+            "60 raw txs must be fetched across primary ({}) and shard ({})",
+            pri_st.tx_get_calls,
+            shd_st.tx_get_calls
+        );
+        assert_eq!(pri_st.merkle_calls + shd_st.merkle_calls, 60);
+        assert!(
+            pri_st.tx_get_calls + pri_st.merkle_calls > 0
+                && shd_st.tx_get_calls + shd_st.merkle_calls > 0,
+            "work must be split across primary (tx={}, merkle={}) and verified shard (tx={}, merkle={})",
+            pri_st.tx_get_calls,
+            pri_st.merkle_calls,
+            shd_st.tx_get_calls,
+            shd_st.merkle_calls
+        );
+    }
+    let utxos = app.list_unspent().unwrap();
+    assert_eq!(utxos.len(), 60);
+    assert!(utxos
+        .iter()
+        .all(|u| u.confirmations > 0 && u.status == CoinStatus::Ready));
+}
+
+#[test]
+fn failed_electrum_body_scan_cancels_overlapped_mweb_and_restores_runtime() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x83);
+    let (mut state, txid, _cb) = build_single_block_chain_with_tx(&tx);
+    // Corrupt the raw transaction bytes so `prepare_electrum_spv` succeeds and starts
+    // the overlapped MWEB stage, then `finish_electrum_spv_with_shards` fails mid-scan.
+    state
+        .txs
+        .insert(txid.to_string(), vec![0xde, 0xad, 0xbe, 0xef]);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+
+    let err = app.sync().expect_err("corrupted raw tx must fail sync");
+    assert!(
+        format!("{err}").contains("SPV rejected invalid transaction"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(app.mweb_sync_progress().phase, crate::dto::SyncPhase::Idle);
+    let guard = app.lock_state().unwrap();
+    assert!(
+        guard.as_ref().unwrap().mweb.is_some(),
+        "MwebRuntime must be restored to WalletState after overlapped Electrum failure"
+    );
 }

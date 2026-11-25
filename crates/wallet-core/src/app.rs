@@ -221,6 +221,42 @@ fn is_local_pegin_entry(entry: &crate::mweb_history::MwebHistoryEntry) -> bool {
         && !entry.output_ids.iter().any(|oid| oid == &entry.id)
 }
 
+/// A local peg-in the wallet no longer has, and whose private outputs are gone.
+///
+/// Evicting the transparent spend puts the inputs back in the balance. The
+/// history row would otherwise stay at 0 confirmations and render as
+/// "maturing · pending". An entry with no output ids, or whose coins are
+/// still in the store, is a repair candidate and stays.
+fn is_dropped_local_pegin(
+    entry: &crate::mweb_history::MwebHistoryEntry,
+    tx_in_wallet: bool,
+    outputs_still_owed: bool,
+) -> bool {
+    is_local_pegin_entry(entry)
+        && entry.confirmed_height.is_none()
+        && !tx_in_wallet
+        && !outputs_still_owed
+}
+
+/// True when repair should still look up the transparent peg-in. Empty output
+/// lists are the legacy rows that credited nothing we can see. Coins still in
+/// the store, or spent with a leaf, were credited and the spend may be missing.
+fn pegin_outputs_still_owed(
+    entry: &crate::mweb_history::MwebHistoryEntry,
+    db: &bdk_mweb::MwebCoinDatabase,
+) -> bool {
+    entry.output_ids.is_empty()
+        || entry.output_ids.iter().any(|oid_hex| {
+            hex::decode(oid_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .is_some_and(|id| {
+                    db.get(&id).is_some()
+                        || db.get_spent(&id).is_some_and(|c| c.leaf_index.is_some())
+                })
+        })
+}
+
 /// Peg-in txids in MWEB history. Their transparent spends are ours even when
 /// no Electrum server reports them, so SPV eviction never drops them.
 fn pegin_txids(history: &crate::mweb_history::MwebHistory) -> HashSet<Txid> {
@@ -2917,7 +2953,12 @@ impl WalletApp {
 
         // Repair peg-ins that credited MWEB without spending transparent UTXOs
         // (bug in earlier builds). Prefer Electrum raw tx; fall back to RPC.
+        // Dropped peg-ins are not in `missing`: their outputs were wiped, so
+        // this has to run even when there is nothing to re-fetch.
         let repair_started = std::time::Instant::now();
+        if state.mweb.is_some() {
+            forget_dropped_pegins(state);
+        }
         let missing = missing_pegin_ids(state);
         let fallbacks = missing
             .iter()
@@ -3000,6 +3041,12 @@ impl WalletApp {
         }
         state.needs_mweb_scan = true;
         meta::write_meta(&state.data_dir, &meta_from_state(state))?;
+        // History survives the wipe. Copy coin heights onto it first, or every
+        // spent receive and peg-in comes back as pending.
+        if let Some(mweb) = state.mweb.as_mut() {
+            mweb::stamp_known_history_heights(&mut mweb.history, mweb.store.db());
+            mweb.persist(&state.data_dir)?;
+        }
         mweb::wipe_mweb_files(&state.data_dir)?;
         crate::crashpoint::maybe_crash("resync_mweb_after_wipe");
         // A manual resync usually means something looked wrong, so re-crawl
@@ -6181,22 +6228,7 @@ fn missing_pegin_ids(state: &WalletState) -> Vec<String> {
         .entries
         .iter()
         .filter(|e| is_local_pegin_entry(e))
-        .filter(|e| {
-            // A dropped peg-in whose outputs are no longer in the MWEB coin store
-            // (or were moved to `spent` with `leaf_index == None` because a full
-            // scan saw they never landed on chain) never credited private funds,
-            // so its transparent inputs were not spent.
-            e.output_ids.is_empty()
-                || e.output_ids.iter().any(|oid_hex| {
-                    hex::decode(oid_hex)
-                        .ok()
-                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                        .is_some_and(|id| {
-                            db.get(&id).is_some()
-                                || db.get_spent(&id).is_some_and(|c| c.leaf_index.is_some())
-                        })
-                })
-        })
+        .filter(|e| pegin_outputs_still_owed(e, db))
         .filter_map(|e| {
             let txid = parse_txid(&e.id)?;
             if state.wallet.get_tx(txid).is_some() {
@@ -6289,6 +6321,76 @@ fn prune_unlanded_pegin(state: &mut WalletState, entry_id: &str) {
     let _ = mweb.persist(&state.data_dir);
     diag::log(format!(
         "sync: pruned unlanded peg-in {entry_id} confirmed absent by 2+ indexers"
+    ));
+}
+
+/// A peg-in txid is live only while the wallet still treats it as canonical
+/// and the mempool eviction stamp has not caught up with `last_seen`.
+fn peg_in_tx_still_live(wallet: &PersistedWallet<Connection>, id: &str) -> bool {
+    let Some(txid) = parse_txid(id) else {
+        return false;
+    };
+    if wallet
+        .tx_graph()
+        .get_tx_node(txid)
+        .is_some_and(|node| node.is_evicted())
+    {
+        return false;
+    }
+    wallet.get_tx(txid).is_some()
+}
+
+fn forget_dropped_pegins(state: &mut WalletState) {
+    let dropped: Vec<String> = {
+        let Some(mweb) = state.mweb.as_ref() else {
+            return;
+        };
+        let db = mweb.store.db();
+        mweb.history
+            .entries
+            .iter()
+            .filter(|entry| {
+                let tx_in_wallet = peg_in_tx_still_live(&state.wallet, &entry.id);
+                is_dropped_local_pegin(entry, tx_in_wallet, pegin_outputs_still_owed(entry, db))
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
+    };
+    if dropped.is_empty() {
+        return;
+    }
+    let Some(mweb) = state.mweb.as_mut() else {
+        return;
+    };
+    let outputs: Vec<String> = mweb
+        .history
+        .entries
+        .iter()
+        .filter(|entry| dropped.iter().any(|id| id == &entry.id))
+        .flat_map(|entry| entry.output_ids.clone())
+        .collect();
+    for oid_hex in outputs {
+        let Some(id) = hex::decode(&oid_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        else {
+            continue;
+        };
+        if mweb
+            .store
+            .db()
+            .get(&id)
+            .is_some_and(|coin| coin.leaf_index.is_none())
+        {
+            let _ = mweb.store.db_mut().mark_spent(&id);
+        }
+    }
+    mweb.history.forget_ids(&dropped);
+    let _ = mweb.persist(&state.data_dir);
+    diag::log(format!(
+        "sync: forgot {} dropped peg-in history row(s): {}",
+        dropped.len(),
+        dropped.join(", ")
     ));
 }
 
@@ -8086,6 +8188,41 @@ mod tests {
         assert_eq!(records[0].height, Some(90));
         assert_eq!(records[0].maturity_blocks_left, None);
         assert_eq!(records[0].confirmations, 11);
+    }
+
+    #[test]
+    fn dropped_pegin_is_not_a_maturing_history_row() {
+        let mut landed = MwebHistoryEntry {
+            id: "11".repeat(32),
+            kind: TxKind::Pegin,
+            net_sats: -1_000,
+            fee_sats: Some(100),
+            timestamp: 1,
+            output_ids: vec!["22".repeat(32)],
+            input_ids: Vec::new(),
+            confirmed_height: None,
+        };
+        assert!(
+            !is_dropped_local_pegin(&landed, true, false),
+            "an unconfirmed peg-in still in the wallet stays"
+        );
+        assert!(
+            !is_dropped_local_pegin(&landed, false, true),
+            "a peg-in whose coins are still in the store is repaired, not deleted"
+        );
+        landed.confirmed_height = Some(90);
+        assert!(
+            !is_dropped_local_pegin(&landed, false, false),
+            "a dated peg-in stays in history"
+        );
+        landed.confirmed_height = None;
+        assert!(
+            is_dropped_local_pegin(&landed, false, false),
+            "evicted peg-in with no coins left is the stuck maturing row"
+        );
+        landed.kind = TxKind::MwebReceive;
+        landed.net_sats = 1_000;
+        assert!(!is_dropped_local_pegin(&landed, false, false));
     }
 
     /// A node that cannot be reached must leave the reason and the time on

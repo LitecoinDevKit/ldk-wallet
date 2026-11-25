@@ -1645,7 +1645,7 @@ impl MwebRuntime {
                 timestamp: now_ts(),
                 output_ids: vec![id_hex],
                 input_ids: Vec::new(),
-                confirmed_height: None,
+                confirmed_height: coin.block_height,
             });
         }
     }
@@ -1682,6 +1682,22 @@ fn is_outgoing_mweb(kind: TxKind) -> bool {
         kind,
         TxKind::Pegout | TxKind::MwebSend | TxKind::MwebSplit | TxKind::MwebChurn
     )
+}
+
+/// Copy a coin's inclusion height onto the history row.
+///
+/// `Resync MWEB` deletes the coin store and keeps the history log. Rows that
+/// never stored `confirmed_height` then have nothing left to date them, so
+/// History shows them pending. Call this while the coins are still loaded.
+pub(crate) fn stamp_known_history_heights(history: &mut MwebHistory, db: &MwebCoinDatabase) {
+    for entry in &mut history.entries {
+        if entry.confirmed_height.is_some() {
+            continue;
+        }
+        if let Some(h) = history_entry_height(entry, db) {
+            entry.confirmed_height = Some(h);
+        }
+    }
 }
 
 /// Minimum inclusion height among coins this entry created, if any are dated.
@@ -1869,12 +1885,18 @@ fn update_outgoing_confirmations_at_inner(
     restore_stale_unconfirmed_inputs(history, db, leafset, now);
 
     for entry in &mut history.entries {
-        if entry.confirmed_height.is_some() || !is_outgoing_mweb(entry.kind) {
+        if entry.confirmed_height.is_some() {
             continue;
         }
         if let Some(h) = history_entry_height(entry, db) {
             entry.confirmed_height = Some(h);
-            date_undated_outputs(db, &entry.output_ids, h);
+            if is_outgoing_mweb(entry.kind) {
+                date_undated_outputs(db, &entry.output_ids, h);
+            }
+            continue;
+        }
+        if !is_outgoing_mweb(entry.kind) {
+            date_orphaned_incoming(entry, db, leafset, tip, now);
             continue;
         }
         if entry.input_ids.is_empty() {
@@ -1911,6 +1933,40 @@ fn update_outgoing_confirmations_at_inner(
     }
 
     forget_stale_unlanded_outgoing(history, db, now);
+}
+
+/// A receive or peg-in whose coins are gone after a resync.
+///
+/// The coin store only re-downloads unspent outputs, so a spent receive is not
+/// in the database anymore. It was found on chain when the row was written.
+/// A peg-in is written at broadcast, before it is mined, and a dropped peg-in
+/// looks the same once its coin has been wiped — only an old one is treated as
+/// confirmed.
+fn date_orphaned_incoming(
+    entry: &mut MwebHistoryEntry,
+    db: &MwebCoinDatabase,
+    leafset: &[u8],
+    tip: u32,
+    now: u64,
+) {
+    if entry.output_ids.is_empty() || leafset.is_empty() {
+        return;
+    }
+    let all_absent = entry.output_ids.iter().all(|id_hex| {
+        let Some(id) = decode_output_id(id_hex) else {
+            return false;
+        };
+        db.get(&id).is_none() && db.get_spent(&id).is_none()
+    });
+    if !all_absent {
+        return;
+    }
+    if entry.kind == TxKind::Pegin
+        && now.saturating_sub(entry.timestamp) < UNCONFIRMED_MWEB_REVERT_SECS
+    {
+        return;
+    }
+    entry.confirmed_height = Some(tip);
 }
 
 fn decode_output_id(id_hex: &str) -> Option<[u8; 32]> {
@@ -2256,6 +2312,62 @@ mod tests {
             &[0],
         );
         assert_eq!(got, vec![None, None]);
+    }
+
+    #[test]
+    fn receive_with_dated_coin_persists_confirmed_height() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, Some(150), Some(7)));
+        let got = run(vec![entry(TxKind::MwebReceive, &[1], &[])], &mut db, &[7]);
+        assert_eq!(
+            got,
+            vec![Some(150)],
+            "a receive must keep the coin's height so a later resync can still show it confirmed"
+        );
+    }
+
+    #[test]
+    fn receive_missing_after_resync_confirms_instead_of_staying_pending() {
+        // Resync drops spent coins from the store. The history row remains, with
+        // no coin left to date it, and used to render as pending forever.
+        let got = run(
+            vec![entry(TxKind::MwebReceive, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+        );
+        assert_eq!(got, vec![Some(TIP)]);
+    }
+
+    #[test]
+    fn undated_receive_still_in_the_store_stays_pending() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, None, None));
+        let got = run(vec![entry(TxKind::MwebReceive, &[1], &[])], &mut db, &[9]);
+        assert_eq!(got, vec![None]);
+    }
+
+    #[test]
+    fn recent_pegin_missing_after_resync_stays_pending() {
+        // A peg-in is recorded at broadcast. Absence after a resync is also how
+        // a peg-in the network dropped looks, so a recent one must stay pending.
+        let got = run(
+            vec![entry(TxKind::Pegin, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+        );
+        assert_eq!(got, vec![None]);
+    }
+
+    #[test]
+    fn old_pegin_missing_after_resync_confirms_at_tip() {
+        let now = 1_700_000_000 + UNCONFIRMED_MWEB_REVERT_SECS + 1;
+        let (heights, _) = run_at(
+            vec![entry(TxKind::Pegin, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+            now,
+        );
+        assert_eq!(heights, vec![Some(TIP)]);
     }
 
     #[test]

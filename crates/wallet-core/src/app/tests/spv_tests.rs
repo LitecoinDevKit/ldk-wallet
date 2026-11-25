@@ -1227,8 +1227,11 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let rpc_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rpc_hits_bg = Arc::clone(&rpc_hits);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            rpc_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut stream = stream;
                 let mut buf = [0u8; 1024];
@@ -1266,17 +1269,16 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
     let server = MockElectrumServer::start(state);
     configure_electrum(&app, &server.url, false);
 
-    let started = std::time::Instant::now();
     let res = app.sync().expect("sync succeeds");
-    let elapsed_ms = started.elapsed().as_millis();
     assert!(
         res.warnings.is_empty(),
         "absorbed MWEB peg-in coin must not trigger missing transparent peg-in warning: {:?}",
         res.warnings
     );
-    assert!(
-        elapsed_ms < 1_000,
-        "absorbed MWEB peg-in coin must not stall sync on RPC fallback, took {elapsed_ms} ms"
+    assert_eq!(
+        rpc_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "absorbed MWEB peg-in coin must not call the RPC fallback"
     );
 }
 

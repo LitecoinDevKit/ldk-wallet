@@ -2795,4 +2795,36 @@ mod tests {
             Err(SpvError::InvalidTransaction { .. })
         ));
     }
+
+    #[test]
+    fn audit_f2_historical_anchor_header_must_not_accept_unlinked_pow_limit_header() {
+        // Real Mainnet parameters (no easy_pow_for_test): an already-synced Mainnet wallet
+        // at tip 3_200_000 requests an isolated historical anchor header at height 3_000_000
+        // (below the 2_016-block tip window and outside cached_headers).
+        let mainnet_gen = genesis_block(Network::Bitcoin).header;
+        let fake_tip_hash = BlockHash::from_byte_array([0x55; 32]);
+        let mut chain = VerifiedChain {
+            tip_height: 3_200_000,
+            agreement: 3_200_000,
+            headers: BTreeMap::new(),
+            local_hashes: BTreeMap::from([
+                (0, mainnet_gen.block_hash()),
+                (3_200_000, fake_tip_hash),
+            ]),
+            cached_headers: BTreeMap::new(),
+            sub_ms: 0,
+            range_ms: 0,
+            walk_ms: 0,
+            ancestors_ms: 0,
+            pow_ms: 0,
+        };
+
+        // `mainnet_gen` has prev_blockhash == 00..00 and 2011 minimum difficulty (0x1e0ffff0 <= powLimit),
+        // completely disconnected from Mainnet height 3_000_000. It must not be accepted as block 3_000_000.
+        let res = chain.verify_and_store_header(3_000_000, mainnet_gen, WalletNetwork::Mainnet);
+        assert!(
+            res.is_err(),
+            "unlinked powLimit header (prev_blockhash=00..00, bits=0x1e0ffff0) was accepted as Mainnet height 3_000_000: {res:?}"
+        );
+    }
 }

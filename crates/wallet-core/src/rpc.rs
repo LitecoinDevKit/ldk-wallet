@@ -202,6 +202,82 @@ mod tests {
         assert!(!url_has_credentials("http://127.0.0.1:9332"));
         assert!(!url_has_credentials("http://127.0.0.1:9332/path?a=b@c"));
     }
+
+    #[test]
+    fn audit_f9a_non_loopback_rpc_must_not_attach_local_mainnet_cookie() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, UdpSocket};
+
+        if let Ok(target_url) = std::env::var("LDK_AUDIT_F9A_RPC_URL") {
+            let _ = get_block_count(&target_url);
+            return;
+        }
+
+        let probe = UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect("198.51.100.1:80").unwrap();
+        let lan_ip = probe.local_addr().unwrap().ip();
+        assert!(
+            !lan_ip.is_loopback(),
+            "expected non-loopback local interface IP, got {lan_ip}"
+        );
+
+        let fake_home = tempfile::tempdir().unwrap();
+        for rel in ["Library/Application Support/Litecoin", ".litecoin"] {
+            let cookie_dir = fake_home.path().join(rel);
+            std::fs::create_dir_all(&cookie_dir).unwrap();
+            std::fs::write(
+                cookie_dir.join(".cookie"),
+                "__cookie__:secret-mainnet-cookie-token\n",
+            )
+            .unwrap();
+        }
+
+        let listener = TcpListener::bind((lan_ip, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            let body = br#"{"result":100,"error":null,"id":"ltc-wallet"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut writer = stream;
+            let _ = writer.write_all(resp.as_bytes());
+            let _ = writer.write_all(body);
+            headers
+        });
+
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("rpc::tests::audit_f9a_non_loopback_rpc_must_not_attach_local_mainnet_cookie")
+            .arg("--nocapture")
+            .env("HOME", fake_home.path())
+            .env("LDK_AUDIT_F9A_RPC_URL", format!("http://{addr}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let captured_headers = handle.join().unwrap();
+        assert!(
+            !captured_headers
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "local Mainnet .cookie Basic auth leaked to non-loopback RPC host {addr}:\n{captured_headers}"
+        );
+    }
 }
 
 /// Read `__cookie__:<token>` from the default litecoind mainnet data directory

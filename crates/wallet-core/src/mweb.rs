@@ -3872,6 +3872,90 @@ mod tests {
         update_outgoing_confirmations(&mut history, &mut db, &[], TIP);
         assert_eq!(history.entries[0].confirmed_height, None);
     }
+
+    #[test]
+    fn audit_f6_sealed_mweb_rejects_deleted_enc_downgrade_and_scans_beyond_gap_limit() {
+        let (dir, secret, key) = sealed_fixture();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        assert_eq!(load_seal_counter(dir.path()), 1);
+
+        // 1. Deleting sealed v2 blobs and planting unauthenticated plaintext files when
+        // seal_counter > 0 must fail open rather than silently wiping coins / accepting
+        // an unauthenticated receive_index beyond MWEB_GAP_LIMIT.
+        std::fs::remove_file(meta::mweb_coins_enc_path(dir.path())).unwrap();
+        std::fs::remove_file(meta::mweb_index_enc_path(dir.path())).unwrap();
+        std::fs::write(
+            meta::mweb_index_path(dir.path()),
+            format!("{}\n", MWEB_GAP_LIMIT + 50),
+        )
+        .unwrap();
+
+        let downgraded = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            WalletNetwork::Testnet,
+            scheme,
+            0,
+            Some(zeroize::Zeroizing::new(key)),
+        );
+        assert!(
+            downgraded.is_err(),
+            "deleting mweb_coins.enc + mweb_receive_index.enc and planting plaintext receive_index succeeded despite seal_counter=1"
+        );
+    }
+
+    #[test]
+    fn audit_f6b_receive_index_at_gap_limit_must_remain_scannable_by_address_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = crate::seed::MasterSecret::parse(
+            &crate::descriptors::generate_mnemonic().unwrap(),
+            None,
+        )
+        .unwrap();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        save_receive_index(dir.path(), MWEB_GAP_LIMIT).unwrap();
+
+        let rt = MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None)
+            .unwrap();
+        assert_eq!(rt.receive_index, MWEB_GAP_LIMIT);
+
+        // Build a peg-in paying our own current `rt.receive_index` (1000) and verify `rt.book` scans it.
+        let mut funded = bdk_mweb::fund_mweb_pegin(
+            &rt.keys,
+            rt.receive_index,
+            200_000,
+            2_100,
+            NetworkKind::Test,
+            &rt.secp,
+        )
+        .unwrap();
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut funded, &rt.keys, &rt.secp).unwrap();
+        let tx = bdk_wallet::bitcoin::Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+            mw_tx: Some(bdk_wallet::bitcoin::blockdata::mimblewimble::Transaction {
+                kernel_offset: funded.psbt.mweb_tx_offset.unwrap_or([0u8; 32]),
+                stealth_offset: funded.psbt.mweb_stealth_offset.unwrap_or([0u8; 32]),
+                body: bdk_wallet::bitcoin::blockdata::mimblewimble::TxBody {
+                    inputs: Vec::new(),
+                    outputs: vec![funded.staged_outputs[0].output.clone()],
+                    kernels: Vec::new(),
+                },
+            }),
+            is_hog_ex: false,
+        };
+        let mut scan_db = MwebCoinDatabase::default();
+        let found =
+            bdk_mweb::scan_litecoin_tx(&rt.keys, &rt.book, &tx, &mut scan_db, &rt.secp).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "MwebRuntime::open capped AddressBook at MWEB_GAP_LIMIT ({MWEB_GAP_LIMIT}) despite receive_index={}; payments to receive_address() are invisible to sync",
+            rt.receive_index
+        );
+    }
 }
 
 /// Remove MWEB store/sync/index files for a from-scratch resync.
@@ -7454,6 +7538,92 @@ mod sync_failover_tests {
                 .iter()
                 .any(|l| l.contains("more than 1 mwebutxos") || l.contains("unproductive budget exhausted")),
             "must not hit dirty-socket protocol violation or false unproductive budget exhaustion, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn audit_f8_find_output_leaf_rejects_unproven_out_of_bounds_leaf_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = test_runtime(tmp.path());
+        let mut pegin =
+            bdk_mweb::fund_mweb_pegin(&rt.keys, 0, 100_000, 2_100, NetworkKind::Test, &rt.secp)
+                .expect("fund pegin output");
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut pegin, &rt.keys, &rt.secp).unwrap();
+        let pegin_tx = extract_prepared_mweb_pegin(&pegin.psbt).unwrap();
+        let sample_output = pegin_tx.mw_tx.unwrap().body.outputs[0].clone();
+        let want_hex = hex::encode(bdk_mweb::scan::output_id(&sample_output));
+
+        let tip_hash = BlockHash::from_byte_array([0x77; 32]);
+        let forged_leaf_index: u64 = 999_999; // Far outside [start_index=1, end_output_mmr=5)
+        let raw_mwebutxos = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 1,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![bdk_mweb::p2p::MwebUtxoEntry {
+                leaf_index: forged_leaf_index,
+                output: sample_output,
+            }],
+            parent_hashes: Vec::new(),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                let mut buf = Vec::new();
+                let Some(first) = read_msg(&mut stream, &mut buf) else {
+                    return;
+                };
+                if !matches!(first.payload(), NetworkMessage::Version(_)) {
+                    return;
+                }
+                let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let ver = VersionMessage::new(
+                    ServiceFlags::from(NODE_MWEB_LIGHT_CLIENT),
+                    0,
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    1,
+                    "/mock-mweb:0.1/".into(),
+                    100,
+                );
+                let _ = send_msg(&mut stream, NetworkMessage::Version(ver));
+                let _ = send_msg(&mut stream, NetworkMessage::Verack);
+                while let Some(msg) = read_msg(&mut stream, &mut buf) {
+                    match msg.into_payload() {
+                        NetworkMessage::Unknown { command, .. }
+                            if command.as_ref() == "getmwebutxos" =>
+                        {
+                            let _ = send_raw_cmd(&mut stream, "mwebutxos", &raw_mwebutxos);
+                        }
+                        NetworkMessage::Ping(nonce)
+                            if !send_msg(&mut stream, NetworkMessage::Pong(nonce)) =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let got = find_output_leaf(
+            &[peer_addr],
+            WalletNetwork::Testnet,
+            tip_hash,
+            1,
+            5,
+            &want_hex,
+        );
+        TEST_PEER_POLICY.with(|c| c.set(None));
+
+        assert_ne!(
+            got,
+            ChainLeaf::Found(forged_leaf_index),
+            "find_output_leaf accepted unproven out-of-bounds leaf_index={forged_leaf_index} for window [1, 5)"
         );
     }
 }

@@ -735,6 +735,14 @@ async fn pegin_ltc(
 }
 
 #[tauri::command]
+async fn clear_pegin(state: State<'_, Arc<WalletApp>>, txid: String) -> Result<(), String> {
+    let wallet = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || wallet.clear_pegin(&txid).map_err(map_err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn preview_mweb_send(
     state: State<'_, Arc<WalletApp>>,
     req: MwebSendRequest,
@@ -1084,6 +1092,7 @@ pub fn run() {
             send_ltc,
             preview_pegin,
             pegin_ltc,
+            clear_pegin,
             preview_mweb_send,
             mweb_send_ltc,
             preview_pegout,

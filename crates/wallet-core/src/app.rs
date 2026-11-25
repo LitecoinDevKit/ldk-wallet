@@ -238,6 +238,41 @@ fn is_dropped_local_pegin(
         && !outputs_still_owed
 }
 
+/// How long a peg-in can stay unseen before a sync may call it unrelayed.
+///
+/// A peer that does not echo the tx can still be relaying it. Litecoin blocks
+/// are a couple of minutes apart, so one quiet sync is not a rejection.
+const PEGIN_ABSENT_GRACE_SECS: u64 = 180;
+
+/// A local peg-in a sync has already failed to find, which is still not in a block.
+///
+/// History shows "Not relayed" and Clear. A peg-in that is only missing a
+/// broadcast echo stays pending until it is mined or this grace expires.
+fn pegin_can_clear(
+    entry: &crate::mweb_history::MwebHistoryEntry,
+    tx_confirmed: bool,
+    output_on_chain: bool,
+) -> bool {
+    is_local_pegin_entry(entry)
+        && entry.absent
+        && entry.confirmed_height.is_none()
+        && !tx_confirmed
+        && !output_on_chain
+}
+
+fn pegin_output_has_leaf(
+    entry: &crate::mweb_history::MwebHistoryEntry,
+    db: &bdk_mweb::MwebCoinDatabase,
+) -> bool {
+    entry.output_ids.iter().any(|oid_hex| {
+        hex::decode(oid_hex)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .and_then(|id| db.get(&id).or_else(|| db.get_spent(&id)))
+            .is_some_and(|coin| coin.leaf_index.is_some())
+    })
+}
+
 /// True when repair should still look up the transparent peg-in. Empty output
 /// lists are the legacy rows that credited nothing we can see. Coins still in
 /// the store, or spent with a leaf, were credited and the spend may be missing.
@@ -1777,6 +1812,7 @@ impl WalletApp {
                     timestamp,
                     kind,
                     maturity_blocks_left: None,
+                    can_clear: false,
                 }
             })
             .collect();
@@ -2793,6 +2829,8 @@ impl WalletApp {
                         persist_started.elapsed().as_millis() as u64
                     ));
                     persisted.map_err(|e| (e, false))?;
+                    note_pegin_chain_status(state, &outcome.unreported_protected)
+                        .map_err(|e| (e, false))?;
                     self.remember_electrum(used.clone());
                     crate::crashpoint::maybe_crash("sync_after_electrum_persist");
                     let electrum_ms = electrum_started.elapsed().as_millis() as u64;
@@ -2957,6 +2995,7 @@ impl WalletApp {
         // this has to run even when there is nothing to re-fetch.
         let repair_started = std::time::Instant::now();
         if state.mweb.is_some() {
+            clear_unproven_pegin_heights(state);
             forget_dropped_pegins(state);
         }
         let missing = missing_pegin_ids(state);
@@ -3258,6 +3297,14 @@ impl WalletApp {
             .map_err(|e| WalletError::Persist(e.to_string()))?;
         mweb.persist(&state.data_dir)?;
         Ok(result)
+    }
+
+    /// Drop a peg-in that no peer accepted, and return its transparent inputs.
+    pub fn clear_pegin(&self, txid: &str) -> Result<(), WalletError> {
+        self.ensure_unlocked()?;
+        let mut guard = self.lock_state()?;
+        let state = guard.as_mut().ok_or(WalletError::NotLoaded)?;
+        clear_unrelayed_pegin(state, txid)
     }
 
     pub fn preview_mweb_send(&self, req: MwebSendRequest) -> Result<MwebSendPreview, WalletError> {
@@ -4847,8 +4894,12 @@ impl MemoryBackedApp {
     }
 }
 
-/// Estimated vbytes for a typical peg-in (1–2 inputs + HogEx output + change).
+/// Floor for a small peg-in. Real sizes from [`estimate_pegin_vb`] are higher
+/// once several inputs are selected.
 const PEGIN_FEE_VB_ESTIMATE: u64 = 250;
+/// Extra vbytes on top of the worst-case size. A peg-in priced at the exact
+/// relay floor was rejected for being 11 litoshis short.
+const PEGIN_FEE_VB_BUFFER: u64 = 16;
 
 /// One-output self-spend. The request has no fee field; every new hop pays this.
 fn self_spend_hop_fee() -> u64 {
@@ -4902,11 +4953,42 @@ fn choose_auto_kernel_fee(
     }
 }
 
-fn estimate_pegin_vb(n_inputs: usize) -> u64 {
-    11u64
-        .saturating_add(43)
-        .saturating_add(31)
-        .saturating_add(68u64.saturating_mul(n_inputs.max(1) as u64))
+fn compact_size_len(n: u64) -> u64 {
+    if n < 253 {
+        1
+    } else if n <= u16::MAX as u64 {
+        3
+    } else {
+        5
+    }
+}
+
+/// Virtual size Core uses for the transparent peg-in, plus [`PEGIN_FEE_VB_BUFFER`].
+///
+/// `GetTransactionWeight` bills the segwit transaction with the MWEB body
+/// stripped, then adds 164 weight units per peg-in kernel (a 41-byte input at
+/// the witness scale). Witness size assumes a 73-byte signature, the longest
+/// standard DER encoding. `n_outputs` is the peg-in output plus change when
+/// coin selection may add one.
+fn estimate_pegin_vb(n_inputs: usize, n_outputs: usize) -> u64 {
+    let n_inputs = n_inputs.max(1) as u64;
+    let n_outputs = n_outputs.max(1) as u64;
+    // P2WPKH base input is 41 bytes. Worst-case witness is stack count, a
+    // 73-byte signature, and a 33-byte pubkey, each with its length byte.
+    const WITNESS_PER_INPUT: u64 = 1 + 1 + 73 + 1 + 33;
+    const OUTPUT_BYTES: u64 = 8 + 1 + 34;
+    const PEGIN_KERNEL_WEIGHT: u64 = 164;
+    let stripped = 4
+        + compact_size_len(n_inputs)
+        + 41 * n_inputs
+        + compact_size_len(n_outputs)
+        + OUTPUT_BYTES * n_outputs
+        + 4;
+    let total = stripped + 2 + WITNESS_PER_INPUT * n_inputs;
+    let weight = stripped * 3 + total + PEGIN_KERNEL_WEIGHT;
+    let vsize = weight.div_ceil(4);
+    vsize
+        .saturating_add(PEGIN_FEE_VB_BUFFER)
         .max(PEGIN_FEE_VB_ESTIMATE)
 }
 
@@ -5071,10 +5153,12 @@ fn resolve_pegin_request(
         }
         count.max(1)
     };
+    // Drain spends the selection with no change. Any other peg-in may add one.
+    let n_outputs = if req.drain { 1 } else { 2 };
     let transparent_fee_sats = auto_pegin_transparent_fee(
         state,
         req.transparent_fee_sats,
-        estimate_pegin_vb(estimated_inputs),
+        estimate_pegin_vb(estimated_inputs, n_outputs),
     )?;
 
     let amount_sats = if req.drain {
@@ -6338,6 +6422,258 @@ fn peg_in_tx_still_live(wallet: &PersistedWallet<Connection>, id: &str) -> bool 
         return false;
     }
     wallet.get_tx(txid).is_some()
+}
+
+/// The transparent peg-in is still unconfirmed in this wallet.
+fn pegin_tx_is_unconfirmed(wallet: &PersistedWallet<Connection>, id: &str) -> bool {
+    let Some(txid) = parse_txid(id) else {
+        return false;
+    };
+    if wallet
+        .tx_graph()
+        .get_tx_node(txid)
+        .is_some_and(|node| node.is_evicted())
+    {
+        return false;
+    }
+    matches!(
+        wallet.get_tx(txid).as_ref().map(|tx| &tx.pos),
+        Some(ChainPosition::Unconfirmed { .. })
+    )
+}
+
+/// Drop the tip height `apply_pegin_locally` used to stamp at broadcast.
+///
+/// A peg-in with no output leaf is not in a block. Electrum also leaves a
+/// confirmed hybrid transaction unconfirmed, so a coin that already has a leaf
+/// keeps its height.
+fn clear_unproven_pegin_heights(state: &mut WalletState) {
+    let targets: Vec<(String, Vec<String>, Option<u32>)> = {
+        let Some(mweb) = state.mweb.as_ref() else {
+            return;
+        };
+        mweb.history
+            .entries
+            .iter()
+            .filter(|entry| {
+                is_local_pegin_entry(entry) && pegin_tx_is_unconfirmed(&state.wallet, &entry.id)
+            })
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    entry.output_ids.clone(),
+                    entry.confirmed_height,
+                )
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let Some(mweb) = state.mweb.as_mut() else {
+        return;
+    };
+    let mut cleared = 0u32;
+    for (id, outputs, confirmed_height) in targets {
+        let mut saw_leaf = false;
+        let mut cleared_coin = false;
+        for oid_hex in &outputs {
+            let Some(oid) = hex::decode(oid_hex)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            else {
+                continue;
+            };
+            let Some(coin) = mweb.store.db().get(&oid).cloned() else {
+                continue;
+            };
+            if coin.leaf_index.is_some() {
+                saw_leaf = true;
+                continue;
+            }
+            if coin.block_height.is_some() {
+                let mut coin = coin;
+                coin.block_height = None;
+                mweb.store.db_mut().insert(coin);
+                cleared_coin = true;
+            }
+        }
+        if cleared_coin && !saw_leaf && confirmed_height.is_some() {
+            if let Some(entry) = mweb.history.entries.iter_mut().find(|entry| entry.id == id) {
+                entry.confirmed_height = None;
+            }
+        }
+        if cleared_coin {
+            cleared += 1;
+        }
+    }
+    if cleared == 0 {
+        return;
+    }
+    let _ = mweb.persist(&state.data_dir);
+    diag::log(format!(
+        "sync: cleared broadcast height on {cleared} unconfirmed peg-in(s)"
+    ));
+}
+
+fn pegin_anchor_height(wallet: &bdk_wallet::Wallet, txid: Txid) -> Option<u32> {
+    match wallet.get_tx(txid)?.pos {
+        ChainPosition::Confirmed { anchor, .. } => Some(anchor.block_id.height),
+        ChainPosition::Unconfirmed { .. } => None,
+    }
+}
+
+/// A mined peg-in is relayed, whatever the broadcast echo said. A peg-in that
+/// stays out of the server's history past the grace is the one Clear can drop.
+fn note_pegin_chain_status(
+    state: &mut WalletState,
+    unreported: &std::collections::BTreeSet<Txid>,
+) -> Result<(), WalletError> {
+    let now = crate::mweb_history::now_ts();
+    let mut notes = Vec::new();
+    let Some(mweb) = state.mweb.as_ref() else {
+        return Ok(());
+    };
+    for entry in &mweb.history.entries {
+        if !is_local_pegin_entry(entry) {
+            continue;
+        }
+        let on_chain = pegin_output_has_leaf(entry, mweb.store.db());
+        let height = entry.confirmed_height.or_else(|| {
+            parse_txid(&entry.id).and_then(|id| pegin_anchor_height(&state.wallet, id))
+        });
+        let confirmed = height.is_some() || on_chain;
+        let (relayed, absent) = if confirmed {
+            (true, false)
+        } else {
+            let unseen = parse_txid(&entry.id).is_some_and(|id| unreported.contains(&id));
+            let old = now.saturating_sub(entry.timestamp) >= PEGIN_ABSENT_GRACE_SECS;
+            (entry.relayed, unseen && old)
+        };
+        let undated_coin = height.is_some_and(|h| {
+            entry.output_ids.iter().any(|oid_hex| {
+                hex::decode(oid_hex)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    .and_then(|id| mweb.store.db().get(&id))
+                    .is_some_and(|coin| coin.block_height != Some(h))
+            })
+        });
+        if entry.relayed == relayed
+            && entry.absent == absent
+            && (height.is_none() || entry.confirmed_height == height)
+            && !undated_coin
+        {
+            continue;
+        }
+        notes.push((
+            entry.id.clone(),
+            relayed,
+            absent,
+            height,
+            entry.output_ids.clone(),
+            undated_coin,
+        ));
+    }
+    if notes.is_empty() {
+        return Ok(());
+    }
+    let Some(mweb) = state.mweb.as_mut() else {
+        return Ok(());
+    };
+    for (id, relayed, absent, height, output_ids, undated_coin) in notes {
+        if let Some(entry) = mweb.history.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.relayed = relayed;
+            entry.absent = absent;
+            if entry.confirmed_height.is_none() {
+                entry.confirmed_height = height;
+            }
+        }
+        if undated_coin {
+            if let Some(h) = height {
+                for oid_hex in output_ids {
+                    let Some(id) = hex::decode(&oid_hex)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    else {
+                        continue;
+                    };
+                    if mweb.store.db().get(&id).is_some() {
+                        let _ = mweb.store.db_mut().set_block_height(&id, h);
+                    }
+                }
+            }
+        }
+        diag::log(format!(
+            "pegin: {} relayed={relayed} absent={absent} height={}",
+            id,
+            height.map(|h| h.to_string()).unwrap_or_else(|| "-".into())
+        ));
+    }
+    mweb.persist(&state.data_dir)
+}
+
+fn clear_unrelayed_pegin(state: &mut WalletState, txid: &str) -> Result<(), WalletError> {
+    let entry = state
+        .mweb
+        .as_ref()
+        .and_then(|mweb| mweb.history.entries.iter().find(|entry| entry.id == txid))
+        .cloned()
+        .ok_or_else(|| WalletError::Mweb("That peg-in is not in this wallet.".into()))?;
+    let output_on_chain = state
+        .mweb
+        .as_ref()
+        .is_some_and(|mweb| pegin_output_has_leaf(&entry, mweb.store.db()));
+    let tx_confirmed = parse_txid(txid).is_some_and(|id| {
+        state
+            .wallet
+            .get_tx(id)
+            .is_some_and(|tx| matches!(tx.pos, ChainPosition::Confirmed { .. }))
+    });
+    if !pegin_can_clear(&entry, tx_confirmed, output_on_chain) {
+        return Err(WalletError::Mweb(
+            "This peg-in is on the network and cannot be cleared.".into(),
+        ));
+    }
+    if let Some(id) = parse_txid(txid) {
+        if state.wallet.get_tx(id).is_some() {
+            let seen = state
+                .wallet
+                .tx_graph()
+                .get_tx_node(id)
+                .and_then(|node| node.last_seen)
+                .unwrap_or(0);
+            let ts = crate::mweb_history::now_ts().max(seen);
+            state.wallet.apply_evicted_txs([(id, ts)]);
+            state
+                .wallet
+                .persist(&mut state.db)
+                .map_err(|e| WalletError::Persist(e.to_string()))?;
+        }
+    }
+    let Some(mweb) = state.mweb.as_mut() else {
+        return Err(WalletError::Mweb("MWEB runtime not initialized".into()));
+    };
+    for oid_hex in &entry.output_ids {
+        let Some(id) = hex::decode(oid_hex)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        else {
+            continue;
+        };
+        if mweb
+            .store
+            .db()
+            .get(&id)
+            .is_some_and(|coin| coin.leaf_index.is_none())
+        {
+            let _ = mweb.store.db_mut().mark_spent(&id);
+        }
+    }
+    mweb.history.forget_ids(&[txid.to_string()]);
+    mweb.persist(&state.data_dir)?;
+    diag::log(format!("pegin: cleared unrelayed {txid}"));
+    Ok(())
 }
 
 fn forget_dropped_pegins(state: &mut WalletState) {
@@ -8054,6 +8390,11 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
             }
             records[i].maturity_blocks_left =
                 mweb::pegin_blocks_left(records[i].kind, records[i].confirmations);
+            records[i].can_clear = pegin_can_clear(
+                entry,
+                records[i].confirmations > 0,
+                pegin_output_has_leaf(entry, mweb.store.db()),
+            );
             continue;
         }
         // Prefer the height resolved and persisted at sync time (covers
@@ -8080,6 +8421,11 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
             timestamp: Some(entry.timestamp),
             kind: entry.kind,
             maturity_blocks_left: mweb::pegin_blocks_left(entry.kind, confirmations),
+            can_clear: pegin_can_clear(
+                entry,
+                confirmations > 0,
+                pegin_output_has_leaf(entry, mweb.store.db()),
+            ),
         });
     }
 }
@@ -8111,6 +8457,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: Some(90),
         });
         mweb.history.record(MwebHistoryEntry {
@@ -8121,6 +8469,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let mut records = Vec::new();
@@ -8167,6 +8517,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: vec![hex::encode(output_id)],
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let mut records = vec![TxRecord {
@@ -8180,6 +8532,7 @@ mod tests {
             timestamp: Some(1_700_000_000),
             kind: TxKind::Transparent,
             maturity_blocks_left: None,
+            can_clear: false,
         }];
         merge_mweb_history(&mut records, &mweb, 100);
         assert_eq!(records.len(), 1);
@@ -8188,6 +8541,50 @@ mod tests {
         assert_eq!(records[0].height, Some(90));
         assert_eq!(records[0].maturity_blocks_left, None);
         assert_eq!(records[0].confirmations, 11);
+    }
+
+    #[test]
+    fn unrelayed_pegin_can_be_cleared_and_a_relayed_one_cannot() {
+        let mut entry = MwebHistoryEntry {
+            id: "11".repeat(32),
+            kind: TxKind::Pegin,
+            net_sats: -1_000,
+            fee_sats: Some(100),
+            timestamp: 1,
+            output_ids: vec!["22".repeat(32)],
+            input_ids: Vec::new(),
+            confirmed_height: None,
+            relayed: false,
+            absent: false,
+        };
+        assert!(
+            !pegin_can_clear(&entry, false, false),
+            "a missing broadcast echo is not proof it failed"
+        );
+        entry.absent = true;
+        assert!(
+            pegin_can_clear(&entry, false, false),
+            "a sync looked and the peg-in was not on the network"
+        );
+        entry.relayed = true;
+        assert!(pegin_can_clear(&entry, false, false));
+        entry.confirmed_height = Some(90);
+        assert!(!pegin_can_clear(&entry, false, false));
+        entry.confirmed_height = None;
+        assert!(!pegin_can_clear(&entry, true, false));
+        assert!(!pegin_can_clear(&entry, false, true));
+    }
+
+    #[test]
+    fn nine_input_pegin_estimate_clears_the_fee_that_was_rejected() {
+        // e125889d… was 708 vbytes. Pricing it as 697 vbytes at 1 lit/vB left
+        // it 11 litoshis under minRelayTxFee, and every peer returned notfound.
+        let vb = estimate_pegin_vb(9, 1);
+        assert!(
+            vb >= 708 + PEGIN_FEE_VB_BUFFER,
+            "9-input peg-in estimated {vb} vbytes"
+        );
+        assert!(estimate_pegin_vb(9, 2) > vb);
     }
 
     #[test]
@@ -8200,6 +8597,8 @@ mod tests {
             timestamp: 1,
             output_ids: vec!["22".repeat(32)],
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         };
         assert!(

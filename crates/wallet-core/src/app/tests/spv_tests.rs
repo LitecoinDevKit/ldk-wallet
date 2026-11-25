@@ -845,6 +845,8 @@ fn switching_servers_drops_cached_server_unconfirmed_state_but_preserves_local_a
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = state.data_dir.clone();
@@ -963,6 +965,8 @@ fn repair_missing_pegin_spends_rejects_mismatched_txid_and_invalid_tx() {
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = st.data_dir.clone();
@@ -1170,6 +1174,8 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = st.data_dir.clone();
@@ -1260,6 +1266,8 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
             timestamp: crate::mweb_history::now_ts(),
             output_ids: vec![absorbed_output_id],
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: Some(1),
         });
         let data_dir = st.data_dir.clone();

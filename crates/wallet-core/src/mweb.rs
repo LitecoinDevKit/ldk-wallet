@@ -1645,6 +1645,8 @@ impl MwebRuntime {
                 timestamp: now_ts(),
                 output_ids: vec![id_hex],
                 input_ids: Vec::new(),
+                relayed: false,
+                absent: false,
                 confirmed_height: coin.block_height,
             });
         }
@@ -2101,6 +2103,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: outputs.iter().map(|&b| id_hex(b)).collect(),
             input_ids: inputs.iter().map(|&b| id_hex(b)).collect(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         }
     }
@@ -3072,7 +3076,12 @@ mod tests {
     fn pegin_blocks_left_only_while_a_pegin_matures() {
         assert_eq!(
             pegin_blocks_left(TxKind::Pegin, 0),
-            Some(MWEB_PEGIN_MATURITY)
+            None,
+            "zero confirmations is pending, not maturing"
+        );
+        assert_eq!(
+            pegin_blocks_left(TxKind::Pegin, 1),
+            Some(MWEB_PEGIN_MATURITY - 1)
         );
         assert_eq!(
             pegin_blocks_left(TxKind::Pegin, 2),
@@ -4579,8 +4588,8 @@ pub fn pegin(
     )?;
     // A peg-in tx carries MWEB extension data that Electrum servers reject
     // ("TX decode failed"), so it must take the RPC/P2P path like other MWEB txs.
-    broadcast_mweb_tx(&tx, route)?;
-    apply_pegin_locally(wallet, runtime, &tx, prepared.outputs, &req)
+    let relayed = broadcast_mweb_tx(&tx, route)?;
+    apply_pegin_locally(wallet, runtime, &tx, prepared.outputs, &req, relayed)
 }
 
 /// Credit MWEB outputs and debit transparent inputs for a peg-in we just built
@@ -4592,13 +4601,15 @@ pub(crate) fn apply_pegin_locally(
     tx: &bdk_wallet::bitcoin::Transaction,
     outputs: Vec<bdk_mweb::MwebCoin>,
     req: &PeginRequest,
+    relayed: bool,
 ) -> Result<PeginResult, WalletError> {
-    let tip = wallet.latest_checkpoint().height();
     let ts = now_ts();
     let mut output_ids = Vec::new();
     for mut coin in outputs {
         coin.is_pegin = true;
-        coin.block_height = Some(tip);
+        // Inclusion height comes from a later scan. Stamping the tip here makes
+        // an unbroadcast peg-in look confirmed and maturing.
+        coin.block_height = None;
         output_ids.push(hex::encode(coin.output_id));
         runtime.store.db_mut().insert(coin);
     }
@@ -4630,6 +4641,8 @@ pub(crate) fn apply_pegin_locally(
             output_ids,
             input_ids: Vec::new(),
             confirmed_height: None,
+            relayed,
+            absent: false,
         });
     }
     Ok(PeginResult {
@@ -4660,17 +4673,19 @@ pub(crate) fn apply_pegin_transparent_spend(
 /// while litecoind RPC submits it as our own and gives up that origin privacy.
 /// RPC is the fallback when no peer accepts it, unless the user opted in to
 /// [`BroadcastRoute::via_own_node`], which puts RPC first.
+/// `Ok(true)` means a peer or the user's node accepted the transaction.
+/// `Ok(false)` means a peer took the bytes and never confirmed acceptance.
 pub(crate) fn broadcast_mweb_tx(
     tx: &bdk_wallet::bitcoin::Transaction,
     route: &BroadcastRoute,
-) -> Result<(), WalletError> {
+) -> Result<bool, WalletError> {
     let rpc_first = route.rpc_first();
     let mut own_node_err = None;
     if let Some(url) = rpc_first {
         match rpc::send_raw_transaction_for_network(url, &serialize_hex(tx), Some(route.network)) {
             Ok(_) => {
                 crate::diag::log("MWEB broadcast: sent through your own node (Settings opt-in)");
-                return Ok(());
+                return Ok(true);
             }
             Err(e) => {
                 crate::diag::log(format!(
@@ -4723,13 +4738,13 @@ pub(crate) fn broadcast_mweb_tx(
     }
 
     if run.confirmed.is_some() {
-        return Ok(());
+        return Ok(true);
     }
     if let Some(addr) = run.sent.first() {
         crate::diag::log(format!(
             "MWEB broadcast: no peer confirmed acceptance; keeping optimistic send via {addr}"
         ));
-        return Ok(());
+        return Ok(false);
     }
     let p2p_err = run.error();
     if let Some(rpc_err) = own_node_err {
@@ -4748,7 +4763,7 @@ pub(crate) fn broadcast_mweb_tx(
             crate::diag::log(format!(
                 "MWEB broadcast: fell back to litecoind RPC ({p2p_err})"
             ));
-            Ok(())
+            Ok(true)
         }
         Err(rpc_err) => Err(WalletError::Mweb(format!(
             "could not broadcast over P2P ({p2p_err}) or litecoind RPC ({rpc_err})"
@@ -5013,6 +5028,8 @@ pub fn apply_signed_mweb_send(
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.input_ids(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
     signed.result()
@@ -5251,9 +5268,15 @@ pub(crate) fn coin_block_message(block: CoinBlock) -> String {
 }
 
 /// Blocks left before a peg-in's private coin is spendable, or `None` once it is.
+///
+/// Zero confirmations means the peg-in is not in a block yet, so it is pending
+/// rather than maturing.
 pub(crate) fn pegin_blocks_left(kind: TxKind, confirmations: u32) -> Option<u32> {
+    if kind != TxKind::Pegin || confirmations == 0 {
+        return None;
+    }
     let left = MWEB_PEGIN_MATURITY.saturating_sub(confirmations);
-    (kind == TxKind::Pegin && left > 0).then_some(left)
+    (left > 0).then_some(left)
 }
 
 struct ChurnFields {
@@ -6016,6 +6039,8 @@ pub fn apply_signed_mweb_split(runtime: &mut MwebRuntime, signed: &SignedMwebSpl
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.spent_ids.iter().map(hex::encode).collect(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
 }
@@ -6170,6 +6195,8 @@ pub fn apply_prepared_output(
             timestamp: now_ts(),
             output_ids: vec![output_id],
             input_ids: vec![spent_output_id.to_string()],
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
     }
@@ -6180,7 +6207,7 @@ pub fn apply_prepared_output(
 pub fn broadcast_prepared_raw(raw_hex: &str, route: &BroadcastRoute) -> Result<(), WalletError> {
     let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
     let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, route)
+    broadcast_mweb_tx(&tx, route).map(|_| ())
 }
 
 /// One successful read of the node mempool for the cover gate.
@@ -6613,6 +6640,8 @@ pub fn apply_signed_pegout(
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.input_ids(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
     MwebBroadcastResult {

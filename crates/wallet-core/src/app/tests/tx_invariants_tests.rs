@@ -308,6 +308,8 @@ fn f6_merge_mweb_history_handles_i64_min_without_overflow_panic() {
         timestamp: 1_700_000_000,
         output_ids: Vec::new(),
         input_ids: Vec::new(),
+        relayed: false,
+        absent: false,
         confirmed_height: Some(10),
     });
     let mut records = Vec::new();

@@ -233,6 +233,9 @@ impl From<SpvError> for WalletError {
 pub struct SpvSyncOutcome {
     pub tip_height: u32,
     pub tip_time: u64,
+    /// Protected txids this server did not list. Peg-ins in here were not in
+    /// its mempool or a block.
+    pub unreported_protected: BTreeSet<Txid>,
     account_dir: PathBuf,
     state: ElectrumSpvState,
 }
@@ -2394,6 +2397,11 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
     }
     next.last_sync_ts = sync_ts;
 
+    let unreported_protected: BTreeSet<Txid> = protected
+        .iter()
+        .copied()
+        .filter(|txid| !out.reported.contains(txid))
+        .collect();
     let tx_update = out.tx_update;
     if full_scan {
         wallet.apply_update(FullScanResponse {
@@ -2412,6 +2420,7 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
     Ok(SpvSyncOutcome {
         tip_height: chain.tip_height,
         tip_time: u64::from(tip.time),
+        unreported_protected,
         account_dir,
         state: next,
     })

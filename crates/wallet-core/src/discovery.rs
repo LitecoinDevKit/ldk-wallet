@@ -68,30 +68,62 @@ static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 static CRAWL_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
+#[derive(Default)]
+struct TestDiscoveryState {
+    offline: bool,
+    peers: Option<Vec<SocketAddr>>,
+    demoted: Vec<SocketAddr>,
+}
+
+#[cfg(test)]
 thread_local! {
-    static OFFLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static TEST_PEERS: std::cell::RefCell<Option<Vec<SocketAddr>>> = const { std::cell::RefCell::new(None) };
-    static TEST_DEMOTED: std::cell::RefCell<Vec<SocketAddr>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_STATE: std::cell::RefCell<std::sync::Arc<Mutex<TestDiscoveryState>>> =
+        std::cell::RefCell::new(std::sync::Arc::new(Mutex::new(TestDiscoveryState::default())));
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestDiscoveryContext(std::sync::Arc<Mutex<TestDiscoveryState>>);
+
+#[cfg(test)]
+pub(crate) fn capture_test_context() -> TestDiscoveryContext {
+    TEST_STATE.with(|slot| TestDiscoveryContext(slot.borrow().clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_context(ctx: TestDiscoveryContext) {
+    TEST_STATE.with(|slot| *slot.borrow_mut() = ctx.0);
+}
+
+#[cfg(test)]
+fn with_test_state<R>(f: impl FnOnce(&mut TestDiscoveryState) -> R) -> R {
+    TEST_STATE.with(|slot| {
+        let arc = slot.borrow().clone();
+        let mut guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
+    })
 }
 
 /// Make discovery on this thread find no peers, so a test can run a sync pass
 /// without touching the network.
 #[cfg(test)]
 pub(crate) fn go_offline_for_test() {
-    OFFLINE.with(|offline| offline.set(true));
+    with_test_state(|st| st.offline = true);
 }
 
 /// Seed discovery on this thread with a fixed peer list for deterministic tests.
 #[cfg(test)]
 pub(crate) fn set_peers_for_test(addrs: Option<Vec<SocketAddr>>) {
-    TEST_PEERS.with(|slot| *slot.borrow_mut() = addrs);
-    TEST_DEMOTED.with(|slot| slot.borrow_mut().clear());
+    with_test_state(|st| {
+        st.peers = addrs;
+        st.demoted.clear();
+    });
 }
 
 /// Current thread-local test peer pool, if seeded.
 #[cfg(test)]
 pub(crate) fn peers_for_test() -> Option<Vec<SocketAddr>> {
-    TEST_PEERS.with(|slot| slot.borrow().clone())
+    with_test_state(|st| st.peers.clone())
 }
 
 /// Peers that completed a handshake advertising MWEB light-client support.
@@ -102,11 +134,16 @@ pub(crate) fn peers_for_test() -> Option<Vec<SocketAddr>> {
 pub fn discover_mweb_peers(network: WalletNetwork) -> Vec<SocketAddr> {
     #[cfg(test)]
     {
-        if let Some(addrs) = TEST_PEERS.with(|slot| slot.borrow().clone()) {
-            return addrs;
-        }
-        if OFFLINE.with(std::cell::Cell::get) {
-            return Vec::new();
+        if let Some(res) = with_test_state(|st| {
+            if let Some(addrs) = st.peers.clone() {
+                Some(addrs)
+            } else if st.offline {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }) {
+            return res;
         }
     }
     if let Some(addrs) = cached_peers(network) {
@@ -149,14 +186,12 @@ fn cached_peers(network: WalletNetwork) -> Option<Vec<SocketAddr>> {
 /// or when every cached peer in a sync pass failed).
 pub fn clear_cache() {
     #[cfg(test)]
-    {
-        TEST_PEERS.with(|slot| {
-            if let Some(addrs) = slot.borrow_mut().as_mut() {
-                addrs.clear();
-            }
-        });
-        TEST_DEMOTED.with(|slot| slot.borrow_mut().clear());
-    }
+    with_test_state(|st| {
+        if let Some(addrs) = st.peers.as_mut() {
+            addrs.clear();
+        }
+        st.demoted.clear();
+    });
     if let Ok(mut guard) = CACHE.lock() {
         *guard = None;
     }
@@ -172,12 +207,12 @@ pub fn evict_peers(bad: &[SocketAddr]) {
         return;
     }
     #[cfg(test)]
-    let handled_by_test = TEST_PEERS.with(|slot| {
-        let mut borrow = slot.borrow_mut();
-        if let Some(addrs) = borrow.as_mut() {
+    let handled_by_test = with_test_state(|st| {
+        if let Some(addrs) = st.peers.as_mut() {
             if !evict_from_pool(addrs, bad) {
                 addrs.clear();
             }
+            st.demoted.retain(|a| !bad.contains(a));
             true
         } else {
             false
@@ -185,7 +220,6 @@ pub fn evict_peers(bad: &[SocketAddr]) {
     });
     #[cfg(test)]
     if handled_by_test {
-        TEST_DEMOTED.with(|slot| slot.borrow_mut().retain(|a| !bad.contains(a)));
         return;
     }
     if let Ok(mut guard) = CACHE.lock() {
@@ -205,10 +239,14 @@ pub fn demote_peers(slow: &[SocketAddr]) {
         return;
     }
     #[cfg(test)]
-    let handled_by_test = TEST_PEERS.with(|slot| {
-        let mut borrow = slot.borrow_mut();
-        if let Some(addrs) = borrow.as_mut() {
+    let handled_by_test = with_test_state(|st| {
+        if let Some(addrs) = st.peers.as_mut() {
             demote_in_pool(addrs, slow);
+            for &addr in slow {
+                if !st.demoted.contains(&addr) {
+                    st.demoted.push(addr);
+                }
+            }
             true
         } else {
             false
@@ -216,14 +254,6 @@ pub fn demote_peers(slow: &[SocketAddr]) {
     });
     #[cfg(test)]
     if handled_by_test {
-        TEST_DEMOTED.with(|slot| {
-            let mut demoted = slot.borrow_mut();
-            for &addr in slow {
-                if !demoted.contains(&addr) {
-                    demoted.push(addr);
-                }
-            }
-        });
         return;
     }
     if let Ok(mut guard) = CACHE.lock() {
@@ -242,9 +272,12 @@ pub fn demote_peers(slow: &[SocketAddr]) {
 /// demoted since it last served a sync pass.
 pub fn should_prefer_peer(addr: &SocketAddr) -> bool {
     #[cfg(test)]
-    if let Some(addrs) = TEST_PEERS.with(|slot| slot.borrow().clone()) {
-        let demoted = TEST_DEMOTED.with(|slot| slot.borrow().contains(addr));
-        return addrs.contains(addr) && !demoted;
+    if let Some(prefer) = with_test_state(|st| {
+        st.peers
+            .as_ref()
+            .map(|addrs| addrs.contains(addr) && !st.demoted.contains(addr))
+    }) {
+        return prefer;
     }
     let Ok(guard) = CACHE.lock() else {
         return false;
@@ -258,7 +291,7 @@ pub fn should_prefer_peer(addr: &SocketAddr) -> bool {
 /// Clear any prior demotion once `addr` completes a verified sync pass.
 pub fn note_good_peer(addr: SocketAddr) {
     #[cfg(test)]
-    TEST_DEMOTED.with(|slot| slot.borrow_mut().retain(|a| *a != addr));
+    with_test_state(|st| st.demoted.retain(|a| *a != addr));
     if let Ok(mut guard) = CACHE.lock() {
         if let Some(cached) = guard.as_mut() {
             cached.demoted.retain(|a| *a != addr);
@@ -287,15 +320,18 @@ fn demote_in_pool(pool: &mut Vec<SocketAddr>, slow: &[SocketAddr]) {
 /// Pre-warm the MWEB peer cache on a background thread when it is cold.
 pub(crate) fn warm_mweb_peers_in_background(network: WalletNetwork) {
     #[cfg(test)]
-    if OFFLINE.with(std::cell::Cell::get) {
-        return;
+    {
+        let _ = network;
     }
-    if cached_peers(network).is_some() {
-        return;
+    #[cfg(not(test))]
+    {
+        if cached_peers(network).is_some() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let _ = discover_mweb_peers(network);
+        });
     }
-    std::thread::spawn(move || {
-        let _ = discover_mweb_peers(network);
-    });
 }
 
 fn crawl(network: WalletNetwork) -> Vec<SocketAddr> {

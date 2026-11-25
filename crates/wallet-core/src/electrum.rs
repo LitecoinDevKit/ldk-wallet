@@ -106,7 +106,7 @@ pub fn cross_check_tip(
     local_tip_height: u32,
     local_hash_at: &dyn Fn(u32) -> Option<bdk_wallet::bitcoin::BlockHash>,
 ) -> Result<Option<String>, WalletError> {
-    let client = connect_with_timeout(url, validate_domain, 10)?;
+    let client = connect_with_timeout(url, validate_domain, 3)?;
     handshake(&client).map_err(|e| WalletError::Electrum(e.to_string()))?;
     let sub = client
         .inner

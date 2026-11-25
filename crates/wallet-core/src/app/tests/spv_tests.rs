@@ -71,6 +71,8 @@ struct MockChainState {
     max_history_batch_size: Option<usize>,
     /// Observed `blockchain.scripthash.get_history` counts per round-trip.
     history_batch_sizes: Vec<usize>,
+    /// Optional artificial delay (ms) per script-history round-trip.
+    history_delay_ms: u64,
 }
 
 struct MockElectrumServer {
@@ -144,7 +146,13 @@ impl MockElectrumServer {
                             continue;
                         }
                         let history_count = note_round_trip(&st, &batch_reqs);
-                        let max_history = st.lock().unwrap().max_history_batch_size;
+                        let (max_history, history_delay_ms) = {
+                            let guard = st.lock().unwrap();
+                            (guard.max_history_batch_size, guard.history_delay_ms)
+                        };
+                        if history_count > 0 && history_delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(history_delay_ms));
+                        }
                         let reject_history = max_history.is_some_and(|max| history_count > max);
                         let mut encoded = Vec::new();
                         for req in &batch_reqs {
@@ -1768,5 +1776,220 @@ fn failed_electrum_body_scan_cancels_overlapped_mweb_and_restores_runtime() {
     assert!(
         guard.as_ref().unwrap().mweb.is_some(),
         "MwebRuntime must be restored to WalletState after overlapped Electrum failure"
+    );
+}
+
+#[test]
+fn warm_sync_with_cached_anchors_skips_shards_and_cold_restore_ignores_dead_shard_candidates() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_job(dir.path(), ChurnPhase::Cancelled, false);
+    let recv_spk = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap()
+        .script_pubkey();
+    let sh = electrum_scripthash_hex(&recv_spk);
+
+    let gen = genesis_block(Network::Testnet4).header;
+    let mut state = MockChainState::default();
+    state.headers.insert(0, gen);
+
+    let mut prev = gen;
+    let mut history = Vec::new();
+    for height in 1..=60u32 {
+        let cb = make_coinbase_tx(height);
+        let cb_id = cb.compute_txid().to_byte_array();
+        let tx = make_funding_tx(recv_spk.clone(), 100_000 + u64::from(height), height as u8);
+        let txid = tx.compute_txid();
+        let root = sha256d_pair(&cb_id, &txid.to_byte_array());
+        let hdr = mine_testnet_header(Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: prev.block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array(root),
+            time: prev.time + 600,
+            bits: easy_bits(),
+            nonce: 0,
+        });
+        prev = hdr;
+        state.headers.insert(height, hdr);
+        state.tip_height = height;
+        history.push(MockHistoryEntry {
+            tx_hash: txid.to_string(),
+            height: height as i32,
+        });
+        state.txs.insert(txid.to_string(), serialize(&tx));
+        state.proofs.insert(
+            (txid.to_string(), height as usize),
+            Ok(MockMerkleProof {
+                block_height: height as usize,
+                pos: 1,
+                merkle: vec![display_hex_from_internal(cb_id)],
+            }),
+        );
+    }
+    state.histories.insert(sh, history);
+
+    let primary = MockElectrumServer::start(state.clone());
+    let shard = MockElectrumServer::start(state);
+
+    // Dead TCP listener that accepts connections and stalls for 5s without replying.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_url = format!("tcp://{}", dead_listener.local_addr().unwrap());
+    let dead_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dead_hits_cl = Arc::clone(&dead_hits);
+    std::thread::spawn(move || {
+        for stream in dead_listener.incoming().flatten() {
+            dead_hits_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                drop(stream);
+            });
+        }
+    });
+
+    // Cold restore with `primary`, `shard`, and `dead_url` in `shard_urls`:
+    // parallel shard probing with the 250ms second-shard grace window must finish
+    // quickly without waiting 5s on `dead_url`.
+    configure_electrum(&app, &shard.url, false);
+    {
+        let mut guard = app.lock_state().unwrap();
+        let st = guard.as_mut().unwrap();
+        st.active_electrum_url = Some(primary.url.clone());
+    }
+    app.remember_electrum(primary.url.clone());
+
+    let cold_started = std::time::Instant::now();
+    app.sync().expect("cold restore with shard");
+    assert!(
+        cold_started.elapsed() < std::time::Duration::from_secs(2),
+        "cold restore took {:?}",
+        cold_started.elapsed()
+    );
+    assert_eq!(app.list_unspent().unwrap().len(), 60);
+    // External keychain (1 active script -> trailing unused = 99 >= 50) + internal keychain
+    // (0 active scripts -> unused = 100 >= 50) must scan only 200 scripts (2 batches of 100),
+    // not overshoot to 500 by doubling inside the trailing gap.
+    {
+        let pri_st = primary.state.lock().unwrap();
+        assert_eq!(
+            pri_st.history_batch_sizes,
+            vec![100, 100],
+            "trailing gap must not double script batch size to 200: {:?}",
+            pri_st.history_batch_sizes
+        );
+    }
+
+    // Now point `electrum_url` at `dead_url` (while `primary` remains remembered/active)
+    // and run a warm sync where all 60 anchors are already cached (`raw_fetches == 0`
+    // and `merkle_fetches == 0`). `connect_verified_shards` must not run at all.
+    configure_electrum(&app, &dead_url, false);
+    {
+        let mut guard = app.lock_state().unwrap();
+        guard.as_mut().unwrap().active_electrum_url = Some(primary.url.clone());
+    }
+    app.remember_electrum(primary.url.clone());
+    // Pre-seed cross-check cache for height 61 so `cross_check_tip` does not hit `dead_url`,
+    // isolating the test to `finish_electrum_spv_with_shards`.
+    primary.update(|st| extend_chain(st, 61));
+    let tip_61_hash = primary.state.lock().unwrap().headers[&61].block_hash();
+    app.note_cross_check(primary.url.clone(), 61, tip_61_hash, None);
+
+    dead_hits.store(0, std::sync::atomic::Ordering::SeqCst);
+    let warm_started = std::time::Instant::now();
+    app.sync().expect("warm sync with 60 cached anchors");
+    assert!(
+        warm_started.elapsed() < std::time::Duration::from_millis(500),
+        "warm sync must not stall probing dead shard URLs, took {:?}",
+        warm_started.elapsed()
+    );
+    assert_eq!(
+        dead_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "warm sync with cached anchors must not probe shard servers"
+    );
+}
+
+#[test]
+fn unlock_and_load_do_not_wait_for_slow_in_flight_locked_prefetch() {
+    discovery::go_offline_for_test();
+    let _pow = crate::spv::easy_pow_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(WalletApp::new(dir.path()));
+    let passphrase = "correct horse battery staple";
+    app.create(
+        dir.path(),
+        crate::dto::CreateWalletRequest {
+            network: WalletNetwork::Testnet,
+            electrum_url: None,
+        },
+        passphrase,
+    )
+    .expect("create");
+
+    let recv_addr = Address::from_str(&app.receive_address().unwrap())
+        .unwrap()
+        .require_network(Network::Testnet4)
+        .unwrap();
+    let tx = make_funding_tx(recv_addr.script_pubkey(), 250_000, 0x91);
+    let (mut state, _txid, _cb) = build_single_block_chain_with_tx(&tx);
+    extend_chain(&mut state, 4);
+
+    let server = MockElectrumServer::start(state);
+    configure_electrum(&app, &server.url, false);
+    app.sync().expect("initial sync at tip 4");
+
+    // Lock the wallet, advance the server to height 5, and add a 2200ms delay per
+    // script-history round-trip so locked prefetch stays in flight past `unlock()`'s
+    // Argon2id KDF in unoptimized test builds.
+    app.lock();
+    server.update(|st| {
+        extend_chain(st, 5);
+        st.history_delay_ms = 2200;
+    });
+
+    let app_bg = Arc::clone(&app);
+    let dir_bg = dir.path().to_path_buf();
+    let prefetch_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prefetch_done_cl = Arc::clone(&prefetch_done);
+    let prefetch_handle = std::thread::spawn(move || {
+        discovery::go_offline_for_test();
+        let _pow = crate::spv::easy_pow_for_test();
+        let res = app_bg.prefetch_transparent(&dir_bg);
+        prefetch_done_cl.store(true, std::sync::atomic::Ordering::Release);
+        res
+    });
+
+    // Wait until `prefetch_transparent` enters `ElectrumSync`.
+    let wait_started = std::time::Instant::now();
+    while app.mweb_sync_progress().phase != crate::dto::SyncPhase::ElectrumSync {
+        assert!(
+            wait_started.elapsed() < std::time::Duration::from_secs(2),
+            "timed out waiting for prefetch to enter ElectrumSync"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Unlock and load while prefetch is still blocked in `scan_spks` (2200ms delay).
+    app.unlock(crate::dto::UnlockRequest {
+        passphrase: passphrase.into(),
+    })
+    .expect("unlock");
+    let loaded = app.load(dir.path()).expect("load while prefetch in flight");
+    assert!(
+        !prefetch_done.load(std::sync::atomic::Ordering::Acquire),
+        "load must complete before the slow in-flight prefetch finishes"
+    );
+    assert_eq!(loaded.tip_height, 4, "load renders cached tip immediately");
+
+    // When the background prefetch finishes, it sees the wallet is unlocked and exits cleanly.
+    let prefetch_res = prefetch_handle
+        .join()
+        .expect("join prefetch")
+        .expect("prefetch ok");
+    assert!(
+        !prefetch_res,
+        "prefetch finishing after unlock must discard its write and return Ok(false)"
     );
 }

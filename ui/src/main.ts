@@ -331,6 +331,8 @@ type TxRecord = {
   kind: TxKind;
   /** Set only while a peg-in is maturing. */
   maturity_blocks_left?: number | null;
+  /** Peg-in no peer accepted. Shows Clear instead of Pending. */
+  can_clear?: boolean;
 };
 
 const TX_KIND_LABELS: Record<TxKind, string> = {
@@ -3739,10 +3741,12 @@ function buildTxRow(tx: TxRecord, index: number): HTMLLIElement {
 
   const pill = document.createElement("span");
   const left = tx.maturity_blocks_left;
-  if (left != null) {
+  if (tx.can_clear) {
     pill.className = "pill pending";
-    pill.textContent =
-      tx.confirmations === 0 ? "maturing · pending" : `maturing · ${left} left`;
+    pill.textContent = "Not relayed";
+  } else if (left != null && tx.confirmations > 0) {
+    pill.className = "pill pending";
+    pill.textContent = `maturing · ${left} left`;
   } else {
     pill.className = tx.confirmations === 0 ? "pill pending" : "pill";
     pill.textContent =
@@ -3757,6 +3761,17 @@ function buildTxRow(tx: TxRecord, index: number): HTMLLIElement {
   const side = document.createElement("div");
   side.className = "tx-side";
   side.append(pill, txid);
+  if (tx.can_clear) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "tx-clear";
+    clear.textContent = "Clear";
+    clear.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void clearUnrelayedTx(tx);
+    });
+    side.append(clear);
+  }
 
   const li = document.createElement("li");
   li.className = "tx-row";
@@ -3816,11 +3831,10 @@ async function openTxDetail(index: number) {
     if (!tx) return;
 
     const peginLeft = tx.maturity_blocks_left ?? null;
-    const statusText =
-      peginLeft != null
-        ? tx.confirmations === 0
-          ? "Maturing — waiting for first confirmation"
-          : `Maturing — ~${peginLeft} block${peginLeft === 1 ? "" : "s"} remaining`
+    const statusText = tx.can_clear
+      ? "Not relayed — the network did not accept it"
+      : peginLeft != null && tx.confirmations > 0
+        ? `Maturing — ~${peginLeft} block${peginLeft === 1 ? "" : "s"} remaining`
         : tx.confirmations === 0
           ? "Pending — not in a block yet"
           : `${tx.confirmations.toLocaleString("en-US")} confirmations`;
@@ -3872,6 +3886,7 @@ async function openTxDetail(index: number) {
     const actions: ModalAction[] = [];
     if (hasPrev) actions.push({ id: "prev", label: "‹ Prev", kind: "ghost", nav: true });
     if (hasNext) actions.push({ id: "next", label: "Next ›", kind: "ghost", nav: true });
+    if (tx.can_clear) actions.push({ id: "clear", label: "Clear", kind: "danger" });
     if (canExplore) actions.push({ id: "explore", label: "View on litview", kind: "secondary" });
     actions.push({ id: "copy", label: "Copy ID", kind: "secondary" });
     actions.push({ id: "save-note", label: "Save note", kind: "secondary" });
@@ -3936,6 +3951,10 @@ async function openTxDetail(index: number) {
       at += 1;
       continue;
     }
+    if (result === "clear") {
+      await clearUnrelayedTx(tx);
+      return;
+    }
     if (result === "explore") {
       await openExplorerForTxid(tx.txid);
       continue;
@@ -3949,6 +3968,18 @@ async function openTxDetail(index: number) {
       continue;
     }
     return;
+  }
+}
+
+async function clearUnrelayedTx(tx: TxRecord): Promise<void> {
+  try {
+    await invoke("clear_pegin", { txid: tx.txid });
+    await refreshHistory();
+    await refreshCombined();
+    await refreshUtxos();
+    setStatus("Cleared. Those coins are spendable again.", "success");
+  } catch (e) {
+    setStatus(String(e), "error");
   }
 }
 

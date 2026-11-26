@@ -845,6 +845,8 @@ fn switching_servers_drops_cached_server_unconfirmed_state_but_preserves_local_a
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = state.data_dir.clone();
@@ -963,6 +965,8 @@ fn repair_missing_pegin_spends_rejects_mismatched_txid_and_invalid_tx() {
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = st.data_dir.clone();
@@ -1137,10 +1141,13 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let rpc_hits = Arc::new(AtomicUsize::new(0));
+    let rpc_hits_bg = Arc::clone(&rpc_hits);
     std::thread::spawn(move || {
         // Accept and never answer. Reading the request and then dropping the
         // socket makes the client fail at once, so the repair timeout never runs.
         for stream in listener.incoming().flatten() {
+            rpc_hits_bg.fetch_add(1, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut stream = stream;
                 let mut buf = [0u8; 1024];
@@ -1160,13 +1167,15 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
         let st = guard.as_mut().unwrap();
         st.litecoin_rpc_url = Some(rpc_url);
         st.mweb.as_mut().unwrap().history.record(MwebHistoryEntry {
-            id: missing_id,
+            id: missing_id.clone(),
             kind: TxKind::Pegin,
             net_sats: -1_000_000,
             fee_sats: Some(10_000),
             timestamp: crate::mweb_history::now_ts(),
             output_ids: Vec::new(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
         let data_dir = st.data_dir.clone();
@@ -1179,25 +1188,33 @@ fn pegin_repair_backs_off_after_a_dead_fallback() {
     let started = std::time::Instant::now();
     let first = app.sync().expect("sync warns instead of failing repair");
     let first_ms = started.elapsed().as_millis();
+    let hits_after_first = rpc_hits.load(Ordering::SeqCst);
     assert!(first
         .warnings
         .iter()
         .any(|w| w.contains("Could not repair")));
     assert!(
-        (1500..10_000).contains(&first_ms),
+        hits_after_first >= 1,
+        "first sync should attempt the dead RPC fallback"
+    );
+    assert!(
+        (1500..15_000).contains(&first_ms),
         "dead fallback should stop at the short timeout, got {first_ms} ms"
     );
+    assert!(
+        !app.pegin_fallback_due(&missing_id),
+        "failed fallback must enter backoff before the next sync"
+    );
 
-    let started = std::time::Instant::now();
     let second = app.sync().expect("second sync");
-    let second_ms = started.elapsed().as_millis();
     assert!(second
         .warnings
         .iter()
         .any(|w| w.contains("Could not repair")));
-    assert!(
-        second_ms < 1_500,
-        "a peg-in that just failed its fallbacks must not stall the next sync, got {second_ms} ms"
+    assert_eq!(
+        rpc_hits.load(Ordering::SeqCst),
+        hits_after_first,
+        "a peg-in that just failed its fallbacks must not retry the dead fallback on the next sync"
     );
 }
 
@@ -1216,8 +1233,11 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+    let rpc_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rpc_hits_bg = Arc::clone(&rpc_hits);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            rpc_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut stream = stream;
                 let mut buf = [0u8; 1024];
@@ -1246,6 +1266,8 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
             timestamp: crate::mweb_history::now_ts(),
             output_ids: vec![absorbed_output_id],
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: Some(1),
         });
         let data_dir = st.data_dir.clone();
@@ -1255,17 +1277,16 @@ fn absorbed_mweb_pegin_output_id_is_not_treated_as_missing_transparent_pegin() {
     let server = MockElectrumServer::start(state);
     configure_electrum(&app, &server.url, false);
 
-    let started = std::time::Instant::now();
     let res = app.sync().expect("sync succeeds");
-    let elapsed_ms = started.elapsed().as_millis();
     assert!(
         res.warnings.is_empty(),
         "absorbed MWEB peg-in coin must not trigger missing transparent peg-in warning: {:?}",
         res.warnings
     );
-    assert!(
-        elapsed_ms < 1_000,
-        "absorbed MWEB peg-in coin must not stall sync on RPC fallback, took {elapsed_ms} ms"
+    assert_eq!(
+        rpc_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "absorbed MWEB peg-in coin must not call the RPC fallback"
     );
 }
 

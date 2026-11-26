@@ -1599,3 +1599,270 @@ fn phase_changes_holds_and_rejections_appear_in_diagnostic_log_and_bundle() {
         "missing self-spend phase transition logs in {lines:#?}"
     );
 }
+
+#[test]
+fn audit_f3_post_broadcast_commit_succeeds_during_detached_mweb_sync_and_after_lock() {
+    crate::discovery::go_offline_for_test();
+
+    // Helper: local RPC listener that pauses inside `sendrawtransaction` at `entered`,
+    // waits for `release`, and then returns HTTP 200 `{"result":"ok"}` (broadcast succeeded!).
+    let spawn_gated_rpc = |entered: Arc<std::sync::Barrier>, release: Arc<std::sync::Barrier>| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut content_len: usize = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some((name, val)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_len = val.trim().parse().unwrap_or(0);
+                    }
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            // Drain the HTTP POST body before replying/closing; on Windows,
+            // closing a socket with unread data in the receive buffer triggers
+            // a TCP RST (WSAECONNRESET / os error 10054) on the client.
+            if content_len > 0 {
+                let mut body = vec![0u8; content_len];
+                let _ = reader.read_exact(&mut body);
+            }
+            entered.wait();
+            release.wait();
+            let payload = br#"{"result":"ok","error":null,"id":"ltc-wallet"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(payload);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut drain = [0u8; 64];
+            let _ = stream.read(&mut drain);
+        });
+        (url, handle)
+    };
+
+    // Subcase A: `sync()` parks `state.mweb` (`park_mweb`) while `mweb_send` is broadcasting,
+    // and the network accepts the transaction (`200 OK`).
+    let dir_a = tempfile::tempdir().unwrap();
+    let (app_a, ids_a) = app_with_private_coins(dir_a.path(), &[3_000_000, 2_000_000]);
+    persist_private(&app_a);
+    let dest_a = app_a.mweb_receive_address().unwrap();
+    let entered_a = Arc::new(std::sync::Barrier::new(2));
+    let release_a = Arc::new(std::sync::Barrier::new(2));
+    let (rpc_url_a, rpc_join_a) = spawn_gated_rpc(Arc::clone(&entered_a), Arc::clone(&release_a));
+    configure(&app_a, "tcp://127.0.0.1:9", Some(&rpc_url_a), &[], true);
+
+    let send_res_a = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            crate::discovery::go_offline_for_test();
+            app_a.mweb_send(mweb_send_req(&dest_a, &ids_a[0], 100_000))
+        });
+        entered_a.wait();
+        let mut guard = app_a.lock_state().unwrap();
+        let _parked = app_a.park_mweb(&mut guard).unwrap().expect("mweb parked");
+        drop(guard);
+        release_a.wait();
+        worker.join().unwrap()
+    });
+    rpc_join_a.join().unwrap();
+
+    // Subcase B: `app.lock()` (e.g. auto-lock) fires while `mweb_send` is broadcasting,
+    // and the network accepts the transaction (`200 OK`).
+    let dir_b = tempfile::tempdir().unwrap();
+    let (app_b, ids_b) = app_with_private_coins(dir_b.path(), &[3_000_000]);
+    persist_private(&app_b);
+    let dest_b = app_b.mweb_receive_address().unwrap();
+    let entered_b = Arc::new(std::sync::Barrier::new(2));
+    let release_b = Arc::new(std::sync::Barrier::new(2));
+    let (rpc_url_b, rpc_join_b) = spawn_gated_rpc(Arc::clone(&entered_b), Arc::clone(&release_b));
+    configure(&app_b, "tcp://127.0.0.1:9", Some(&rpc_url_b), &[], true);
+
+    let send_res_b = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            crate::discovery::go_offline_for_test();
+            app_b.mweb_send(mweb_send_req(&dest_b, &ids_b[0], 100_000))
+        });
+        entered_b.wait();
+        app_b.lock();
+        release_b.wait();
+        worker.join().unwrap()
+    });
+    rpc_join_b.join().unwrap();
+
+    assert!(
+        send_res_a.is_ok(),
+        "broadcast MWEB send failed to commit during detached MWEB sync (releases CoinHold and enables double-send): {send_res_a:?}"
+    );
+    assert!(
+        !matches!(send_res_b, Err(WalletError::MissingMnemonic)),
+        "broadcast MWEB send after lock falsely reported MissingMnemonic and dropped local spend record: {send_res_b:?}"
+    );
+}
+
+#[test]
+fn audit_f4_lock_and_switch_wallet_during_detached_mweb_sync_preserve_invariants() {
+    crate::discovery::go_offline_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000]);
+    clear_planted_job(&app);
+    persist_private(&app);
+    app.create_wallet_account(
+        dir.path(),
+        CreateAccountRequest {
+            name: "Second".into(),
+        },
+    )
+    .unwrap();
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .unwrap();
+    let acc0_dir = account_dir(&app);
+
+    // 1. Switch to Account 1 while Account 0's MWEB runtime is detached: switching back to
+    // Account 0 after detached sync finishes must NOT leave Account 0 with `state.mweb == None`.
+    let mut guard = app.lock_state().unwrap();
+    let detached_rt = app.park_mweb(&mut guard).unwrap().expect("park acc0 mweb");
+    drop(guard);
+
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 1 })
+        .unwrap();
+    let _ = app.restore_parked_mweb(&acc0_dir, detached_rt);
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .unwrap();
+    let acc0_coins_after_switch = app.list_mweb_unspent();
+
+    // 2. Reload cleanly, detach MWEB, call `lock()`, then unlock + load + advance state:
+    // `lock()` must clear `detached_mweb_view`, keep cancellation signaled for the detached
+    // worker, and reject stale pre-lock `restore_parked_mweb` instead of clobbering new state.
+    app.lock();
+    unlock_load(&app, dir.path());
+    let mut guard = app.lock_state().unwrap();
+    let pre_lock_rt = app.park_mweb(&mut guard).unwrap().expect("park acc0 mweb");
+    drop(guard);
+
+    app.lock();
+    let leaked_detached_view_while_locked = app.detached_mweb_view().is_some();
+    unlock_load(&app, dir.path());
+    app.start_churn(churn_req(&ids[0], 1, 1)).unwrap();
+    let churned_id = app.churn_status().unwrap().unwrap().output_id;
+
+    let stale_reattach = app.restore_parked_mweb(&acc0_dir, pre_lock_rt);
+    let post_reattach_ids = unspent_ids(&app);
+
+    assert!(
+        acc0_coins_after_switch.is_ok(),
+        "switching accounts during detached MWEB sync left Account 0 in AccountPark with mweb=None: {acc0_coins_after_switch:?}"
+    );
+    assert!(
+        !leaked_detached_view_while_locked,
+        "lock() left plaintext DetachedMwebView balances and stealth address in memory while locked"
+    );
+    assert!(
+        stale_reattach.is_err() && post_reattach_ids.contains(&churned_id),
+        "stale pre-lock MwebRuntime reattached into post-unlock session and clobbered new churn output: reattach={stale_reattach:?}, coins={post_reattach_ids:?}"
+    );
+}
+
+#[test]
+fn audit_f5_churn_armed_file_must_not_store_cleartext_mweb_spend_key_on_disk() {
+    crate::discovery::go_offline_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000]);
+    clear_planted_job(&app);
+    persist_private(&app);
+    let data_dir = account_dir(&app);
+
+    app.start_churn(churn_req(&ids[0], 2, 1)).unwrap();
+    app.lock();
+
+    let raw_armed_json = std::fs::read_to_string(churn::armed_path(&data_dir)).unwrap();
+    assert!(
+        !raw_armed_json.contains("\"spend_key\"")
+            && !raw_armed_json.contains("\"blind\"")
+            && !raw_armed_json.contains("\"shared_secret\""),
+        "churn_armed.json persisted cleartext MWEB spend_key/blind/shared_secret on disk while wallet is locked"
+    );
+}
+
+#[test]
+fn audit_f7_cross_account_private_transfer_uses_destination_mweb_scheme() {
+    crate::discovery::go_offline_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let (app, ids) = app_with_private_coins(dir.path(), &[3_000_000]);
+    clear_planted_job(&app);
+    persist_private(&app);
+
+    // Create Account 1 and configure it to use the legacy `Mwebd` derivation scheme.
+    app.create_wallet_account(
+        dir.path(),
+        CreateAccountRequest {
+            name: "MwebdAccount".into(),
+        },
+    )
+    .unwrap();
+    app.set_mweb_scheme(MwebScheme::Mwebd).unwrap();
+    let expected_acc1_addr = app.mweb_receive_address().unwrap();
+
+    // Switch back to Account 0 (`LitecoinCore` scheme) and lock/unlock so Account 1 is cold on disk.
+    app.switch_wallet(dir.path(), SwitchWalletRequest { index: 0 })
+        .unwrap();
+    app.lock();
+    unlock_load(&app, dir.path());
+
+    let preview = app
+        .preview_transfer_coin(
+            dir.path(),
+            TransferCoinRequest {
+                chain: SplitChain::Private,
+                coin_id: ids[0].clone(),
+                to_account_index: 1,
+                fee_rate_sat_vb: None,
+                fee_sats: 0,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        preview.address, expected_acc1_addr,
+        "private transfer to cold Account 1 derived destination under Account 0's LitecoinCore scheme instead of Account 1's Mwebd scheme"
+    );
+}
+
+#[test]
+fn audit_f9b_second_process_load_must_not_clobber_live_coin_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app1, ids) = app_with_private_coins(dir.path(), &[3_000_000]);
+    clear_planted_job(&app1);
+    persist_private(&app1);
+    let data_dir = account_dir(&app1);
+
+    // Process 1 holds a live in-flight reservation while broadcasting a spend.
+    let _live_hold = CoinHold::take(&data_dir, vec![ids[0].clone()], &app1.session).unwrap();
+    assert_eq!(private_row(&app1, &ids[0]).status, CoinStatus::Sending);
+
+    // Process 2 (e.g. wallet-cli or a second GUI instance) opens the same data_dir.
+    let app2 = WalletApp::new(dir.path());
+    app2.unlock(UnlockRequest {
+        passphrase: PASSPHRASE.into(),
+    })
+    .unwrap();
+    if app2.load(dir.path()).is_ok() {
+        assert!(
+            mweb_frozen::read_ids(&data_dir)
+                .unwrap()
+                .reserved
+                .contains_key(&ids[0]),
+            "second WalletApp::load wiped Process 1's live in-flight CoinHold reservation"
+        );
+    }
+}

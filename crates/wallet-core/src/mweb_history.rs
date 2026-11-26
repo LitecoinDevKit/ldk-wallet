@@ -42,6 +42,14 @@ pub struct MwebHistoryEntry {
     /// and persisted so it survives an MWEB store wipe/resync.
     #[serde(default)]
     pub confirmed_height: Option<u32>,
+    /// A peer or the user's node accepted the broadcast. A later sync also sets
+    /// this once the peg-in is in a block. Absent on older rows.
+    #[serde(default)]
+    pub relayed: bool,
+    /// A sync looked for this peg-in and did not find it, after it had time to
+    /// propagate. That is the only case History calls "Not relayed".
+    #[serde(default)]
+    pub absent: bool,
 }
 
 /// Persisted MWEB activity log.
@@ -123,6 +131,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: outputs.iter().map(|s| s.to_string()).collect(),
             input_ids: Vec::new(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         }
     }

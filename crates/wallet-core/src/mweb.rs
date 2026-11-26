@@ -265,9 +265,11 @@ struct CrossProbeSpec<'scope, 'env> {
     policy: PeerPolicy,
     cancel: Option<&'env std::sync::atomic::AtomicBool>,
     pending_lock: Option<&'env std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&'env std::sync::atomic::AtomicU64, u64)>,
     pass_aborted: &'env std::sync::atomic::AtomicBool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn probe_cross_check_peers(
     backup_addrs: Vec<std::net::SocketAddr>,
     tip_hash: bdk_wallet::bitcoin::BlockHash,
@@ -275,11 +277,12 @@ fn probe_cross_check_peers(
     policy: PeerPolicy,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     pending_lock: Option<&std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     pass_aborted: &std::sync::atomic::AtomicBool,
 ) -> PreProbedCrossCheck {
     let mut probed = Vec::new();
     for addr in backup_addrs {
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock)
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
             || pass_aborted.load(std::sync::atomic::Ordering::Acquire)
         {
             break;
@@ -301,7 +304,7 @@ fn probe_cross_check_peers(
                 continue;
             }
         };
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock)
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
             || pass_aborted.load(std::sync::atomic::Ordering::Acquire)
         {
             break;
@@ -352,6 +355,7 @@ struct CancellableMwebPeer<'scope, 'env> {
     inner: TcpMwebPeer,
     cancel: Option<&'env std::sync::atomic::AtomicBool>,
     pending_lock: Option<&'env std::sync::atomic::AtomicBool>,
+    epoch_check: Option<(&'env std::sync::atomic::AtomicU64, u64)>,
     probe_spec: Option<CrossProbeSpec<'scope, 'env>>,
     probe_handle: Option<std::thread::ScopedJoinHandle<'scope, PreProbedCrossCheck>>,
     last_progress_at: std::time::Instant,
@@ -363,14 +367,16 @@ impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
     fn is_cancelled(
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> bool {
         use std::sync::atomic::Ordering;
         cancel.is_some_and(|c| c.load(Ordering::Acquire))
             || pending_lock.is_some_and(|p| p.load(Ordering::Acquire))
+            || epoch_check.is_some_and(|(cur, start)| cur.load(Ordering::Acquire) != start)
     }
 
     fn check_cancel(&self) -> Result<(), bdk_mweb::Error> {
-        if Self::is_cancelled(self.cancel, self.pending_lock) {
+        if Self::is_cancelled(self.cancel, self.pending_lock, self.epoch_check) {
             Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()))
         } else {
             Ok(())
@@ -391,6 +397,7 @@ impl<'scope, 'env> CancellableMwebPeer<'scope, 'env> {
                     spec.policy,
                     spec.cancel,
                     spec.pending_lock,
+                    spec.epoch_check,
                     spec.pass_aborted,
                 )
             }));
@@ -463,12 +470,13 @@ impl MwebUtxoSource for CancellableMwebPeer<'_, '_> {
         self.check_cancel()?;
         let cancel = self.cancel;
         let pending_lock = self.pending_lock;
+        let epoch_check = self.epoch_check;
         for chunk in reqs.chunks(PIPELINE_WINDOW_BATCHES.max(1)) {
             self.check_cancel()?;
             let last_progress_at = &mut self.last_progress_at;
             let mut callback_err = false;
             let res = self.inner.get_utxos_pipelined(chunk, &mut |batch| {
-                if Self::is_cancelled(cancel, pending_lock) {
+                if Self::is_cancelled(cancel, pending_lock, epoch_check) {
                     return Err(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
                 }
                 if !batch.utxos.is_empty() {
@@ -765,8 +773,6 @@ impl MwebRuntime {
         let master = secret.master_xprv_guarded(bdk_net)?;
         let keys = master_keys_for_account(&master, scheme, account, &secp)?;
         drop(master);
-        let book = AddressBook::from_keys(&keys, MWEB_GAP_LIMIT, &secp)
-            .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
         let key_ref = sealing_key.as_deref();
         let saved_counter = if key_ref.is_some() {
@@ -779,10 +785,13 @@ impl MwebRuntime {
         let (receive_index, index_counter) = load_receive_index(data_dir, key_ref, saved_counter)?;
         let (history, history_counter) = load_history(data_dir, key_ref, saved_counter)?;
 
-        let v2_counters: Vec<u64> = [coins_counter, sync_counter, index_counter, history_counter]
-            .into_iter()
-            .flatten()
-            .collect();
+        let all_counters = [coins_counter, sync_counter, index_counter, history_counter];
+        if key_ref.is_some() && saved_counter > 0 && all_counters.iter().any(Option::is_none) {
+            return Err(WalletError::Mweb(format!(
+                "sealed MWEB files missing v2 persist counter (seal counter {saved_counter})"
+            )));
+        }
+        let v2_counters: Vec<u64> = all_counters.into_iter().flatten().collect();
         if let (Some(&min_c), Some(&max_c)) = (v2_counters.iter().min(), v2_counters.iter().max()) {
             // A kill mid-persist leaves at most a 1-step split ({C, C+1}) across the
             // four blobs. A wider gap means an individual file was rolled back.
@@ -793,6 +802,21 @@ impl MwebRuntime {
             }
         }
         let loaded_seal_counter = v2_counters.into_iter().fold(saved_counter, u64::max);
+
+        let max_coin_index = store
+            .db()
+            .unspent()
+            .chain(store.db().spent_coins())
+            .filter(|c| c.address_index != CHANGE_ADDRESS_INDEX)
+            .map(|c| c.address_index)
+            .max()
+            .unwrap_or(0);
+        let initial_gap = receive_index
+            .max(max_coin_index)
+            .saturating_add(MWEB_GAP_LIMIT)
+            .saturating_add(1);
+        let book = AddressBook::from_keys(&keys, initial_gap, &secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?;
 
         Ok(Self {
             store,
@@ -812,6 +836,15 @@ impl MwebRuntime {
             sealing_key,
             secp,
         })
+    }
+
+    pub fn ensure_address_book_covers(&mut self, max_index: u32) -> Result<(), WalletError> {
+        let needed = max_index.saturating_add(MWEB_GAP_LIMIT).saturating_add(1);
+        if self.book.gap_limit() < needed {
+            self.book = AddressBook::from_keys(&self.keys, needed, &self.secp)
+                .map_err(|e| WalletError::Mweb(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn persist(&mut self, data_dir: &Path) -> Result<(), WalletError> {
@@ -890,6 +923,7 @@ impl MwebRuntime {
 
     pub fn advance_receive_index(&mut self) {
         self.receive_index = self.receive_index.saturating_add(1);
+        let _ = self.ensure_address_book_covers(self.receive_index);
     }
 
     /// Tip-only LIP sync. On peer failure, mark stale and keep transparent usable.
@@ -920,6 +954,7 @@ impl MwebRuntime {
             hold_spent,
             None,
             None,
+            None,
         )
     }
 
@@ -935,6 +970,7 @@ impl MwebRuntime {
         hold_spent: &BTreeSet<[u8; 32]>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> Result<(), WalletError> {
         let configured = resolve_reachable_peers(peers)?;
         let mut configured_failure = None;
@@ -949,6 +985,7 @@ impl MwebRuntime {
                 hold_spent,
                 cancel,
                 pending_lock,
+                epoch_check,
             ) {
                 Ok(pre_probed) => {
                     let mut candidates = configured;
@@ -962,11 +999,12 @@ impl MwebRuntime {
                         pre_probed,
                         cancel,
                         pending_lock,
+                        epoch_check,
                     );
                     return Ok(());
                 }
                 Err(outcome) => {
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         return Ok(());
                     }
                     let failure = classify_pass_failure(&outcome.err);
@@ -981,7 +1019,7 @@ impl MwebRuntime {
                 }
             }
         }
-        if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+        if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
             return Ok(());
         }
         // Their own node is absent or down, so fall back to public MWEB peers
@@ -1019,6 +1057,7 @@ impl MwebRuntime {
             hold_spent,
             cancel,
             pending_lock,
+            epoch_check,
         ) {
             Ok(pre_probed) => {
                 self.last_status.push_str(" via public peer");
@@ -1029,11 +1068,12 @@ impl MwebRuntime {
                     pre_probed,
                     cancel,
                     pending_lock,
+                    epoch_check,
                 );
                 Ok(())
             }
             Err(first) => {
-                if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                     return Ok(());
                 }
                 // When Electrum sees a brand-new block 1–2s before P2P gossip,
@@ -1050,7 +1090,7 @@ impl MwebRuntime {
                     if !backoff.is_zero() {
                         std::thread::sleep(backoff);
                     }
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         return Ok(());
                     }
                     if let Ok(pre_probed) = self.sync_pass(
@@ -1063,6 +1103,7 @@ impl MwebRuntime {
                         hold_spent,
                         cancel,
                         pending_lock,
+                        epoch_check,
                     ) {
                         self.last_status.push_str(" via public peer");
                         self.cross_check_leafset(
@@ -1072,6 +1113,7 @@ impl MwebRuntime {
                             pre_probed,
                             cancel,
                             pending_lock,
+                            epoch_check,
                         );
                         return Ok(());
                     }
@@ -1098,6 +1140,7 @@ impl MwebRuntime {
                             hold_spent,
                             cancel,
                             pending_lock,
+                            epoch_check,
                         ) {
                             self.last_status.push_str(" via public peer");
                             self.cross_check_leafset(
@@ -1107,6 +1150,7 @@ impl MwebRuntime {
                                 pre_probed,
                                 cancel,
                                 pending_lock,
+                                epoch_check,
                             );
                             return Ok(());
                         }
@@ -1126,6 +1170,7 @@ impl MwebRuntime {
     /// internally consistent but stale/forged header + leafset; agreement from
     /// a second peer means omission now requires collusion. Only headers are
     /// requested, so the peers learn nothing about the wallet.
+    #[allow(clippy::too_many_arguments)]
     fn cross_check_leafset(
         &mut self,
         tip_hash: bdk_wallet::bitcoin::BlockHash,
@@ -1134,6 +1179,7 @@ impl MwebRuntime {
         pre_probed: Option<PreProbedCrossCheck>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) {
         self.cross_check_warning = None;
         if self.sync_state.leafset.is_empty() {
@@ -1199,7 +1245,9 @@ impl MwebRuntime {
         }
 
         for addr in distinct {
-            if confirmed >= 2 || CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+            if confirmed >= 2
+                || CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check)
+            {
                 break;
             }
             if already_probed.contains(&addr) {
@@ -1292,6 +1340,7 @@ impl MwebRuntime {
         hold_spent: &BTreeSet<[u8; 32]>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         pending_lock: Option<&std::sync::atomic::AtomicBool>,
+        epoch_check: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> Result<Option<PreProbedCrossCheck>, SyncPassFailure> {
         let pass_started = std::time::Instant::now();
         // Heal before this pass so a stuck split/send is included in the
@@ -1338,7 +1387,7 @@ impl MwebRuntime {
         let mut last_err: Option<bdk_mweb::Error> = None;
 
         for (idx, addr) in addrs.iter().copied().enumerate() {
-            if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+            if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                 last_err = Some(bdk_mweb::Error::Crypto("MWEB sync cancelled".into()));
                 break;
             }
@@ -1390,6 +1439,7 @@ impl MwebRuntime {
                         inner: tcp_peer,
                         cancel,
                         pending_lock,
+                        epoch_check,
                         probe_spec: (!backup_addrs.is_empty()).then_some(CrossProbeSpec {
                             scope,
                             backup_addrs,
@@ -1398,6 +1448,7 @@ impl MwebRuntime {
                             policy: probe_policy,
                             cancel,
                             pending_lock,
+                            epoch_check,
                             pass_aborted: &pass_aborted,
                         }),
                         probe_handle: None,
@@ -1456,7 +1507,7 @@ impl MwebRuntime {
                     return Ok(pre_probed);
                 }
                 Err(e) => {
-                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+                    if CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
                         last_err = Some(e);
                         break;
                     }
@@ -1490,7 +1541,7 @@ impl MwebRuntime {
             }
         }
 
-        if !CancellableMwebPeer::is_cancelled(cancel, pending_lock) {
+        if !CancellableMwebPeer::is_cancelled(cancel, pending_lock, epoch_check) {
             crate::discovery::evict_peers(&hard_failed);
             crate::discovery::demote_peers(&lagging);
         }
@@ -1550,6 +1601,17 @@ impl MwebRuntime {
         for id in hold_spent {
             let _ = self.store.db_mut().mark_spent(id);
         }
+        if let Some(max_coin_idx) = self
+            .store
+            .db()
+            .unspent()
+            .filter(|c| c.address_index != CHANGE_ADDRESS_INDEX)
+            .map(|c| c.address_index)
+            .max()
+        {
+            self.receive_index = self.receive_index.max(max_coin_idx.saturating_add(1));
+        }
+        let _ = self.ensure_address_book_covers(self.receive_index);
         self.absorb_received_coins();
         let leafset = self.sync_state.leafset.clone();
         update_outgoing_confirmations_after_scan(
@@ -1583,7 +1645,9 @@ impl MwebRuntime {
                 timestamp: now_ts(),
                 output_ids: vec![id_hex],
                 input_ids: Vec::new(),
-                confirmed_height: None,
+                relayed: false,
+                absent: false,
+                confirmed_height: coin.block_height,
             });
         }
     }
@@ -1620,6 +1684,22 @@ fn is_outgoing_mweb(kind: TxKind) -> bool {
         kind,
         TxKind::Pegout | TxKind::MwebSend | TxKind::MwebSplit | TxKind::MwebChurn
     )
+}
+
+/// Copy a coin's inclusion height onto the history row.
+///
+/// `Resync MWEB` deletes the coin store and keeps the history log. Rows that
+/// never stored `confirmed_height` then have nothing left to date them, so
+/// History shows them pending. Call this while the coins are still loaded.
+pub(crate) fn stamp_known_history_heights(history: &mut MwebHistory, db: &MwebCoinDatabase) {
+    for entry in &mut history.entries {
+        if entry.confirmed_height.is_some() {
+            continue;
+        }
+        if let Some(h) = history_entry_height(entry, db) {
+            entry.confirmed_height = Some(h);
+        }
+    }
 }
 
 /// Minimum inclusion height among coins this entry created, if any are dated.
@@ -1807,12 +1887,18 @@ fn update_outgoing_confirmations_at_inner(
     restore_stale_unconfirmed_inputs(history, db, leafset, now);
 
     for entry in &mut history.entries {
-        if entry.confirmed_height.is_some() || !is_outgoing_mweb(entry.kind) {
+        if entry.confirmed_height.is_some() {
             continue;
         }
         if let Some(h) = history_entry_height(entry, db) {
             entry.confirmed_height = Some(h);
-            date_undated_outputs(db, &entry.output_ids, h);
+            if is_outgoing_mweb(entry.kind) {
+                date_undated_outputs(db, &entry.output_ids, h);
+            }
+            continue;
+        }
+        if !is_outgoing_mweb(entry.kind) {
+            date_orphaned_incoming(entry, db, leafset, tip, now);
             continue;
         }
         if entry.input_ids.is_empty() {
@@ -1849,6 +1935,40 @@ fn update_outgoing_confirmations_at_inner(
     }
 
     forget_stale_unlanded_outgoing(history, db, now);
+}
+
+/// A receive or peg-in whose coins are gone after a resync.
+///
+/// The coin store only re-downloads unspent outputs, so a spent receive is not
+/// in the database anymore. It was found on chain when the row was written.
+/// A peg-in is written at broadcast, before it is mined, and a dropped peg-in
+/// looks the same once its coin has been wiped — only an old one is treated as
+/// confirmed.
+fn date_orphaned_incoming(
+    entry: &mut MwebHistoryEntry,
+    db: &MwebCoinDatabase,
+    leafset: &[u8],
+    tip: u32,
+    now: u64,
+) {
+    if entry.output_ids.is_empty() || leafset.is_empty() {
+        return;
+    }
+    let all_absent = entry.output_ids.iter().all(|id_hex| {
+        let Some(id) = decode_output_id(id_hex) else {
+            return false;
+        };
+        db.get(&id).is_none() && db.get_spent(&id).is_none()
+    });
+    if !all_absent {
+        return;
+    }
+    if entry.kind == TxKind::Pegin
+        && now.saturating_sub(entry.timestamp) < UNCONFIRMED_MWEB_REVERT_SECS
+    {
+        return;
+    }
+    entry.confirmed_height = Some(tip);
 }
 
 fn decode_output_id(id_hex: &str) -> Option<[u8; 32]> {
@@ -1983,6 +2103,8 @@ mod tests {
             timestamp: 1_700_000_000,
             output_ids: outputs.iter().map(|&b| id_hex(b)).collect(),
             input_ids: inputs.iter().map(|&b| id_hex(b)).collect(),
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         }
     }
@@ -2194,6 +2316,62 @@ mod tests {
             &[0],
         );
         assert_eq!(got, vec![None, None]);
+    }
+
+    #[test]
+    fn receive_with_dated_coin_persists_confirmed_height() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, Some(150), Some(7)));
+        let got = run(vec![entry(TxKind::MwebReceive, &[1], &[])], &mut db, &[7]);
+        assert_eq!(
+            got,
+            vec![Some(150)],
+            "a receive must keep the coin's height so a later resync can still show it confirmed"
+        );
+    }
+
+    #[test]
+    fn receive_missing_after_resync_confirms_instead_of_staying_pending() {
+        // Resync drops spent coins from the store. The history row remains, with
+        // no coin left to date it, and used to render as pending forever.
+        let got = run(
+            vec![entry(TxKind::MwebReceive, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+        );
+        assert_eq!(got, vec![Some(TIP)]);
+    }
+
+    #[test]
+    fn undated_receive_still_in_the_store_stays_pending() {
+        let mut db = MwebCoinDatabase::default();
+        db.insert(coin(1, None, None));
+        let got = run(vec![entry(TxKind::MwebReceive, &[1], &[])], &mut db, &[9]);
+        assert_eq!(got, vec![None]);
+    }
+
+    #[test]
+    fn recent_pegin_missing_after_resync_stays_pending() {
+        // A peg-in is recorded at broadcast. Absence after a resync is also how
+        // a peg-in the network dropped looks, so a recent one must stay pending.
+        let got = run(
+            vec![entry(TxKind::Pegin, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+        );
+        assert_eq!(got, vec![None]);
+    }
+
+    #[test]
+    fn old_pegin_missing_after_resync_confirms_at_tip() {
+        let now = 1_700_000_000 + UNCONFIRMED_MWEB_REVERT_SECS + 1;
+        let (heights, _) = run_at(
+            vec![entry(TxKind::Pegin, &[1], &[])],
+            &mut MwebCoinDatabase::default(),
+            &[9],
+            now,
+        );
+        assert_eq!(heights, vec![Some(TIP)]);
     }
 
     #[test]
@@ -2898,7 +3076,12 @@ mod tests {
     fn pegin_blocks_left_only_while_a_pegin_matures() {
         assert_eq!(
             pegin_blocks_left(TxKind::Pegin, 0),
-            Some(MWEB_PEGIN_MATURITY)
+            None,
+            "zero confirmations is pending, not maturing"
+        );
+        assert_eq!(
+            pegin_blocks_left(TxKind::Pegin, 1),
+            Some(MWEB_PEGIN_MATURITY - 1)
         );
         assert_eq!(
             pegin_blocks_left(TxKind::Pegin, 2),
@@ -3872,6 +4055,90 @@ mod tests {
         update_outgoing_confirmations(&mut history, &mut db, &[], TIP);
         assert_eq!(history.entries[0].confirmed_height, None);
     }
+
+    #[test]
+    fn audit_f6_sealed_mweb_rejects_deleted_enc_downgrade_and_scans_beyond_gap_limit() {
+        let (dir, secret, key) = sealed_fixture();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        assert_eq!(load_seal_counter(dir.path()), 1);
+
+        // 1. Deleting sealed v2 blobs and planting unauthenticated plaintext files when
+        // seal_counter > 0 must fail open rather than silently wiping coins / accepting
+        // an unauthenticated receive_index beyond MWEB_GAP_LIMIT.
+        std::fs::remove_file(meta::mweb_coins_enc_path(dir.path())).unwrap();
+        std::fs::remove_file(meta::mweb_index_enc_path(dir.path())).unwrap();
+        std::fs::write(
+            meta::mweb_index_path(dir.path()),
+            format!("{}\n", MWEB_GAP_LIMIT + 50),
+        )
+        .unwrap();
+
+        let downgraded = MwebRuntime::open(
+            dir.path(),
+            &secret,
+            WalletNetwork::Testnet,
+            scheme,
+            0,
+            Some(zeroize::Zeroizing::new(key)),
+        );
+        assert!(
+            downgraded.is_err(),
+            "deleting mweb_coins.enc + mweb_receive_index.enc and planting plaintext receive_index succeeded despite seal_counter=1"
+        );
+    }
+
+    #[test]
+    fn audit_f6b_receive_index_at_gap_limit_must_remain_scannable_by_address_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = crate::seed::MasterSecret::parse(
+            &crate::descriptors::generate_mnemonic().unwrap(),
+            None,
+        )
+        .unwrap();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        save_receive_index(dir.path(), MWEB_GAP_LIMIT).unwrap();
+
+        let rt = MwebRuntime::open(dir.path(), &secret, WalletNetwork::Testnet, scheme, 0, None)
+            .unwrap();
+        assert_eq!(rt.receive_index, MWEB_GAP_LIMIT);
+
+        // Build a peg-in paying our own current `rt.receive_index` (1000) and verify `rt.book` scans it.
+        let mut funded = bdk_mweb::fund_mweb_pegin(
+            &rt.keys,
+            rt.receive_index,
+            200_000,
+            2_100,
+            NetworkKind::Test,
+            &rt.secp,
+        )
+        .unwrap();
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut funded, &rt.keys, &rt.secp).unwrap();
+        let tx = bdk_wallet::bitcoin::Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+            mw_tx: Some(bdk_wallet::bitcoin::blockdata::mimblewimble::Transaction {
+                kernel_offset: funded.psbt.mweb_tx_offset.unwrap_or([0u8; 32]),
+                stealth_offset: funded.psbt.mweb_stealth_offset.unwrap_or([0u8; 32]),
+                body: bdk_wallet::bitcoin::blockdata::mimblewimble::TxBody {
+                    inputs: Vec::new(),
+                    outputs: vec![funded.staged_outputs[0].output.clone()],
+                    kernels: Vec::new(),
+                },
+            }),
+            is_hog_ex: false,
+        };
+        let mut scan_db = MwebCoinDatabase::default();
+        let found =
+            bdk_mweb::scan_litecoin_tx(&rt.keys, &rt.book, &tx, &mut scan_db, &rt.secp).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "MwebRuntime::open capped AddressBook at MWEB_GAP_LIMIT ({MWEB_GAP_LIMIT}) despite receive_index={}; payments to receive_address() are invisible to sync",
+            rt.receive_index
+        );
+    }
 }
 
 /// Remove MWEB store/sync/index files for a from-scratch resync.
@@ -3887,6 +4154,7 @@ pub fn wipe_mweb_files(data_dir: &Path) -> Result<(), WalletError> {
         meta::mweb_coins_enc_path(data_dir),
         meta::mweb_sync_enc_path(data_dir),
         meta::mweb_index_enc_path(data_dir),
+        meta::mweb_seal_counter_path(data_dir),
         crate::broadcast_peers::path(data_dir),
     ] {
         match fs::remove_file(&path) {
@@ -4035,6 +4303,11 @@ fn load_store(
             }
             .map_err(|e| WalletError::Mweb(format!("sealed MWEB store: {e}")))?;
             return Ok((MwebStore::from_changeset(cs.clone()), cs, counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB store {} (seal counter {min_counter})",
+                path.display()
+            )));
         }
     }
     let path = meta::mweb_db_path(data_dir);
@@ -4070,15 +4343,16 @@ fn load_sync_state(
     min_counter: u64,
 ) -> Result<(SyncState, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_sync_enc_path(data_dir),
-            key,
-            SealContext::SyncState,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_sync_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::SyncState, min_counter)? {
             let state = serde_json::from_slice(&opened.plain)
                 .map_err(|e| WalletError::Mweb(e.to_string()))?;
             return Ok((state, opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB sync state {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     let path = meta::mweb_sync_path(data_dir);
@@ -4104,14 +4378,15 @@ fn load_receive_index(
     min_counter: u64,
 ) -> Result<(u32, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_index_enc_path(data_dir),
-            key,
-            SealContext::Index,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_index_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::Index, min_counter)? {
             let s = String::from_utf8_lossy(&opened.plain);
             return Ok((s.trim().parse().unwrap_or(0), opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB receive index {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     let path = meta::mweb_index_path(data_dir);
@@ -4136,15 +4411,16 @@ fn load_history(
     min_counter: u64,
 ) -> Result<(MwebHistory, Option<u64>), WalletError> {
     if let Some(key) = sealing_key {
-        if let Some(opened) = read_sealed(
-            &meta::mweb_history_enc_path(data_dir),
-            key,
-            SealContext::History,
-            min_counter,
-        )? {
+        let enc_path = meta::mweb_history_enc_path(data_dir);
+        if let Some(opened) = read_sealed(&enc_path, key, SealContext::History, min_counter)? {
             let history = serde_json::from_slice(&opened.plain)
                 .map_err(|e| WalletError::Mweb(e.to_string()))?;
             return Ok((history, opened.counter));
+        } else if min_counter > 0 {
+            return Err(WalletError::Mweb(format!(
+                "missing sealed MWEB history {} (seal counter {min_counter})",
+                enc_path.display()
+            )));
         }
     }
     Ok((MwebHistory::load(&meta::mweb_history_path(data_dir))?, None))
@@ -4312,8 +4588,8 @@ pub fn pegin(
     )?;
     // A peg-in tx carries MWEB extension data that Electrum servers reject
     // ("TX decode failed"), so it must take the RPC/P2P path like other MWEB txs.
-    broadcast_mweb_tx(&tx, route)?;
-    apply_pegin_locally(wallet, runtime, &tx, prepared.outputs, &req)
+    let relayed = broadcast_mweb_tx(&tx, route)?;
+    apply_pegin_locally(wallet, runtime, &tx, prepared.outputs, &req, relayed)
 }
 
 /// Credit MWEB outputs and debit transparent inputs for a peg-in we just built
@@ -4325,13 +4601,15 @@ pub(crate) fn apply_pegin_locally(
     tx: &bdk_wallet::bitcoin::Transaction,
     outputs: Vec<bdk_mweb::MwebCoin>,
     req: &PeginRequest,
+    relayed: bool,
 ) -> Result<PeginResult, WalletError> {
-    let tip = wallet.latest_checkpoint().height();
     let ts = now_ts();
     let mut output_ids = Vec::new();
     for mut coin in outputs {
         coin.is_pegin = true;
-        coin.block_height = Some(tip);
+        // Inclusion height comes from a later scan. Stamping the tip here makes
+        // an unbroadcast peg-in look confirmed and maturing.
+        coin.block_height = None;
         output_ids.push(hex::encode(coin.output_id));
         runtime.store.db_mut().insert(coin);
     }
@@ -4363,6 +4641,8 @@ pub(crate) fn apply_pegin_locally(
             output_ids,
             input_ids: Vec::new(),
             confirmed_height: None,
+            relayed,
+            absent: false,
         });
     }
     Ok(PeginResult {
@@ -4393,17 +4673,19 @@ pub(crate) fn apply_pegin_transparent_spend(
 /// while litecoind RPC submits it as our own and gives up that origin privacy.
 /// RPC is the fallback when no peer accepts it, unless the user opted in to
 /// [`BroadcastRoute::via_own_node`], which puts RPC first.
+/// `Ok(true)` means a peer or the user's node accepted the transaction.
+/// `Ok(false)` means a peer took the bytes and never confirmed acceptance.
 pub(crate) fn broadcast_mweb_tx(
     tx: &bdk_wallet::bitcoin::Transaction,
     route: &BroadcastRoute,
-) -> Result<(), WalletError> {
+) -> Result<bool, WalletError> {
     let rpc_first = route.rpc_first();
     let mut own_node_err = None;
     if let Some(url) = rpc_first {
-        match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
+        match rpc::send_raw_transaction_for_network(url, &serialize_hex(tx), Some(route.network)) {
             Ok(_) => {
                 crate::diag::log("MWEB broadcast: sent through your own node (Settings opt-in)");
-                return Ok(());
+                return Ok(true);
             }
             Err(e) => {
                 crate::diag::log(format!(
@@ -4456,13 +4738,13 @@ pub(crate) fn broadcast_mweb_tx(
     }
 
     if run.confirmed.is_some() {
-        return Ok(());
+        return Ok(true);
     }
     if let Some(addr) = run.sent.first() {
         crate::diag::log(format!(
             "MWEB broadcast: no peer confirmed acceptance; keeping optimistic send via {addr}"
         ));
-        return Ok(());
+        return Ok(false);
     }
     let p2p_err = run.error();
     if let Some(rpc_err) = own_node_err {
@@ -4476,12 +4758,12 @@ pub(crate) fn broadcast_mweb_tx(
              check your connection, or set a Litecoin RPC URL in Settings"
         )));
     };
-    match rpc::send_raw_transaction(url, &serialize_hex(tx)) {
+    match rpc::send_raw_transaction_for_network(url, &serialize_hex(tx), Some(route.network)) {
         Ok(_) => {
             crate::diag::log(format!(
                 "MWEB broadcast: fell back to litecoind RPC ({p2p_err})"
             ));
-            Ok(())
+            Ok(true)
         }
         Err(rpc_err) => Err(WalletError::Mweb(format!(
             "could not broadcast over P2P ({p2p_err}) or litecoind RPC ({rpc_err})"
@@ -4746,6 +5028,8 @@ pub fn apply_signed_mweb_send(
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.input_ids(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
     signed.result()
@@ -4984,9 +5268,15 @@ pub(crate) fn coin_block_message(block: CoinBlock) -> String {
 }
 
 /// Blocks left before a peg-in's private coin is spendable, or `None` once it is.
+///
+/// Zero confirmations means the peg-in is not in a block yet, so it is pending
+/// rather than maturing.
 pub(crate) fn pegin_blocks_left(kind: TxKind, confirmations: u32) -> Option<u32> {
+    if kind != TxKind::Pegin || confirmations == 0 {
+        return None;
+    }
     let left = MWEB_PEGIN_MATURITY.saturating_sub(confirmations);
-    (kind == TxKind::Pegin && left > 0).then_some(left)
+    (left > 0).then_some(left)
 }
 
 struct ChurnFields {
@@ -5410,10 +5700,35 @@ pub fn find_output_leaf(
     };
     let bdk_net = network.to_bitcoin_network();
     let policy = peer_policy_for_pool(addrs.len().max(2));
+    let verify_mode = bdk_mweb::lip0006::VerifyMode::default();
     for addr in addrs {
         let Ok(mut peer) = TcpMwebPeer::connect_with_policy(*addr, bdk_net, policy) else {
             continue;
         };
+        let Ok(hdr_msg) = MwebUtxoSource::get_header(&mut peer, tip_hash) else {
+            continue;
+        };
+        if verify_mode.is_anchored() && hdr_msg.verify_anchored(tip_hash).is_err() {
+            continue;
+        }
+        let mweb_header = hdr_msg.mweb_header;
+        if mweb_header.output_mmr_size < end_output_mmr {
+            continue;
+        }
+        let Ok(leafset) = MwebUtxoSource::get_leafset(&mut peer, tip_hash) else {
+            continue;
+        };
+        if bdk_mweb::pmmr::verify_leafset_at(
+            &leafset,
+            tip_hash,
+            &mweb_header.leafset_root,
+            mweb_header.output_mmr_size,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
         let mut start = start_index;
         let mut covered = true;
         for _ in 0..4 {
@@ -5427,26 +5742,72 @@ pub fn find_output_leaf(
                 covered = false;
                 break;
             };
-            if batch.output_format != OUTPUT_FORMAT_FULL {
+            if batch.block_hash != tip_hash || batch.output_format != OUTPUT_FORMAT_FULL {
                 covered = false;
                 break;
             }
             if batch.utxos.is_empty() {
+                if (start..end_output_mmr).any(|idx| leafset_has_leaf(&leafset.leafset, idx)) {
+                    covered = false;
+                    break;
+                }
                 return ChainLeaf::Absent;
             }
-            for entry in &batch.utxos {
-                if bdk_mweb::scan::output_id(&entry.output) == want {
-                    return ChainLeaf::Found(entry.leaf_index);
-                }
+            if bdk_mweb::lip0006::check_batch_advances(&batch, start).is_err()
+                || bdk_mweb::pmmr::verify_utxo_batch(&batch, &leafset, &mweb_header).is_err()
+            {
+                covered = false;
+                break;
             }
+            if mweb_header.output_mmr_size == end_output_mmr
+                && batch.utxos.iter().any(|e| e.leaf_index >= end_output_mmr)
+            {
+                covered = false;
+                break;
+            }
+            // Check no unspent leaf in `[start, min(end_output_mmr, last + 1))` was omitted
             let last = batch
                 .utxos
                 .last()
                 .map(|entry| entry.leaf_index)
                 .unwrap_or(start);
+            let checked_end = last.saturating_add(1).min(end_output_mmr);
+            let mut batch_idx = 0usize;
+            let mut omitted = false;
+            for idx in start..checked_end {
+                if leafset_has_leaf(&leafset.leafset, idx) {
+                    if batch.utxos.get(batch_idx).map(|e| e.leaf_index) == Some(idx) {
+                        batch_idx += 1;
+                    } else {
+                        omitted = true;
+                        break;
+                    }
+                }
+            }
+            if omitted {
+                covered = false;
+                break;
+            }
+            for entry in &batch.utxos {
+                if entry.leaf_index < start || entry.leaf_index >= end_output_mmr {
+                    continue;
+                }
+                if bdk_mweb::scan::output_id(&entry.output) == want {
+                    return ChainLeaf::Found(entry.leaf_index);
+                }
+            }
             if (batch.utxos.len() as u16) < MAX_REQUESTED_MWEB_UTXOS
                 || last.saturating_add(1) >= end_output_mmr
             {
+                let remaining_start = last.saturating_add(1);
+                if (batch.utxos.len() as u16) < MAX_REQUESTED_MWEB_UTXOS
+                    && remaining_start < end_output_mmr
+                    && (remaining_start..end_output_mmr)
+                        .any(|idx| leafset_has_leaf(&leafset.leafset, idx))
+                {
+                    covered = false;
+                    break;
+                }
                 return ChainLeaf::Absent;
             }
             start = last.saturating_add(1);
@@ -5642,6 +6003,7 @@ pub fn sign_mweb_split(
     // Advance and persist receive_index only after building & signing succeed,
     // still before returning to the caller for broadcast.
     runtime.receive_index = start.saturating_add(recipient_amounts.len() as u32);
+    let _ = runtime.ensure_address_book_covers(runtime.receive_index);
     if let Err(e) = runtime.persist(data_dir) {
         runtime.receive_index = start;
         return Err(e);
@@ -5677,6 +6039,8 @@ pub fn apply_signed_mweb_split(runtime: &mut MwebRuntime, signed: &SignedMwebSpl
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.spent_ids.iter().map(hex::encode).collect(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
 }
@@ -5791,6 +6155,7 @@ pub fn sign_self_spend_hops(
     }
 
     runtime.receive_index = start.saturating_add(hops);
+    let _ = runtime.ensure_address_book_covers(runtime.receive_index);
     if let Err(e) = runtime.persist(data_dir) {
         runtime.receive_index = start;
         return Err(e);
@@ -5830,6 +6195,8 @@ pub fn apply_prepared_output(
             timestamp: now_ts(),
             output_ids: vec![output_id],
             input_ids: vec![spent_output_id.to_string()],
+            relayed: false,
+            absent: false,
             confirmed_height: None,
         });
     }
@@ -5840,7 +6207,7 @@ pub fn apply_prepared_output(
 pub fn broadcast_prepared_raw(raw_hex: &str, route: &BroadcastRoute) -> Result<(), WalletError> {
     let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
     let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
-    broadcast_mweb_tx(&tx, route)
+    broadcast_mweb_tx(&tx, route).map(|_| ())
 }
 
 /// One successful read of the node mempool for the cover gate.
@@ -5992,13 +6359,24 @@ pub fn tally_cover(
 ///
 /// A transaction counts when it carries an MWEB payload or is a HogEx integration.
 /// Ids in `own` (txid or wtxid) are skipped, including this wallet's other spends.
+#[allow(dead_code)]
 pub fn count_foreign_mweb_mempool(
     rpc_url: &str,
     own: &BTreeSet<String>,
 ) -> Result<CoverRead, WalletError> {
-    let ids = crate::rpc::get_raw_mempool(rpc_url)?;
+    count_foreign_mweb_mempool_for_network(rpc_url, own, None)
+}
+
+/// [`count_foreign_mweb_mempool`] scoped to the active [`WalletNetwork`].
+pub fn count_foreign_mweb_mempool_for_network(
+    rpc_url: &str,
+    own: &BTreeSet<String>,
+    network: Option<WalletNetwork>,
+) -> Result<CoverRead, WalletError> {
+    let ids = crate::rpc::get_raw_mempool_for_network(rpc_url, network)?;
     let txs = ids.iter().map(|txid| {
-        let Ok(hex_tx) = crate::rpc::get_raw_transaction_hex(rpc_url, txid) else {
+        let Ok(hex_tx) = crate::rpc::get_raw_transaction_hex_for_network(rpc_url, txid, network)
+        else {
             return CoverTx::Unreadable;
         };
         let Ok(bytes) = hex::decode(&hex_tx) else {
@@ -6051,8 +6429,57 @@ pub fn drop_unbroadcast_output(runtime: &mut MwebRuntime, wtxid: &str, created_o
     runtime.history.forget_ids(&[wtxid.to_string()]);
 }
 
-pub fn coin_from_value(value: &serde_json::Value) -> Result<bdk_mweb::MwebCoin, WalletError> {
-    serde_json::from_value(value.clone()).map_err(|e| WalletError::Mweb(e.to_string()))
+/// Recover the owned `MwebCoin` for a prepared self-spend hop from its consensus
+/// transaction hex while the wallet is unlocked.
+pub fn recover_hop_output_coin(
+    runtime: &mut MwebRuntime,
+    raw_hex: &str,
+    created_output_id: &str,
+    receive_index: u32,
+) -> Result<bdk_mweb::MwebCoin, WalletError> {
+    if raw_hex.is_empty() {
+        return Err(WalletError::Mweb(
+            "armed hop raw transaction is empty".into(),
+        ));
+    }
+    let expected_id = decode_output_id(created_output_id).ok_or_else(|| {
+        WalletError::BuildTx(format!(
+            "invalid MWEB output id '{created_output_id}' (expected 32-byte hex)"
+        ))
+    })?;
+    let bytes = hex::decode(raw_hex).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let tx: Transaction = deserialize(&bytes).map_err(|e| WalletError::Mweb(e.to_string()))?;
+    let mw = tx
+        .mw_tx
+        .as_ref()
+        .ok_or_else(|| WalletError::Mweb("armed hop transaction has no MWEB payload".into()))?;
+    let output = mw
+        .body
+        .outputs
+        .iter()
+        .find(|out| bdk_mweb::output_id(out) == expected_id)
+        .ok_or_else(|| {
+            WalletError::Mweb(format!(
+                "armed hop transaction does not contain output {created_output_id}"
+            ))
+        })?;
+    runtime.ensure_address_book_covers(receive_index)?;
+    let mut coin =
+        bdk_mweb::scan::rewind_output(&runtime.keys, &runtime.book, output, &runtime.secp)
+            .map_err(|e| WalletError::Mweb(e.to_string()))?
+            .ok_or_else(|| {
+                WalletError::Mweb(format!(
+                    "armed hop output {created_output_id} does not rewind to this wallet"
+                ))
+            })?;
+    if coin.address_index != receive_index {
+        return Err(WalletError::Mweb(format!(
+            "armed hop output address_index {} does not match expected {receive_index}",
+            coin.address_index
+        )));
+    }
+    coin.block_height = None;
+    Ok(coin)
 }
 
 /// Signed peg-out, not yet broadcast and not yet applied to the coin set.
@@ -6213,6 +6640,8 @@ pub fn apply_signed_pegout(
         timestamp: now_ts(),
         output_ids,
         input_ids: signed.input_ids(),
+        relayed: false,
+        absent: false,
         confirmed_height: None,
     });
     MwebBroadcastResult {
@@ -7371,6 +7800,7 @@ mod sync_failover_tests {
             &BTreeSet::new(),
             Some(&cancel),
             None,
+            None,
         )
         .expect("cancelled sync_at_tip_cancellable returns Ok");
         assert_eq!(a_connects.load(Ordering::SeqCst), a_before);
@@ -7455,5 +7885,265 @@ mod sync_failover_tests {
                 .any(|l| l.contains("more than 1 mwebutxos") || l.contains("unproductive budget exhausted")),
             "must not hit dirty-socket protocol violation or false unproductive budget exhaustion, got: {logs:?}"
         );
+    }
+
+    #[test]
+    fn audit_f8_find_output_leaf_rejects_unproven_out_of_bounds_leaf_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = test_runtime(tmp.path());
+        let mut pegin =
+            bdk_mweb::fund_mweb_pegin(&rt.keys, 0, 100_000, 2_100, NetworkKind::Test, &rt.secp)
+                .expect("fund pegin output");
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut pegin, &rt.keys, &rt.secp).unwrap();
+        let pegin_tx = extract_prepared_mweb_pegin(&pegin.psbt).unwrap();
+        let sample_output = pegin_tx.mw_tx.unwrap().body.outputs[0].clone();
+        let want_hex = hex::encode(bdk_mweb::scan::output_id(&sample_output));
+
+        let tip_hash = BlockHash::from_byte_array([0x77; 32]);
+        let forged_leaf_index: u64 = 999_999; // Far outside [start_index=1, end_output_mmr=5)
+        let raw_mwebutxos = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 1,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![bdk_mweb::p2p::MwebUtxoEntry {
+                leaf_index: forged_leaf_index,
+                output: sample_output,
+            }],
+            parent_hashes: Vec::new(),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                let mut buf = Vec::new();
+                let Some(first) = read_msg(&mut stream, &mut buf) else {
+                    return;
+                };
+                if !matches!(first.payload(), NetworkMessage::Version(_)) {
+                    return;
+                }
+                let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let ver = VersionMessage::new(
+                    ServiceFlags::from(NODE_MWEB_LIGHT_CLIENT),
+                    0,
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    Address::new(&dummy_addr, ServiceFlags::NONE),
+                    1,
+                    "/mock-mweb:0.1/".into(),
+                    100,
+                );
+                let _ = send_msg(&mut stream, NetworkMessage::Version(ver));
+                let _ = send_msg(&mut stream, NetworkMessage::Verack);
+                while let Some(msg) = read_msg(&mut stream, &mut buf) {
+                    match msg.into_payload() {
+                        NetworkMessage::Unknown { command, .. }
+                            if command.as_ref() == "getmwebutxos" =>
+                        {
+                            let _ = send_raw_cmd(&mut stream, "mwebutxos", &raw_mwebutxos);
+                        }
+                        NetworkMessage::Ping(nonce)
+                            if !send_msg(&mut stream, NetworkMessage::Pong(nonce)) =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let got = find_output_leaf(
+            &[peer_addr],
+            WalletNetwork::Testnet,
+            tip_hash,
+            1,
+            5,
+            &want_hex,
+        );
+        TEST_PEER_POLICY.with(|c| c.set(None));
+
+        assert_ne!(
+            got,
+            ChainLeaf::Found(forged_leaf_index),
+            "find_output_leaf accepted unproven out-of-bounds leaf_index={forged_leaf_index} for window [1, 5)"
+        );
+        assert_eq!(got, ChainLeaf::Unread);
+    }
+
+    #[test]
+    fn find_output_leaf_fails_over_from_bad_proof_peer_to_honest_anchored_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = test_runtime(tmp.path());
+        let mut pegin =
+            bdk_mweb::fund_mweb_pegin(&rt.keys, 0, 100_000, 2_100, NetworkKind::Test, &rt.secp)
+                .expect("fund pegin output");
+        let _ = bdk_mweb::sign_funded_mweb_pegin(&mut pegin, &rt.keys, &rt.secp).unwrap();
+        let pegin_tx = extract_prepared_mweb_pegin(&pegin.psbt).unwrap();
+        let sample_output = pegin_tx.mw_tx.unwrap().body.outputs[0].clone();
+        let oid = bdk_mweb::scan::output_id(&sample_output);
+        let want_hex = hex::encode(oid);
+
+        let mut mmr = bdk_mweb::pmmr::MemMmr::new();
+        assert_eq!(mmr.add_output_id(oid), 0);
+        let output_root = mmr.root();
+        let leafset_bytes = vec![0x80u8];
+        let mweb_header = MwebBlockHeader {
+            height: 200,
+            output_root,
+            kernel_root: [0u8; 32],
+            leafset_root: bdk_mweb::hash::blake3_hash(&leafset_bytes),
+            kernel_offset: [0u8; 32],
+            stealth_offset: [0u8; 32],
+            output_mmr_size: 1,
+            kernel_mmr_size: 0,
+        };
+        let mut spk = vec![0x58u8, 0x20];
+        spk.extend_from_slice(&header_hash(&mweb_header));
+        let filler = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            mw_tx: None,
+            is_hog_ex: false,
+        };
+        let hogex = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            mw_tx: None,
+            is_hog_ex: true,
+        };
+        let txids = vec![filler.compute_txid(), hogex.compute_txid()];
+        let txn = PartialMerkleTree::from_txids(&txids, &[false, true]);
+        let merkle_root = bdk_wallet::bitcoin::merkle_tree::calculate_root(txids.into_iter())
+            .map(|h| TxMerkleNode::from_byte_array(h.to_byte_array()))
+            .unwrap();
+        let header = Header {
+            version: BlockVersion::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root,
+            time: 0,
+            bits: CompactTarget::from_consensus(0),
+            nonce: 99,
+        };
+        let tip_hash = header.block_hash();
+        let hdr_payload = serialize(&MwebHeaderMsg {
+            merkle: MerkleBlock { header, txn },
+            hogex,
+            mweb_header,
+        });
+        let leafset_payload = serialize(&MwebLeafset {
+            block_hash: tip_hash,
+            leafset: leafset_bytes,
+        });
+        let bad_utxos_payload = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 0,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![],
+            parent_hashes: vec![],
+        });
+        let good_utxos_payload = serialize(&bdk_mweb::p2p::MwebUtxos {
+            block_hash: tip_hash,
+            start_index: 0,
+            output_format: bdk_mweb::p2p::OUTPUT_FORMAT_FULL,
+            utxos: vec![bdk_mweb::p2p::MwebUtxoEntry {
+                leaf_index: 0,
+                output: sample_output,
+            }],
+            parent_hashes: vec![],
+        });
+
+        let spawn_leaf_peer = |hdr_bytes: Vec<u8>, ls_bytes: Vec<u8>, utxos_bytes: Vec<u8>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut buf = Vec::new();
+                    let Some(first) = read_msg(&mut stream, &mut buf) else {
+                        return;
+                    };
+                    if !matches!(first.payload(), NetworkMessage::Version(_)) {
+                        return;
+                    }
+                    let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                    let ver = VersionMessage::new(
+                        ServiceFlags::from(NODE_MWEB_LIGHT_CLIENT),
+                        0,
+                        Address::new(&dummy_addr, ServiceFlags::NONE),
+                        Address::new(&dummy_addr, ServiceFlags::NONE),
+                        1,
+                        "/mock-mweb:0.1/".into(),
+                        200,
+                    );
+                    let _ = send_msg(&mut stream, NetworkMessage::Version(ver));
+                    let _ = send_msg(&mut stream, NetworkMessage::Verack);
+                    while let Some(msg) = read_msg(&mut stream, &mut buf) {
+                        match msg.into_payload() {
+                            NetworkMessage::GetData(inv) => {
+                                for item in inv {
+                                    if let Inventory::Unknown { inv_type, .. } = item {
+                                        if inv_type == MSG_MWEB_HEADER {
+                                            let _ =
+                                                send_raw_cmd(&mut stream, "mwebheader", &hdr_bytes);
+                                        } else if inv_type == MSG_MWEB_LEAFSET {
+                                            let _ =
+                                                send_raw_cmd(&mut stream, "mwebleafset", &ls_bytes);
+                                        }
+                                    }
+                                }
+                            }
+                            NetworkMessage::Unknown { command, .. }
+                                if command.as_ref() == "getmwebutxos" =>
+                            {
+                                let _ = send_raw_cmd(&mut stream, "mwebutxos", &utxos_bytes);
+                            }
+                            NetworkMessage::Ping(nonce)
+                                if !send_msg(&mut stream, NetworkMessage::Pong(nonce)) =>
+                            {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            addr
+        };
+
+        // Bad peer claims empty UTXOs despite leaf 0 being set in leafset; good peer proves leaf 0.
+        let bad_peer = spawn_leaf_peer(
+            hdr_payload.clone(),
+            leafset_payload.clone(),
+            bad_utxos_payload,
+        );
+        let good_peer = spawn_leaf_peer(hdr_payload, leafset_payload, good_utxos_payload);
+
+        TEST_PEER_POLICY.with(|c| c.set(Some(fast_test_policy())));
+        let got = find_output_leaf(
+            &[bad_peer, good_peer],
+            WalletNetwork::Testnet,
+            tip_hash,
+            0,
+            1,
+            &want_hex,
+        );
+        TEST_PEER_POLICY.with(|c| c.set(None));
+
+        assert_eq!(got, ChainLeaf::Found(0));
     }
 }

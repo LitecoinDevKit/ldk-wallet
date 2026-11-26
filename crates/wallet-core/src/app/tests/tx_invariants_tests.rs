@@ -308,6 +308,8 @@ fn f6_merge_mweb_history_handles_i64_min_without_overflow_panic() {
         timestamp: 1_700_000_000,
         output_ids: Vec::new(),
         input_ids: Vec::new(),
+        relayed: false,
+        absent: false,
         confirmed_height: Some(10),
     });
     let mut records = Vec::new();
@@ -738,8 +740,8 @@ fn auto_mweb_fee_follows_weight() {
     let script = crate::mweb::p2wpkh_script();
     let peg_exact = crate::tx_invariants::min_kernel_fee(0, [script.as_script()]);
     let peg_change = crate::tx_invariants::min_kernel_fee(1, [script.as_script()]);
-    assert_eq!(peg_exact, 400);
-    assert_eq!(peg_change, 2_200);
+    assert_eq!(peg_exact, 447);
+    assert_eq!(peg_change, 2_247);
 
     let dir_peg = tempfile::tempdir().unwrap();
     let (app_peg, peg_ids) =
@@ -793,7 +795,7 @@ fn auto_mweb_fee_follows_weight() {
     let p2wpkh = crate::mweb::p2wpkh_script();
     let two_scripts =
         crate::tx_invariants::min_kernel_fee(0, std::iter::repeat(p2wpkh.as_script()).take(2));
-    assert_eq!(two_scripts, 500);
+    assert_eq!(two_scripts, 578);
     assert_eq!(per_coin.fee_sats, two_scripts);
     assert!(!per_coin.creates_change);
 }

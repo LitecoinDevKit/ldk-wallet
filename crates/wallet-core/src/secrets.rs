@@ -364,27 +364,25 @@ impl UnlockableSecretStore for EncryptedFileSecretStore {
             ));
         }
         let blob = fs::read(&self.path).map_err(|e| WalletError::SecretStore(e.to_string()))?;
-        let mut opened = Self::open(passphrase, &blob)?;
+        let opened = Self::open(passphrase, &blob)?;
         if opened.legacy {
-            // Transparent v1 → v2 upgrade: fresh random sealing key, stronger KDF.
-            // Only adopt the new key once the rewritten file verifies; on any
-            // failure keep the legacy key so the on-disk v1 file stays usable.
-            let mut new_key = Zeroizing::new([0u8; KEY_LEN]);
-            rand::thread_rng().fill_bytes(&mut *new_key);
-            let upgraded = Self::seal(passphrase, &opened.mnemonic, &new_key).and_then(|blob2| {
-                let check = Self::open(passphrase, &blob2)?;
-                if check.mnemonic.trim() != opened.mnemonic.trim() {
-                    return Err(WalletError::SecretStore("upgrade verify failed".into()));
-                }
-                write_bytes(&self.path, &blob2)
-            });
+            // Transparent v1 → v2 upgrade: stronger KDF, preserving the existing
+            // sealing key so already-sealed MWEB files continue to open.
+            let upgraded =
+                Self::seal(passphrase, &opened.mnemonic, &opened.sealing_key).and_then(|blob2| {
+                    let check = Self::open(passphrase, &blob2)?;
+                    if check.mnemonic.trim() != opened.mnemonic.trim()
+                        || *check.sealing_key != *opened.sealing_key
+                    {
+                        return Err(WalletError::SecretStore("upgrade verify failed".into()));
+                    }
+                    write_bytes(&self.path, &blob2)
+                });
             match upgraded {
                 Ok(()) => {
-                    opened.sealing_key = new_key;
                     eprintln!("secret store: upgraded mnemonic file to v2 format");
                 }
                 Err(e) => {
-                    drop(new_key);
                     eprintln!("secret store: v2 upgrade failed, staying on v1 ({e})");
                 }
             }
@@ -632,5 +630,65 @@ mod tests {
         assert!(enc.exists());
         store.lock();
         store.unlock("secret").unwrap();
+    }
+
+    #[test]
+    fn audit_f1_v1_to_v2_upgrade_preserves_existing_mweb_sealed_store() {
+        let dir = tempdir().unwrap();
+        let enc = dir.path().join("wallet.mnemonic.enc");
+        let plain = dir.path().join("wallet.mnemonic");
+        let account_dir = dir.path().join("accounts").join("0");
+        fs::create_dir_all(&account_dir).unwrap();
+
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let v1_blob = seal_v1("pass", mnemonic);
+        let v1_salt = &v1_blob[MAGIC_V1.len()..MAGIC_V1.len() + SALT_LEN];
+        let v1_sealing_key = EncryptedFileSecretStore::derive_key_v1("pass", v1_salt).unwrap();
+
+        // Simulate an existing v1 wallet whose MWEB coin store was sealed under the v1 key.
+        let secret = crate::seed::MasterSecret::parse(mnemonic, None).unwrap();
+        let scheme = crate::dto::MwebScheme::default().to_master_scheme();
+        {
+            let mut rt = crate::mweb::MwebRuntime::open(
+                &account_dir,
+                &secret,
+                crate::network::WalletNetwork::Testnet,
+                scheme,
+                0,
+                Some(v1_sealing_key),
+            )
+            .unwrap();
+            let blind = [0x0bu8; 32];
+            let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+            let commitment = bdk_mweb::crypto::switch_commit(&blind, 250_000, &secp).unwrap();
+            rt.store.db_mut().insert(bdk_mweb::MwebCoin {
+                output_id: [0x22; 32],
+                commitment,
+                amount: 250_000,
+                address_index: 0,
+                blind,
+                shared_secret: [0x33; 32],
+                spend_key: Some([0x44; 32]),
+                block_height: Some(10),
+                is_pegin: false,
+                leaf_index: Some(1),
+            });
+            rt.persist(&account_dir).unwrap();
+        }
+        fs::write(&enc, &v1_blob).unwrap();
+
+        // Unlocking upgrades wallet.mnemonic.enc from v1 to v2; existing mweb_*.enc must still open.
+        let store = EncryptedFileSecretStore::new(&enc, &plain);
+        store.unlock("pass").unwrap();
+        let reopened = crate::mweb::MwebRuntime::open(
+            &account_dir,
+            &secret,
+            crate::network::WalletNetwork::Testnet,
+            scheme,
+            0,
+            store.sealing_key(),
+        )
+        .expect("v1 -> v2 mnemonic upgrade must not orphan existing sealed MWEB stores");
+        assert_eq!(reopened.store.db().unspent_count(), 1);
     }
 }

@@ -18,8 +18,85 @@ use serde::{Deserialize, Serialize};
 use crate::error::WalletError;
 
 pub const MWEB_FROZEN_FILE: &str = "mweb_frozen.json";
+pub const WALLET_LOCK_FILE: &str = ".wallet.lock";
 
 pub const RESERVED_MESSAGE: &str = "A send is already using this coin.";
+
+/// Tracks directories locked within the current process so two `WalletApp`
+/// instances in the same process also fail fast with [`WalletError::AlreadyOpen`].
+static OPEN_DIRS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Exclusive non-blocking OS advisory lock held on `<data_dir>/.wallet.lock`
+/// for the lifetime of a loaded/parked wallet handle.
+pub struct DirLock {
+    file: fs::File,
+    canonical_dir: PathBuf,
+}
+
+impl DirLock {
+    pub fn matches_dir(&self, data_dir: &Path) -> bool {
+        let candidate = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        self.canonical_dir == candidate
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        if let Ok(mut guard) = OPEN_DIRS.lock() {
+            guard.remove(&self.canonical_dir);
+        }
+    }
+}
+
+/// Acquire an exclusive non-blocking OS advisory lock on `<data_dir>/.wallet.lock`.
+/// Fails immediately with [`WalletError::AlreadyOpen`] if another process or
+/// another handle in this process already holds it.
+pub fn try_lock_dir(data_dir: &Path) -> Result<DirLock, WalletError> {
+    fs::create_dir_all(data_dir)?;
+    let canonical_dir = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    {
+        let mut open = OPEN_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+        if !open.insert(canonical_dir.clone()) {
+            return Err(WalletError::AlreadyOpen);
+        }
+    }
+    let lock_path = data_dir.join(WALLET_LOCK_FILE);
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = match opts.open(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            if let Ok(mut guard) = OPEN_DIRS.lock() {
+                guard.remove(&canonical_dir);
+            }
+            return Err(WalletError::Io(e));
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(DirLock {
+            file,
+            canonical_dir,
+        }),
+        Err(fs::TryLockError::WouldBlock) => {
+            if let Ok(mut guard) = OPEN_DIRS.lock() {
+                guard.remove(&canonical_dir);
+            }
+            Err(WalletError::AlreadyOpen)
+        }
+        Err(fs::TryLockError::Error(e)) => {
+            if let Ok(mut guard) = OPEN_DIRS.lock() {
+                guard.remove(&canonical_dir);
+            }
+            Err(WalletError::Io(e))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MwebFrozenFile {

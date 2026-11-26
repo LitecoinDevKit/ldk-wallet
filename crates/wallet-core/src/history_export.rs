@@ -150,6 +150,7 @@ mod tests {
             timestamp: Some(1_700_000_000),
             kind: TxKind::Transparent,
             maturity_blocks_left: None,
+            can_clear: false,
         }
     }
 

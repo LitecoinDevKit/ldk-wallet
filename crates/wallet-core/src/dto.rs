@@ -315,6 +315,9 @@ pub struct TxRecord {
     /// Blocks until a peg-in's private coin is spendable. Set only while it is maturing.
     #[serde(default)]
     pub maturity_blocks_left: Option<u32>,
+    /// The peg-in never left this wallet. History shows Clear instead of Pending.
+    #[serde(default)]
+    pub can_clear: bool,
 }
 
 /// Request to unlock an encrypted wallet.

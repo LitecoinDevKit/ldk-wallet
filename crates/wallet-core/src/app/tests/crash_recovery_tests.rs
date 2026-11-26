@@ -486,6 +486,8 @@ fn crash_mid_reorg_sync_and_resync_mweb_and_cross_account_holds_recover_on_resta
             timestamp: 1_700_000_000,
             output_ids: Vec::new(),
             input_ids: vec![ids[0].clone()],
+            relayed: false,
+            absent: false,
             confirmed_height: Some(115),
         });
         let data_dir = state.data_dir.clone();

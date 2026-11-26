@@ -233,6 +233,9 @@ impl From<SpvError> for WalletError {
 pub struct SpvSyncOutcome {
     pub tip_height: u32,
     pub tip_time: u64,
+    /// Protected txids this server did not list. Peg-ins in here were not in
+    /// its mempool or a block.
+    pub unreported_protected: BTreeSet<Txid>,
     account_dir: PathBuf,
     state: ElectrumSpvState,
 }
@@ -988,6 +991,13 @@ struct VerifiedChain {
 }
 
 impl VerifiedChain {
+    fn verified_at(&self, height: u32) -> Option<Header> {
+        self.headers
+            .get(&height)
+            .or_else(|| self.cached_headers.get(&height))
+            .copied()
+    }
+
     fn verify_and_store_header(
         &mut self,
         height: u32,
@@ -1002,8 +1012,158 @@ impl VerifiedChain {
                 )));
             }
         }
+        if height > 0 {
+            let parent_linked = self
+                .verified_at(height - 1)
+                .map(|parent| {
+                    if header.prev_blockhash != parent.block_hash() {
+                        Err(SpvError::PrevHashMismatch {
+                            height,
+                            expected_prev: parent.block_hash(),
+                            got_prev: header.prev_blockhash,
+                        })
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let child_linked = height
+                .checked_add(1)
+                .and_then(|next| self.verified_at(next))
+                .map(|child| {
+                    if child.prev_blockhash != hash {
+                        Err(SpvError::PrevHashMismatch {
+                            height: height + 1,
+                            expected_prev: hash,
+                            got_prev: child.prev_blockhash,
+                        })
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let local_anchored = self.local_hashes.get(&height) == Some(&hash);
+            if !parent_linked && !child_linked && !local_anchored {
+                return Err(SpvError::PrevHashMismatch {
+                    height,
+                    expected_prev: BlockHash::all_zeros(),
+                    got_prev: header.prev_blockhash,
+                });
+            }
+            match expected_bits_with(height, &header, network, |h| Ok(self.verified_at(h)))? {
+                Some(expected) => {
+                    if expected != header.bits {
+                        return Err(SpvError::TargetMismatch {
+                            height,
+                            expected_bits: expected.to_consensus(),
+                            got_bits: header.bits.to_consensus(),
+                        });
+                    }
+                }
+                None if !local_anchored => {
+                    return Err(SpvError::TargetMismatch {
+                        height,
+                        expected_bits: 0,
+                        got_bits: header.bits.to_consensus(),
+                    });
+                }
+                None => {}
+            }
+        }
         self.headers.insert(height, header);
         Ok(header)
+    }
+
+    /// Collect any missing heights needed to link `targets` to an already-verified
+    /// header (or genesis) and satisfy `expected_bits_with` retarget lookups.
+    fn collect_needed_heights(&self, targets: &[u32]) -> Vec<u32> {
+        const MAX_WALK_SPAN: u32 = 4032;
+        let mut needed = BTreeSet::new();
+        for &target in targets {
+            if self.verified_at(target).is_some() {
+                continue;
+            }
+            needed.insert(target);
+            if self.local_hashes.contains_key(&target) {
+                continue;
+            }
+            let lower = self
+                .headers
+                .range(..target)
+                .next_back()
+                .map(|(&h, _)| h)
+                .into_iter()
+                .chain(
+                    self.cached_headers
+                        .range(..target)
+                        .next_back()
+                        .map(|(&h, _)| h),
+                )
+                .chain(
+                    self.local_hashes
+                        .range(..target)
+                        .next_back()
+                        .map(|(&h, _)| h),
+                )
+                .max();
+            let upper = self
+                .headers
+                .range((target + 1)..)
+                .next()
+                .map(|(&h, _)| h)
+                .into_iter()
+                .chain(
+                    self.cached_headers
+                        .range((target + 1)..)
+                        .next()
+                        .map(|(&h, _)| h),
+                )
+                .min();
+            let down_dist = lower.map(|l| target - l).unwrap_or(u32::MAX);
+            let up_dist = upper.map(|u| u - target).unwrap_or(u32::MAX);
+            if down_dist <= up_dist && down_dist <= MAX_WALK_SPAN {
+                let l = lower.unwrap_or(0);
+                for h in l..=target {
+                    if self.verified_at(h).is_none() {
+                        needed.insert(h);
+                    }
+                }
+            } else if up_dist <= MAX_WALK_SPAN {
+                let u = upper.unwrap_or(target);
+                for h in target..=u {
+                    if self.verified_at(h).is_none() {
+                        needed.insert(h);
+                    }
+                }
+            } else if target > 0 && self.verified_at(target - 1).is_none() {
+                needed.insert(target - 1);
+            }
+        }
+        // Also ensure retarget-epoch ancestors and immediate parents are included
+        // for any height we are about to verify.
+        let snapshot: Vec<u32> = needed.iter().copied().collect();
+        for h in snapshot {
+            if h > 0 && self.verified_at(h - 1).is_none() {
+                needed.insert(h - 1);
+            }
+            if h > 0 && h.is_multiple_of(RETARGET_INTERVAL) {
+                let lookback = if h == RETARGET_INTERVAL {
+                    RETARGET_INTERVAL - 1
+                } else {
+                    RETARGET_INTERVAL
+                };
+                let anc = h - 1 - lookback;
+                if self.verified_at(anc).is_none() {
+                    needed.insert(anc);
+                }
+            }
+        }
+        needed
+            .into_iter()
+            .filter(|h| self.verified_at(*h).is_none())
+            .collect()
     }
 
     fn prefetch_headers_at<E: ElectrumApi>(
@@ -1012,13 +1172,8 @@ impl VerifiedChain {
         heights: &[u32],
         network: WalletNetwork,
     ) -> Result<(), SpvError> {
-        let missing: Vec<u32> = heights
-            .iter()
-            .copied()
-            .filter(|h| !self.headers.contains_key(h) && !self.cached_headers.contains_key(h))
-            .collect::<BTreeSet<u32>>()
-            .into_iter()
-            .collect();
+        let missing = self.collect_needed_heights(heights);
+        let mut fetched_map = BTreeMap::new();
         for chunk in missing.chunks(HEADER_BATCH_SIZE) {
             let fetched = api.batch_block_header(chunk).map_err(transport)?;
             if fetched.len() != chunk.len() {
@@ -1029,8 +1184,36 @@ impl VerifiedChain {
                 )));
             }
             for (&height, header) in chunk.iter().zip(fetched) {
-                self.verify_and_store_header(height, header, network)?;
+                fetched_map.insert(height, header);
             }
+        }
+        // Verify any local_hashes anchors or ascending-linked heights first, then
+        // any downward-linked heights in reverse order.
+        let mut pending: Vec<(u32, Header)> = fetched_map.into_iter().collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut next_pending = Vec::new();
+            for (height, header) in pending {
+                let can_verify_now = height == 0
+                    || self.local_hashes.contains_key(&height)
+                    || self.verified_at(height - 1).is_some()
+                    || height
+                        .checked_add(1)
+                        .and_then(|n| self.verified_at(n))
+                        .is_some();
+                if can_verify_now {
+                    self.verify_and_store_header(height, header, network)?;
+                } else {
+                    next_pending.push((height, header));
+                }
+            }
+            if next_pending.len() == before {
+                for (height, header) in next_pending {
+                    self.verify_and_store_header(height, header, network)?;
+                }
+                break;
+            }
+            pending = next_pending;
         }
         Ok(())
     }
@@ -1043,14 +1226,15 @@ impl VerifiedChain {
         height: u32,
         network: WalletNetwork,
     ) -> Result<Header, SpvError> {
-        if let Some(header) = self.headers.get(&height) {
-            return Ok(*header);
+        if let Some(header) = self.verified_at(height) {
+            return Ok(header);
         }
-        if let Some(header) = self.cached_headers.get(&height) {
-            return Ok(*header);
-        }
-        let header = api.block_header(height as usize).map_err(transport)?;
-        self.verify_and_store_header(height, header, network)
+        self.prefetch_headers_at(api, &[height], network)?;
+        self.verified_at(height).ok_or_else(|| {
+            SpvError::Transport(format!(
+                "Electrum server did not return verified header at height {height}"
+            ))
+        })
     }
 }
 
@@ -2213,6 +2397,11 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
     }
     next.last_sync_ts = sync_ts;
 
+    let unreported_protected: BTreeSet<Txid> = protected
+        .iter()
+        .copied()
+        .filter(|txid| !out.reported.contains(txid))
+        .collect();
     let tx_update = out.tx_update;
     if full_scan {
         wallet.apply_update(FullScanResponse {
@@ -2231,6 +2420,7 @@ pub fn finish_electrum_spv_with_shards<E: ElectrumApi + Sync>(
     Ok(SpvSyncOutcome {
         tip_height: chain.tip_height,
         tip_time: u64::from(tip.time),
+        unreported_protected,
         account_dir,
         state: next,
     })
@@ -2794,5 +2984,37 @@ mod tests {
             verify_transaction(&raw_over, &over_id),
             Err(SpvError::InvalidTransaction { .. })
         ));
+    }
+
+    #[test]
+    fn audit_f2_historical_anchor_header_must_not_accept_unlinked_pow_limit_header() {
+        // Real Mainnet parameters (no easy_pow_for_test): an already-synced Mainnet wallet
+        // at tip 3_200_000 requests an isolated historical anchor header at height 3_000_000
+        // (below the 2_016-block tip window and outside cached_headers).
+        let mainnet_gen = genesis_block(Network::Bitcoin).header;
+        let fake_tip_hash = BlockHash::from_byte_array([0x55; 32]);
+        let mut chain = VerifiedChain {
+            tip_height: 3_200_000,
+            agreement: 3_200_000,
+            headers: BTreeMap::new(),
+            local_hashes: BTreeMap::from([
+                (0, mainnet_gen.block_hash()),
+                (3_200_000, fake_tip_hash),
+            ]),
+            cached_headers: BTreeMap::new(),
+            sub_ms: 0,
+            range_ms: 0,
+            walk_ms: 0,
+            ancestors_ms: 0,
+            pow_ms: 0,
+        };
+
+        // `mainnet_gen` has prev_blockhash == 00..00 and 2011 minimum difficulty (0x1e0ffff0 <= powLimit),
+        // completely disconnected from Mainnet height 3_000_000. It must not be accepted as block 3_000_000.
+        let res = chain.verify_and_store_header(3_000_000, mainnet_gen, WalletNetwork::Mainnet);
+        assert!(
+            res.is_err(),
+            "unlinked powLimit header (prev_blockhash=00..00, bits=0x1e0ffff0) was accepted as Mainnet height 3_000_000: {res:?}"
+        );
     }
 }

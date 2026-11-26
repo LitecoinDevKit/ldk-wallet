@@ -112,6 +112,9 @@ pub enum SpvError {
         expected_prev: BlockHash,
         got_prev: BlockHash,
     },
+    /// Header above genesis links to neither a stored header nor one fetched
+    /// in the same batch. Not a parent-hash comparison: there is no parent.
+    UnlinkedHeader { height: u32 },
     /// Header's `bits` does not match the expected Litecoin difficulty target at `height`.
     TargetMismatch {
         height: u32,
@@ -188,6 +191,10 @@ impl std::fmt::Display for SpvError {
             } => write!(
                 f,
                 "SPV header at height {height} prev_blockhash mismatch: expected {expected_prev}, got {got_prev}"
+            ),
+            Self::UnlinkedHeader { height } => write!(
+                f,
+                "SPV header at height {height} is not linked to a verified header"
             ),
             Self::TargetMismatch {
                 height,
@@ -990,6 +997,14 @@ struct VerifiedChain {
     pow_ms: u64,
 }
 
+/// Whether a fetched header can be stored on this pass through the island.
+enum IslandStep {
+    /// Parent is stored, or this is the floor and the next header points at it.
+    Store,
+    /// Parent was fetched and is not stored yet.
+    Wait,
+}
+
 impl VerifiedChain {
     fn verified_at(&self, height: u32) -> Option<Header> {
         self.headers
@@ -1004,6 +1019,19 @@ impl VerifiedChain {
         header: Header,
         network: WalletNetwork,
     ) -> Result<Header, SpvError> {
+        self.verify_and_store_header_with(height, header, network, &BTreeMap::new())
+    }
+
+    /// `pending` holds headers fetched in this batch that are not stored yet.
+    /// A forward link to one of them accepts the floor of an island. It is not
+    /// a stored parent, so the bits check still waits until that parent is stored.
+    fn verify_and_store_header_with(
+        &mut self,
+        height: u32,
+        header: Header,
+        network: WalletNetwork,
+        pending: &BTreeMap<u32, Header>,
+    ) -> Result<Header, SpvError> {
         let hash = verify_header_pow(&header, height, network)?;
         if let Some(&local) = self.local_hashes.get(&height) {
             if local != hash {
@@ -1013,67 +1041,155 @@ impl VerifiedChain {
             }
         }
         if height > 0 {
-            let parent_linked = self
-                .verified_at(height - 1)
-                .map(|parent| {
-                    if header.prev_blockhash != parent.block_hash() {
-                        Err(SpvError::PrevHashMismatch {
-                            height,
-                            expected_prev: parent.block_hash(),
-                            got_prev: header.prev_blockhash,
-                        })
-                    } else {
-                        Ok(true)
-                    }
-                })
-                .transpose()?
-                .unwrap_or(false);
-            let child_linked = height
-                .checked_add(1)
-                .and_then(|next| self.verified_at(next))
-                .map(|child| {
-                    if child.prev_blockhash != hash {
-                        Err(SpvError::PrevHashMismatch {
-                            height: height + 1,
-                            expected_prev: hash,
-                            got_prev: child.prev_blockhash,
-                        })
-                    } else {
-                        Ok(true)
-                    }
-                })
-                .transpose()?
-                .unwrap_or(false);
+            let parent_linked = if let Some(parent) = self.verified_at(height - 1) {
+                if header.prev_blockhash != parent.block_hash() {
+                    return Err(SpvError::PrevHashMismatch {
+                        height,
+                        expected_prev: parent.block_hash(),
+                        got_prev: header.prev_blockhash,
+                    });
+                }
+                true
+            } else {
+                false
+            };
+            let child_linked = if let Some(child) = height.checked_add(1).and_then(|next| {
+                self.verified_at(next)
+                    .or_else(|| pending.get(&next).copied())
+            }) {
+                if child.prev_blockhash != hash {
+                    return Err(SpvError::PrevHashMismatch {
+                        height: height + 1,
+                        expected_prev: hash,
+                        got_prev: child.prev_blockhash,
+                    });
+                }
+                true
+            } else {
+                false
+            };
             let local_anchored = self.local_hashes.get(&height) == Some(&hash);
             if !parent_linked && !child_linked && !local_anchored {
-                return Err(SpvError::PrevHashMismatch {
-                    height,
-                    expected_prev: BlockHash::all_zeros(),
-                    got_prev: header.prev_blockhash,
-                });
+                return Err(SpvError::UnlinkedHeader { height });
             }
             match expected_bits_with(height, &header, network, |h| Ok(self.verified_at(h)))? {
-                Some(expected) => {
-                    if expected != header.bits {
-                        return Err(SpvError::TargetMismatch {
-                            height,
-                            expected_bits: expected.to_consensus(),
-                            got_bits: header.bits.to_consensus(),
-                        });
-                    }
+                Some(expected) if expected != header.bits => {
+                    return Err(SpvError::TargetMismatch {
+                        height,
+                        expected_bits: expected.to_consensus(),
+                        got_bits: header.bits.to_consensus(),
+                    });
                 }
-                None if !local_anchored => {
+                // Parent is stored, but a further ancestor the retarget needs
+                // is not. Refuse that header instead of inventing a target.
+                None if parent_linked && !local_anchored => {
                     return Err(SpvError::TargetMismatch {
                         height,
                         expected_bits: 0,
                         got_bits: header.bits.to_consensus(),
                     });
                 }
-                None => {}
+                // No stored parent. The floor of an island below the tip window
+                // is accepted on proof-of-work and a forward link. Item 33
+                // replaces that floor with a signed checkpoint.
+                _ => {}
             }
         }
         self.headers.insert(height, header);
         Ok(header)
+    }
+
+    /// Store `pending` from the bottom. A header whose parent is already
+    /// stored has to match that parent. The lowest header of an island, whose
+    /// parent was not fetched, is stored when the next header points at it.
+    fn verify_fetched_island(
+        &mut self,
+        mut pending: BTreeMap<u32, Header>,
+        network: WalletNetwork,
+    ) -> Result<(), SpvError> {
+        while !pending.is_empty() {
+            let heights: Vec<u32> = pending.keys().copied().collect();
+            let mut progress = false;
+            let mut unlinked = None;
+            for height in heights {
+                let Some(header) = pending.get(&height).copied() else {
+                    continue;
+                };
+                match self.island_step(height, &header, &pending) {
+                    Ok(IslandStep::Wait) => {}
+                    Ok(IslandStep::Store) => {
+                        pending.remove(&height);
+                        self.verify_and_store_header_with(height, header, network, &pending)?;
+                        progress = true;
+                    }
+                    Err(SpvError::UnlinkedHeader { height }) => {
+                        unlinked.get_or_insert(height);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if !progress {
+                let height = unlinked.unwrap_or_else(|| {
+                    pending
+                        .keys()
+                        .next()
+                        .copied()
+                        .expect("pending is non-empty")
+                });
+                return Err(SpvError::UnlinkedHeader { height });
+            }
+        }
+        Ok(())
+    }
+
+    fn island_step(
+        &self,
+        height: u32,
+        header: &Header,
+        pending: &BTreeMap<u32, Header>,
+    ) -> Result<IslandStep, SpvError> {
+        if height == 0 || self.local_hashes.contains_key(&height) {
+            return Ok(IslandStep::Store);
+        }
+        if let Some(parent) = self.verified_at(height - 1) {
+            if header.prev_blockhash != parent.block_hash() {
+                return Err(SpvError::PrevHashMismatch {
+                    height,
+                    expected_prev: parent.block_hash(),
+                    got_prev: header.prev_blockhash,
+                });
+            }
+            return Ok(IslandStep::Store);
+        }
+        if let Some(child) = height
+            .checked_add(1)
+            .and_then(|next| self.verified_at(next))
+        {
+            let hash = header.block_hash();
+            if child.prev_blockhash != hash {
+                return Err(SpvError::PrevHashMismatch {
+                    height: height + 1,
+                    expected_prev: hash,
+                    got_prev: child.prev_blockhash,
+                });
+            }
+            if pending.contains_key(&(height - 1)) {
+                return Ok(IslandStep::Wait);
+            }
+            return Ok(IslandStep::Store);
+        }
+        if pending.contains_key(&(height - 1)) {
+            return Ok(IslandStep::Wait);
+        }
+        let hash = header.block_hash();
+        if height
+            .checked_add(1)
+            .and_then(|next| pending.get(&next))
+            .is_some_and(|child| child.prev_blockhash == hash)
+        {
+            return Ok(IslandStep::Store);
+        }
+        Err(SpvError::UnlinkedHeader { height })
     }
 
     /// Collect any missing heights needed to link `targets` to an already-verified
@@ -1187,35 +1303,9 @@ impl VerifiedChain {
                 fetched_map.insert(height, header);
             }
         }
-        // Verify any local_hashes anchors or ascending-linked heights first, then
-        // any downward-linked heights in reverse order.
-        let mut pending: Vec<(u32, Header)> = fetched_map.into_iter().collect();
-        while !pending.is_empty() {
-            let before = pending.len();
-            let mut next_pending = Vec::new();
-            for (height, header) in pending {
-                let can_verify_now = height == 0
-                    || self.local_hashes.contains_key(&height)
-                    || self.verified_at(height - 1).is_some()
-                    || height
-                        .checked_add(1)
-                        .and_then(|n| self.verified_at(n))
-                        .is_some();
-                if can_verify_now {
-                    self.verify_and_store_header(height, header, network)?;
-                } else {
-                    next_pending.push((height, header));
-                }
-            }
-            if next_pending.len() == before {
-                for (height, header) in next_pending {
-                    self.verify_and_store_header(height, header, network)?;
-                }
-                break;
-            }
-            pending = next_pending;
-        }
-        Ok(())
+        // An anchor far below the tip window arrives as a short island (the
+        // anchor, its parent, and that parent's parent), not a walk to the tip.
+        self.verify_fetched_island(fetched_map, network)
     }
 
     /// The verified header at `height`, reading and checking an isolated one
@@ -3010,11 +3100,93 @@ mod tests {
         };
 
         // `mainnet_gen` has prev_blockhash == 00..00 and 2011 minimum difficulty (0x1e0ffff0 <= powLimit),
-        // completely disconnected from Mainnet height 3_000_000. It must not be accepted as block 3_000_000.
+        // completely disconnected from Mainnet height 3_000_000. It must not be accepted as block 3_000_000,
+        // and the rejection must not pretend the expected parent was the all-zero hash.
         let res = chain.verify_and_store_header(3_000_000, mainnet_gen, WalletNetwork::Mainnet);
         assert!(
-            res.is_err(),
-            "unlinked powLimit header (prev_blockhash=00..00, bits=0x1e0ffff0) was accepted as Mainnet height 3_000_000: {res:?}"
+            matches!(res, Err(SpvError::UnlinkedHeader { height: 3_000_000 })),
+            "unlinked powLimit header must be rejected without a zero parent hash, got {res:?}"
         );
+    }
+
+    fn chain_with_distant_tip(tip: u32) -> VerifiedChain {
+        let gen = genesis_block(Network::Testnet4).header;
+        VerifiedChain {
+            tip_height: tip,
+            agreement: tip,
+            headers: BTreeMap::from([(tip, gen)]),
+            local_hashes: BTreeMap::from([(0, gen.block_hash()), (tip, gen.block_hash())]),
+            cached_headers: BTreeMap::new(),
+            sub_ms: 0,
+            range_ms: 0,
+            walk_ms: 0,
+            ancestors_ms: 0,
+            pow_ms: 0,
+        }
+    }
+
+    #[test]
+    fn sparse_anchor_island_links_without_zero_parent() {
+        let _pow = easy_pow_for_test();
+        // 10_000 blocks above the anchor, past MAX_WALK_SPAN (4032), so the
+        // anchor is not walked back to the tip window.
+        let anchor_height = 10_000;
+        let tip = anchor_height + 10_000;
+        let mut chain = chain_with_distant_tip(tip);
+        let needed = chain.collect_needed_heights(&[anchor_height]);
+        assert_eq!(
+            needed,
+            vec![anchor_height - 2, anchor_height - 1, anchor_height],
+            "a far anchor fetches a 3-header island, not the span up to the tip"
+        );
+
+        let floor = mine_scrypt_header(Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: BlockHash::from_byte_array([0x11; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([1; 32]),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        });
+        let mid = easy_child(&floor, 2);
+        let anchor = easy_child(&mid, 3);
+        let island = BTreeMap::from([
+            (anchor_height - 2, floor),
+            (anchor_height - 1, mid),
+            (anchor_height, anchor),
+        ]);
+        chain
+            .verify_fetched_island(island, WalletNetwork::Testnet)
+            .expect("linked island below the tip window must be accepted");
+        assert_eq!(
+            chain
+                .verified_at(anchor_height)
+                .map(|header| header.block_hash()),
+            Some(anchor.block_hash())
+        );
+
+        let mut broken = anchor;
+        broken.prev_blockhash = floor.block_hash();
+        let broken = mine_scrypt_header(broken);
+        let mut chain = chain_with_distant_tip(tip);
+        let err = chain
+            .verify_fetched_island(
+                BTreeMap::from([
+                    (anchor_height - 2, floor),
+                    (anchor_height - 1, mid),
+                    (anchor_height, broken),
+                ]),
+                WalletNetwork::Testnet,
+            )
+            .expect_err("anchor whose prev does not match the mined parent");
+        assert_eq!(
+            err,
+            SpvError::PrevHashMismatch {
+                height: anchor_height,
+                expected_prev: mid.block_hash(),
+                got_prev: broken.prev_blockhash,
+            }
+        );
+        assert_ne!(mid.block_hash(), BlockHash::all_zeros());
     }
 }

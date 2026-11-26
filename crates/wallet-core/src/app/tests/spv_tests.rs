@@ -1877,9 +1877,10 @@ fn warm_sync_with_cached_anchors_skips_shards_and_cold_restore_ignores_dead_shar
         }
     });
 
-    // Cold restore with `primary`, `shard`, and `dead_url` in `shard_urls`:
-    // parallel shard probing with the 250ms second-shard grace window must finish
-    // quickly without waiting 5s on `dead_url`.
+    // Cold restore with `primary` active and `shard` configured. The dead
+    // listener is not a candidate yet. Probing must return inside the 250ms
+    // second-shard grace, but sqlite persist and `build_summary` take several
+    // seconds on Windows CI, so the bound is the probe log rather than the sync.
     configure_electrum(&app, &shard.url, false);
     {
         let mut guard = app.lock_state().unwrap();
@@ -1888,12 +1889,21 @@ fn warm_sync_with_cached_anchors_skips_shards_and_cold_restore_ignores_dead_shar
     }
     app.remember_electrum(primary.url.clone());
 
-    let cold_started = std::time::Instant::now();
+    let (cursor, _) = diag::since_current_thread(u64::MAX);
     app.sync().expect("cold restore with shard");
+    let (_, lines) = diag::since_current_thread(cursor);
+    let shard_ms = lines.iter().rev().find_map(|line| {
+        let rest = line.split("sync: electrum shards connected=").nth(1)?;
+        rest.split("ms=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    });
     assert!(
-        cold_started.elapsed() < std::time::Duration::from_secs(2),
-        "cold restore took {:?}",
-        cold_started.elapsed()
+        shard_ms.is_some_and(|ms| ms < 1_000),
+        "shard probe must return inside the grace window, not the 5s dead-socket stall; lines={lines:#?}"
     );
     assert_eq!(app.list_unspent().unwrap().len(), 60);
     // External keychain (1 active script -> trailing unused = 99 >= 50) + internal keychain
@@ -1925,12 +1935,14 @@ fn warm_sync_with_cached_anchors_skips_shards_and_cold_restore_ignores_dead_shar
     app.note_cross_check(primary.url.clone(), 61, tip_61_hash, None);
 
     dead_hits.store(0, std::sync::atomic::Ordering::SeqCst);
-    let warm_started = std::time::Instant::now();
+    let (cursor, _) = diag::since_current_thread(u64::MAX);
     app.sync().expect("warm sync with 60 cached anchors");
+    let (_, lines) = diag::since_current_thread(cursor);
     assert!(
-        warm_started.elapsed() < std::time::Duration::from_millis(500),
-        "warm sync must not stall probing dead shard URLs, took {:?}",
-        warm_started.elapsed()
+        lines
+            .iter()
+            .all(|line| !line.contains("sync: electrum shards connected=")),
+        "warm sync with cached anchors must not probe shard servers: {lines:#?}"
     );
     assert_eq!(
         dead_hits.load(std::sync::atomic::Ordering::SeqCst),

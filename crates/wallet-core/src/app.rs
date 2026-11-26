@@ -260,17 +260,69 @@ fn pegin_can_clear(
         && !output_on_chain
 }
 
+/// A peg-out whose recorded fee is the pre-fix kernel price.
+///
+/// One public output is the smallest peg-out this wallet sends, so any fee
+/// under that floor cannot relay. A per-coin peg-out has no MWEB change and
+/// paid exactly the old kernel fee for one output per input; that price is
+/// also short once each public output is billed.
+fn pegout_fee_is_short(entry: &crate::mweb_history::MwebHistoryEntry) -> bool {
+    if entry.kind != TxKind::Pegout {
+        return false;
+    }
+    let Some(fee) = entry.fee_sats else {
+        return false;
+    };
+    let script = mweb::p2wpkh_script();
+    let change = entry.output_ids.len();
+    let one = crate::tx_invariants::min_kernel_fee(change, [script.as_script()]);
+    if fee < one {
+        return true;
+    }
+    if change == 0 {
+        let n = entry.input_ids.len().max(1);
+        let old = bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(
+            0,
+            std::iter::repeat(script.as_script()).take(n),
+        ));
+        let required =
+            crate::tx_invariants::min_kernel_fee(0, std::iter::repeat(script.as_script()).take(n));
+        if fee == old && fee < required {
+            return true;
+        }
+    }
+    false
+}
+
+/// History shows Not relayed and Clear for a peg-in a sync could not find, or
+/// a peg-out whose fee the network will not relay.
+fn spend_can_clear(
+    entry: &crate::mweb_history::MwebHistoryEntry,
+    tx_confirmed: bool,
+    on_chain: bool,
+) -> bool {
+    if tx_confirmed || on_chain || entry.confirmed_height.is_some() {
+        return false;
+    }
+    pegin_can_clear(entry, false, false) || pegout_fee_is_short(entry)
+}
+
+fn coin_id_has_leaf(oid_hex: &str, db: &bdk_mweb::MwebCoinDatabase) -> bool {
+    hex::decode(oid_hex)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .and_then(|id| db.get(&id).or_else(|| db.get_spent(&id)))
+        .is_some_and(|coin| coin.leaf_index.is_some())
+}
+
 fn pegin_output_has_leaf(
     entry: &crate::mweb_history::MwebHistoryEntry,
     db: &bdk_mweb::MwebCoinDatabase,
 ) -> bool {
-    entry.output_ids.iter().any(|oid_hex| {
-        hex::decode(oid_hex)
-            .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-            .and_then(|id| db.get(&id).or_else(|| db.get_spent(&id)))
-            .is_some_and(|coin| coin.leaf_index.is_some())
-    })
+    entry
+        .output_ids
+        .iter()
+        .any(|oid_hex| coin_id_has_leaf(oid_hex, db))
 }
 
 /// True when repair should still look up the transparent peg-in. Empty output
@@ -6620,7 +6672,7 @@ fn clear_unrelayed_pegin(state: &mut WalletState, txid: &str) -> Result<(), Wall
         .and_then(|mweb| mweb.history.entries.iter().find(|entry| entry.id == txid))
         .cloned()
         .ok_or_else(|| WalletError::Mweb("That peg-in is not in this wallet.".into()))?;
-    let output_on_chain = state
+    let on_chain = state
         .mweb
         .as_ref()
         .is_some_and(|mweb| pegin_output_has_leaf(&entry, mweb.store.db()));
@@ -6630,10 +6682,39 @@ fn clear_unrelayed_pegin(state: &mut WalletState, txid: &str) -> Result<(), Wall
             .get_tx(id)
             .is_some_and(|tx| matches!(tx.pos, ChainPosition::Confirmed { .. }))
     });
-    if !pegin_can_clear(&entry, tx_confirmed, output_on_chain) {
+    if !spend_can_clear(&entry, tx_confirmed, on_chain) {
         return Err(WalletError::Mweb(
-            "This peg-in is on the network and cannot be cleared.".into(),
+            "This transaction is on the network and cannot be cleared.".into(),
         ));
+    }
+    if entry.kind == TxKind::Pegout {
+        let Some(mweb) = state.mweb.as_mut() else {
+            return Err(WalletError::Mweb("MWEB runtime not initialized".into()));
+        };
+        for oid_hex in entry.input_ids.iter().chain(entry.output_ids.iter()) {
+            let Some(id) = hex::decode(oid_hex)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            else {
+                continue;
+            };
+            if entry.input_ids.iter().any(|hex_id| hex_id == oid_hex) {
+                let _ = mweb.store.db_mut().restore_spent(&id);
+            }
+            if entry.output_ids.iter().any(|hex_id| hex_id == oid_hex)
+                && mweb
+                    .store
+                    .db()
+                    .get(&id)
+                    .is_some_and(|coin| coin.leaf_index.is_none())
+            {
+                let _ = mweb.store.db_mut().mark_spent(&id);
+            }
+        }
+        mweb.history.forget_ids(&[txid.to_string()]);
+        mweb.persist(&state.data_dir)?;
+        diag::log(format!("pegout: cleared unrelayed {txid}"));
+        return Ok(());
     }
     if let Some(id) = parse_txid(txid) {
         if state.wallet.get_tx(id).is_some() {
@@ -8390,7 +8471,7 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
             }
             records[i].maturity_blocks_left =
                 mweb::pegin_blocks_left(records[i].kind, records[i].confirmations);
-            records[i].can_clear = pegin_can_clear(
+            records[i].can_clear = spend_can_clear(
                 entry,
                 records[i].confirmations > 0,
                 pegin_output_has_leaf(entry, mweb.store.db()),
@@ -8421,7 +8502,7 @@ fn merge_mweb_history(records: &mut Vec<TxRecord>, mweb: &MwebRuntime, tip: u32)
             timestamp: Some(entry.timestamp),
             kind: entry.kind,
             maturity_blocks_left: mweb::pegin_blocks_left(entry.kind, confirmations),
-            can_clear: pegin_can_clear(
+            can_clear: spend_can_clear(
                 entry,
                 confirmations > 0,
                 pegin_output_has_leaf(entry, mweb.store.db()),
@@ -8573,6 +8654,40 @@ mod tests {
         entry.confirmed_height = None;
         assert!(!pegin_can_clear(&entry, true, false));
         assert!(!pegin_can_clear(&entry, false, true));
+    }
+
+    #[test]
+    fn underpaid_pegout_can_be_cleared() {
+        let input = "33".repeat(32);
+        let mut entry = MwebHistoryEntry {
+            id: "aa".repeat(32),
+            kind: TxKind::Pegout,
+            net_sats: -1_000,
+            fee_sats: Some(400),
+            timestamp: 1,
+            output_ids: Vec::new(),
+            input_ids: vec![input.clone()],
+            confirmed_height: None,
+            relayed: false,
+            absent: false,
+        };
+        assert!(
+            spend_can_clear(&entry, false, false),
+            "400 litoshis is the old one-output kernel fee"
+        );
+        entry.fee_sats = Some(447);
+        assert!(!spend_can_clear(&entry, false, false));
+        entry.input_ids.push("44".repeat(32));
+        entry.fee_sats = Some(500);
+        assert!(
+            spend_can_clear(&entry, false, false),
+            "500 litoshis is the old two-output kernel fee"
+        );
+        entry.fee_sats = Some(578);
+        assert!(!spend_can_clear(&entry, false, false));
+        entry.fee_sats = Some(400);
+        entry.confirmed_height = Some(90);
+        assert!(!spend_can_clear(&entry, false, false));
     }
 
     #[test]

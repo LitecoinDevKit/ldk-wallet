@@ -3761,6 +3761,17 @@ function buildTxRow(tx: TxRecord, index: number): HTMLLIElement {
   const side = document.createElement("div");
   side.className = "tx-side";
   side.append(pill, txid);
+  if (tx.can_clear) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "tx-clear";
+    clear.textContent = "Clear";
+    clear.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void clearUnrelayedTx(tx);
+    });
+    side.append(clear);
+  }
 
   const li = document.createElement("li");
   li.className = "tx-row";
@@ -3821,7 +3832,7 @@ async function openTxDetail(index: number) {
 
     const peginLeft = tx.maturity_blocks_left ?? null;
     const statusText = tx.can_clear
-      ? "Not relayed — no peer accepted it"
+      ? "Not relayed — the network did not accept it"
       : peginLeft != null && tx.confirmations > 0
         ? `Maturing — ~${peginLeft} block${peginLeft === 1 ? "" : "s"} remaining`
         : tx.confirmations === 0
@@ -3941,15 +3952,7 @@ async function openTxDetail(index: number) {
       continue;
     }
     if (result === "clear") {
-      try {
-        await invoke("clear_pegin", { txid: tx.txid });
-        await refreshHistory();
-        await refreshCombined();
-        await refreshUtxos();
-        setStatus("Peg-in cleared. Those coins are spendable again.", "success");
-      } catch (e) {
-        setStatus(String(e), "error");
-      }
+      await clearUnrelayedTx(tx);
       return;
     }
     if (result === "explore") {
@@ -3965,6 +3968,18 @@ async function openTxDetail(index: number) {
       continue;
     }
     return;
+  }
+}
+
+async function clearUnrelayedTx(tx: TxRecord): Promise<void> {
+  try {
+    await invoke("clear_pegin", { txid: tx.txid });
+    await refreshHistory();
+    await refreshCombined();
+    await refreshUtxos();
+    setStatus("Cleared. Those coins are spendable again.", "success");
+  } catch (e) {
+    setStatus(String(e), "error");
   }
 }
 

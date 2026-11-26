@@ -112,20 +112,56 @@ pub fn ltc_dust_threshold(script: &Script) -> u64 {
     bdk_mweb::policy::dust_threshold(script)
 }
 
+/// Extra litoshis above the peg-out relay floor. An exact floor was rejected
+/// once the byte count was even one short.
+const PEGOUT_FEE_BUFFER_SATS: u64 = 16;
+
 /// Relay minimum for an MWEB kernel this wallet builds.
 ///
 /// `standard_outputs` counts every MWEB output, including change. Peg-out scripts
 /// add `ceil(len / 42)` each and are not standard outputs. Inputs add nothing.
-/// The result is that weight times `BASE_MWEB_FEE` (100 litoshis). Paying more
-/// does not get a faster block: this is a relay floor, not a mempool feerate.
+/// That weight times `BASE_MWEB_FEE` (100 litoshis) is the MWEB part. An
+/// MWEB-only peg-out also pays 1 litoshi per byte of each transparent peg-out
+/// output, because `GetTransactionWeight` still counts those outputs. Paying
+/// more does not get a faster block: this is a relay floor, not a mempool feerate.
 pub fn min_kernel_fee<'a>(
     standard_outputs: usize,
     pegout_scripts: impl IntoIterator<Item = &'a Script>,
 ) -> u64 {
-    bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(
+    let scripts: Vec<&Script> = pegout_scripts.into_iter().collect();
+    let kernel = bdk_mweb::policy::min_mweb_fee(bdk_mweb::policy::mweb_weight(
         standard_outputs,
-        pegout_scripts,
-    ))
+        scripts.iter().copied(),
+    ));
+    kernel.saturating_add(pegout_byte_fee(&scripts))
+}
+
+/// Serialized size of one peg-out `CTxOut`: 8-byte amount, compact size, script.
+fn pegout_output_bytes(script: &Script) -> u64 {
+    let script_len = script.len() as u64;
+    let compact = if script_len < 253 {
+        1
+    } else if script_len <= u64::from(u16::MAX) {
+        3
+    } else {
+        5
+    };
+    8 + compact + script_len
+}
+
+/// Byte fee for every peg-out output, plus [`PEGOUT_FEE_BUFFER_SATS`].
+///
+/// Weight is the serialized size times 4, and virtual size rounds that up to
+/// a multiple of 4, which is the serialized size again. Min relay is 1
+/// litoshi per vbyte.
+fn pegout_byte_fee(scripts: &[&Script]) -> u64 {
+    let bytes: u64 = scripts.iter().copied().map(pegout_output_bytes).sum();
+    if bytes == 0 {
+        return 0;
+    }
+    let weight = bytes.saturating_mul(4);
+    let vsize = weight.div_ceil(4);
+    vsize.saturating_add(PEGOUT_FEE_BUFFER_SATS)
 }
 
 /// True when `script` is a standard spendable public wallet script (P2PKH, P2SH, P2WPKH, P2WSH, P2TR).
@@ -816,7 +852,12 @@ mod tests {
             1_800
         );
         let script = p2wpkh();
-        assert_eq!(min_kernel_fee(0, [script.as_script()]), 400);
-        assert_eq!(min_kernel_fee(1, [script.as_script()]), 2_200);
+        // Kernel 400 plus the 31-byte P2WPKH output and the 16-litoshi buffer.
+        assert_eq!(min_kernel_fee(0, [script.as_script()]), 447);
+        assert_eq!(min_kernel_fee(1, [script.as_script()]), 2_247);
+        assert_eq!(
+            min_kernel_fee(0, [script.as_script(), script.as_script()]),
+            578
+        );
     }
 }

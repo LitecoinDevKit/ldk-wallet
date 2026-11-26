@@ -104,6 +104,26 @@ pub fn since(seq: u64) -> (u64, Vec<String>) {
         .unwrap_or((seq, Vec::new()))
 }
 
+/// [`since`], limited to lines this thread logged.
+///
+/// Sync tests run in parallel and share the ring. A wall-clock check has to
+/// read its own probe line, not another test's.
+#[cfg(test)]
+pub fn since_current_thread(seq: u64) -> (u64, Vec<String>) {
+    let tid = std::thread::current().id();
+    LOG.lock()
+        .map(|ring| {
+            let lines = ring
+                .lines
+                .iter()
+                .filter(|(s, t, _)| *s > seq && *t == tid)
+                .map(|(_, _, l)| l.clone())
+                .collect();
+            (ring.last_seq, lines)
+        })
+        .unwrap_or((seq, Vec::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
